@@ -1,33 +1,66 @@
-# LingBot-VA Latent Data Design
+# LingBot-VA Latent 数据设计
 
-## Goal
+## 目标
 
-Use LeRobot 0.5 metadata directly and keep LingBot-VA training on precomputed latents without decoding videos during training.
+直接使用 LeRobot 0.5 的元数据，并让 LingBot-VA 在训练时使用预先计算好的 latent，而不在训练过程中解码视频。
 
-## Main Rule
+## 核心规则
 
-Do not maintain a second segment metadata file.
+不要再维护第二份 segment 元数据文件。
 
-Training segments should be built at runtime from LeRobot metadata, then filtered by latent-file existence.
+训练 segment 应在运行时根据 LeRobot 元数据构建。
 
-This avoids duplicate sources of truth.
+这样可以避免出现重复的事实来源。
 
-## Segment Construction
+每个数据集只保留两个文件：
 
-Build segments per dataset at initialization time:
+- `meta/wan_va_config.json`
+- `latents/metadata.json`
 
-- Read only the needed index columns from `hf_dataset` in bulk, not per-frame one by one.
-- Prefer a lightweight view such as `episode_index`, `frame_index`, `task_index`, and optional `subtask_index`.
-- If `subtask_index` exists and `meta.subtasks` is available:
-  - split each episode by contiguous runs of the same `subtask_index`
-  - use the corresponding subtask text
-- Otherwise:
-  - one episode becomes one segment
-  - use the episode task text
+`meta/wan_va_config.json` 由用户编辑，可以包含：
 
-The same segment-building logic should be used in both latent extraction and training-time loading.
+- 预处理输入，例如相机键、预定义相机预设、目标 FPS
+- 训练期的数据集规则，例如 latent 布局、action 重映射和 action 归一化
 
-Each runtime segment only needs:
+`latents/metadata.json` 由预处理阶段固化生成，不应手动编辑。它只包含解释已提取 latent 数据所需的 latent 格式事实。
+
+`latents/metadata.json` 还携带提取状态：
+
+- `extracting`：预处理正在进行，或曾被中断，必须继续恢复
+- `complete`：所有 latent 文件与文本嵌入文件都已写入并完成校验
+
+训练阶段：
+
+- 信任 `latents/metadata.json` 作为 latent 解释依据
+- 从 `meta/wan_va_config.json` 读取训练期的数据集规则
+- 如果 `meta/wan_va_config.json` 中的 preprocess 部分与 `latents/metadata.json` 不再一致，则立即失败
+- 如果 `latents/metadata.json` 状态不是 `complete`，则立即失败
+
+## Segment 构建
+
+在每个数据集初始化时构建 segment：
+
+- 只批量读取 `hf_dataset` 中所需的索引列，不要逐帧读取
+- 优先使用轻量视图，例如 `episode_index`、`frame_index`、`task_index`，以及可选的 `subtask_index`
+- 如果存在 `subtask_index` 且 `meta.subtasks` 可用：
+  - 按连续相同的 `subtask_index` 区间切分每个 episode
+  - 使用对应的 subtask 文本
+- 否则：
+  - 一个 episode 对应一个 segment
+  - 使用该 episode 的 task 文本
+
+同一套 segment 构建逻辑需要同时用于 latent 提取和训练时加载。
+
+数据集结构检查应发生在预处理阶段，而不是训练热路径中。具体来说，预处理阶段要验证：
+
+- `frame_index` 在每个 episode 内是稠密且从 0 开始的
+- `task_index` 存在且未越界
+- `subtask_index` 若存在，则未越界
+- 当不存在 `subtask_index` 时，每个 episode 内的 `task_index` 必须是常量
+- `obs_cam_keys` 的数量和顺序与所选预定义相机预设一致
+- 所选相机预设在 latent 空间中的尺寸与配置的 `latent_layout` 兼容
+
+每个运行时 segment 只需要包含：
 
 - `episode_index`
 - `start_frame`
@@ -35,55 +68,59 @@ Each runtime segment only needs:
 - `global_from`
 - `global_to`
 - `task_index`
-- `subtask_index` (optional)
+- `subtask_index`（可选）
 
-`global_from` and `global_to` come from the episode's global index range in LeRobot metadata, combined with the segment's local frame range.
+`global_from` 和 `global_to` 来自 LeRobot 元数据中该 episode 的全局索引范围，再结合该 segment 的局部帧范围得到。
 
-## Latent File Naming
+## Latent 文件命名
 
-Latent files follow this convention:
+latent 文件遵循以下命名约定：
 
 - `episode_{episode_index:06d}_{start_frame}_{end_frame}.pth`
 
-The segment boundaries computed at runtime must match the boundaries used during latent extraction.
+运行时计算出的 segment 边界必须与 latent 提取时使用的边界完全一致。
 
-If task or subtask annotations change, previously extracted latent files will no longer match the runtime segments and must be regenerated.
+如果 task 或 subtask 标注发生变化，那么此前提取出的 latent 文件将不再匹配运行时 segment，必须重新生成。
 
-The loader should warn on limited latent mismatches and fail fast when a large fraction of constructed segments have no matching latent files.
+训练阶段应信任预处理后的数据集布局，而不是在初始化时再次检查 latent 覆盖率。
 
-## Recommended Layout
+预处理结束前，应做一次低成本的完整性检查：在将 `latents/metadata.json` 标记为 `complete` 之前，确认所有预期的 latent 路径都存在。
+
+## 推荐目录布局
 
 ```text
 dataset_root/
-├── data/                      # LeRobot native
-├── videos/                    # LeRobot native, not used in training
+├── data/                      # LeRobot 原生数据
+├── videos/                    # LeRobot 原生视频，训练时不使用
 ├── meta/
 │   ├── info.json
+│   ├── wan_va_config.json     # 可编辑：预处理 + 训练数据集配置
 │   ├── tasks.parquet
-│   ├── subtasks.parquet       # optional
+│   ├── subtasks.parquet       # 可选
 │   ├── episodes/...
 │   └── stats.json
 ├── latents/
+│   ├── metadata.json          # 固化的 latent 格式元数据，不要编辑
 │   ├── observation.images.top/
 │   └── observation.images.wrist/
 └── text_emb/
     ├── task_emb.pth
-    ├── subtask_emb.pth        # optional
+    ├── subtask_emb.pth        # 可选
     └── empty_emb.pth
 ```
 
-Latent paths do not need to mirror LeRobot chunk layout.
+latent 路径不需要镜像 LeRobot 的 chunk 布局。
 
-A flat per-camera layout is preferred, for example:
+更推荐扁平的按相机布局，例如：
 
 - `latents/observation.images.top/episode_000000_0_264.pth`
 - `latents/observation.images.wrist/episode_000000_0_264.pth`
 
-## Latent Files
+## Latent 文件内容
 
-Latent files should stay minimal.
+latent 文件应尽量保持精简。
 
-Recommended contents:
+内容包括：
 
 - `latent`
 - `frame_ids`
@@ -92,90 +129,101 @@ Recommended contents:
 - `latent_width`
 - `fps`
 
-Keep `frame_ids` because it encodes the temporal downsampling applied during VAE encoding.
+`frame_ids` 记录的是 VAE 编码之前实际采样到的原始帧。它在提取阶段用于验证同一 segment 的所有相机是否具有完全一致的时间采样。训练阶段不会读取它：`frame_stride` 由 `preprocess_config.frame_stride(meta.fps)` 推导，并结合 `latents/metadata.json` 中固化的 `actual_fps` 使用。
 
-This cannot be derived from LeRobot metadata alone.
+`fps` 记录 latent 提取时使用的目标采样率。它主要用于人工检查，在训练阶段不会被读取。
 
-Action alignment uses it to compute `frame_stride`, `act_shift`, and the action length required by the latent sequence.
+主要的空间节省来自于不再在每个 latent 文件里重复存储 `text_emb` 张量。
 
-`fps` records the target sampling rate used during latent extraction. It is mainly for load-time sanity checks against dataset fps and `frame_ids`, not a primary training input.
+不要在每个 latent 文件中存储重复的业务元数据。
 
-The main space saving comes from removing repeated `text_emb` tensors from every latent file.
+只有 `meta/wan_va_config.json` 中的 preprocess 子集会被冻结写入 `latents/metadata.json`。
 
-Do not store repeated business metadata in every latent file.
+action 重映射、归一化统计、latent 布局和 action 后处理属于可编辑的 training 部分，因为修改它们不需要重新提取 latent。
 
-## Text Embeddings
+## 相机预设
 
-Cache text embeddings per dataset:
+与其让用户手写任意的逐相机 resize 值，预处理阶段应暴露一组固定的相机预设，以匹配历史训练配置：
 
-- `task_emb.pth`: stacked tensor indexed by local `task_index`
-- `subtask_emb.pth`: stacked tensor indexed by local `subtask_index`
-- `empty_emb.pth`: used for CFG dropout
+| 预设名 | 相机数量 | Resize 分辨率 | 布局 |
+|---|---|---|---|
+| `one_primary_one_wrist_256` | 2 | 256×256, 256×256 | `horizontal_concat` |
+| `one_primary_one_wrist_128` | 2 | 128×128, 128×128 | `horizontal_concat` |
+| `one_primary_two_wrist_224x320` | 3 | 224×320, 224×320, 224×320 | `horizontal_concat` |
+| `one_primary_two_wrist_tshape_256x320` | 3 | 256×320, 128×160, 128×160 | `robotwin_tshape` |
 
-This should remain dataset-local, not global across mixed datasets.
+相机 0 永远是主视角，后续相机视为 wrist 视角。
 
-Prefer padding to a dataset-local fixed sequence length so stacked tensors remain usable.
+每个预设都定义了每个相机在 VAE 编码前应采用的精确 resize，以及与该几何布局兼容的 latent 布局。几何不变量，例如 `horizontal_concat` 需要 latent 高度一致，`robotwin_tshape` 需要宽度求和匹配且 wrist 高度一致，会在模块加载时通过 `CameraPresetSpec.__post_init__` 一次性校验。
 
-If sequence lengths are not made uniform, use a dataset-local mapping instead of a stacked tensor.
+## 文本嵌入
 
-At training time:
+为每个数据集单独缓存文本嵌入：
 
-- use `subtask_index` to look up `subtask_emb.pth` when subtasks exist
-- otherwise use `task_index` to look up `task_emb.pth`
-- apply CFG dropout by replacing the selected embedding with `empty_emb`
+- `task_emb.pth`：按本地 `task_index` 索引的堆叠张量
+- `subtask_emb.pth`：按本地 `subtask_index` 索引的堆叠张量
+- `empty_emb.pth`：用于 CFG dropout
 
-## Training Path
+这些缓存应保持数据集本地化，而不是跨混合数据集全局共享。
 
-Do not use `LeRobotDataset.__getitem__()` to build segments.
+训练时：
 
-Use only:
+- 若存在 subtasks，则使用 `subtask_index` 查找 `subtask_emb.pth`
+- 否则使用 `task_index` 查找 `task_emb.pth`
+- 通过将选中的 embedding 替换为 `empty_emb` 实现 CFG dropout
 
-- `dataset.meta`
-- `dataset.hf_dataset`
+## 训练路径
 
-Reason:
+不要使用 `LeRobotDataset.__getitem__()` 来构建 segment。
 
-- `LeRobotDataset.__getitem__()` decodes video frames when video keys exist
-- `meta` and `hf_dataset` provide the needed metadata and action tables without video decode
+只使用：
 
-Initialization can follow either of these safe paths:
+- `dataset.meta`（通过 `LeRobotDatasetMetadata` 获取）
+- `dataset.hf_dataset`（通过 `load_nested_dataset` 单独加载）
 
-- construct `LeRobotDataset` with local data present and `download_videos=False`, then use only `meta` and `hf_dataset`
-- or construct `LeRobotDatasetMetadata` directly with `root` pointing to the local dataset, then load parquet data separately
+原因：
 
-The second path is the lighter option when training only needs metadata and action tables.
+- `LeRobotDataset.__getitem__()` 在存在视频键时会解码视频帧
+- `LeRobotDatasetMetadata` 和 parquet 数据已经足够提供所需元数据和 action 表，而无需视频解码
 
-It assumes the local `meta/` directory is complete. If local metadata is missing, LeRobot may try to fall back to repository download behavior.
+训练路径应为：
 
-So the training path remains:
+1. 根据 LeRobot 元数据构建 segment
+2. 从 `latents/` 加载 latent 张量
+3. 从 LeRobot parquet 数据加载 actions
+   - 初始化时，仅保留所需列的轻量索引视图
+   - 在 `__getitem__` 中，保留一个单独的 tensor 格式 action 视图
+   - 使用从 `episodes["dataset_from_index"]` 推导出的 `global_from` 与 `global_to` 读取 action 区间
+4. 训练过程中绝不解码视频
 
-1. build segments from LeRobot metadata
-2. filter out segments without latent files
-3. load latent tensors from `latents/`
-4. load actions from LeRobot parquet data
-   - during init, use a lightweight index view over only the needed columns
-   - during `__getitem__`, keep a separate tensor-formatted action view
-   - use `global_from` and `global_to`, derived from `episodes["dataset_from_index"]`, to read action ranges
-5. never decode video during training
+训练阶段应信任固化的 latent 元数据，并避免在热路径中重复进行 latent 文件检查。只保留常数成本的漂移检查：
 
-## Multi-Camera Layout
+- `meta/wan_va_config.json.preprocess` 仍然匹配 `latents/metadata.json.preprocess`
+- 当前数据集的 `codebase_version` 以及推导出的 `actual_fps` 仍然匹配 `latents/metadata.json`
+- 混合数据集之间仍然具备 batch 兼容性
 
-Latent loading stays per camera, and multi-camera concatenation remains a dataset-level rule.
+## 多相机布局
 
-The concatenation strategy should stay in per-dataset config, because different environments may use different layouts.
+latent 仍按相机分别加载，而多相机拼接仍然是数据集级规则。
 
-Frame alignment should assume the same `frame_ids` across cameras for the same segment and validate this when loading latents.
+拼接策略应保留在每个数据集自己的配置中，因为不同环境可能使用不同布局。
 
-## Multi-Dataset Note
+帧对齐由预处理阶段保证，而不是在训练阶段重复验证。
 
-Each dataset should keep its own:
+在预处理阶段，每个 segment 的 latent 写入过程都要验证：同一 segment 下所有相机共享相同的 `frame_ids`，且具有相同的 temporal latent 长度。
 
-- segment construction
-- text embedding cache
-- camera configuration
-- action dimension mapping to the unified training action space
-- action normalization statistics and rules
+布局兼容性，也就是所选布局在 latent 空间中的几何兼容性，由 `CameraPresetSpec.__post_init__` 在模块加载时校验，而不在训练阶段重复检查。
 
-Mixed training should combine datasets above this layer, not by sharing task or subtask indices globally.
+## 多数据集说明
 
-Sampling weights across datasets should be handled at the multi-dataset mixing layer, not inside the per-dataset latent format.
+每个数据集都应各自维护：
+
+- segment 构建
+- 文本嵌入缓存
+- 相机配置
+- 到统一训练 action 空间的 action 维度映射
+- action 归一化统计与规则
+
+混合训练应在这一层之上组合多个数据集，而不是让 task 或 subtask 索引在全局共享。
+
+跨数据集的采样权重应在多数据集混合层处理，而不是内嵌进单个数据集的 latent 格式中。

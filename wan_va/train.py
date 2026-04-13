@@ -43,7 +43,7 @@ from utils import (
     FlowMatchScheduler
 )
 
-from dataset import MultiLatentLeRobotDataset
+from dataset import MultiLatentLeRobotDataset, collate_variable_f
 import gc
 
 
@@ -129,9 +129,10 @@ class Trainer:
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
+            shuffle=(train_sampler is None),
             num_workers=config.load_worker,
             sampler=train_sampler,
+            collate_fn=collate_variable_f,
         )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -235,6 +236,8 @@ class Trainer:
             noisy_cond_prob=0.0)
 
         latent_dict['text_emb'] = batch_dict['text_emb']
+        if 'latents_mask' in batch_dict:
+            latent_dict['latents_mask'] = batch_dict['latents_mask']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_dict['actions_mask']
 
@@ -266,30 +269,30 @@ class Trainer:
         latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
         action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
 
-        # Frame-wise video loss calculation
+        frame_valid = (
+            input_dict['latent_dict']['latents_mask'].flatten().float()
+            if 'latents_mask' in input_dict['latent_dict'] else None
+        )
+
         latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
-        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        latent_loss = latent_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        latent_loss = latent_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and compute mask per frame
-        latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
-        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
-        latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+        latent_loss = latent_loss.permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)  # (B*F, H*W*C)
+        latent_loss_per_frame = latent_loss.sum(dim=1) / latent_loss.shape[1]
+        latent_loss = (
+            (latent_loss_per_frame * frame_valid).sum() / (frame_valid.sum() + 1e-6)
+            if frame_valid is not None else latent_loss_per_frame.mean()
+        )
 
-        # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
         action_loss = action_loss * action_loss_weight[:, None, :, None, None]
         action_loss = action_loss * input_dict['action_dict']['actions_mask'].float()
-        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        action_loss = action_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_loss = action_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        action_mask = action_mask.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and normalize by mask per frame
-        action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
-        action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
-        action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
+        action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)
+        action_loss = action_loss.permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)  # (B*F, H*W*C)
+        action_loss_per_frame = action_loss.sum(dim=1) / (action_mask.sum(dim=1) + 1e-6)
+        action_loss = (
+            (action_loss_per_frame * frame_valid).sum() / (frame_valid.sum() + 1e-6)
+            if frame_valid is not None else action_loss_per_frame.mean()
+        )
 
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
 

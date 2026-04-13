@@ -93,21 +93,34 @@ class FlexAttnFunc(nn.Module):
     @staticmethod
     @torch.no_grad()
     def init_mask(
-        latent_shape, 
-        action_shape, 
-        padded_length, 
+        latent_shape,
+        action_shape,
+        padded_length,
         chunk_size,
         window_size,
         patch_size,
         device,
+        latents_mask=None,  # (B, F) bool — True = valid, False = collate-padding
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
         _, _, A_F, A_H, A_W = action_shape
 
         latent_seq_id = torch.arange(B)[:, None, None, None].\
-            expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
-        action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
+            expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2])  # (B, F', H', W')
+        if latents_mask is not None:
+            assert patch_size[0] == 1, \
+                f"latents_mask assumes no temporal patchification, but patch_size[0]={patch_size[0]}"
+            # Padding frame tokens → seq_id=-1, excluded by seq_mask (same as 128-alignment padding).
+            mask_4d = latents_mask.to(device=device)[:, :, None, None].expand_as(latent_seq_id)
+            latent_seq_id = latent_seq_id.masked_fill(~mask_4d, -1)
+        latent_seq_id = latent_seq_id.flatten()
+        action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W)  # (B, A_F, A_H, A_W)
+        if latents_mask is not None:
+            # A_F == L_F (same frame_ids), so latents_mask applies directly to action tokens.
+            mask_4d = latents_mask.to(device=device)[:, :, None, None].expand_as(action_seq_id)
+            action_seq_id = action_seq_id.masked_fill(~mask_4d, -1)
+        action_seq_id = action_seq_id.flatten()
         seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
 
         latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
@@ -762,13 +775,14 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
-        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
-                               action_dict['noisy_latents'].shape, 
-                               padded_length, 
+        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape,
+                               action_dict['noisy_latents'].shape,
+                               padded_length,
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
-                               device=hidden_states.device
+                               device=hidden_states.device,
+                               latents_mask=latent_dict.get('latents_mask'),
                                )
 
         for block in self.blocks:
