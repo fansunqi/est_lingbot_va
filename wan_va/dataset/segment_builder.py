@@ -8,7 +8,7 @@ from typing import Optional
 
 import numpy as np
 
-MIN_SAMPLED_FRAMES = 2  # need >= 2 sampled frames to derive frame_stride from frame_ids
+MIN_SAMPLED_FRAMES = 2  # need >= 2 sampled frames so the segment is non-degenerate after striding
 
 
 @dataclass

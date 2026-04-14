@@ -1,0 +1,30 @@
+{
+  "preprocess": {
+    "obs_cam_keys": [
+      "observation.images.cam_high",
+      "observation.images.cam_left_wrist",
+      "observation.images.cam_right_wrist"
+    ],
+    "frame_stride": 4,
+    "camera_preset": "one_primary_two_wrist_tshape_256x320"
+  },
+  "training": {
+    "latent_layout": "robotwin_tshape",
+    "action_transform": "robotwin_relative_pose_bimanual",
+    "action_dim": 30,
+    "used_action_channel_ids": [0, 1, 2, 3, 4, 5, 6, 28, 7, 8, 9, 10, 11, 12, 13, 29],
+    "action_norm_method": "quantiles",
+    "norm_stat": {
+      "q01": [
+        -0.062, 0.0, -0.088, -1.0, -1.0, -1.0, -1.0,
+        -0.355, 0.0, -0.120, -1.0, -1.0, -1.0, -1.0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+      ],
+      "q99": [
+        0.346, 0.400, 0.147, 1.0, 1.0, 1.0, 1.0,
+        0.034, 0.391, 0.179, 1.0, 1.0, 1.0, 1.0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0, 1.0
+      ]
+    }
+  }
+}

@@ -201,7 +201,7 @@ def _build_frozen_metadata(
     *,
     extraction_status: str,
 ) -> FrozenLatentMetadata:
-    stride = preprocess_cfg.frame_stride(meta.fps)
+    stride = preprocess_cfg.frame_stride
     return FrozenLatentMetadata(
         preprocess=preprocess_cfg,
         codebase_version=str(meta.info["codebase_version"]),
@@ -466,20 +466,20 @@ def extract_latents(
 
     meta, hf_dataset = _load_v30_dataset(dataset_root)
     _validate_dataset_convention(dataset_root, meta, hf_dataset, preprocess_cfg)
-    stride = preprocess_cfg.frame_stride(meta.fps)
+    stride = preprocess_cfg.frame_stride
 
     segments = build_segments(
         episodes=meta.episodes,
         hf_dataset=hf_dataset,
         subtasks=meta.subtasks,
-        min_segment_frames=preprocess_cfg.min_segment_frames(meta.fps, min_sampled_frames=MIN_SAMPLED_FRAMES),
+        min_segment_frames=preprocess_cfg.min_segment_frames(min_sampled_frames=MIN_SAMPLED_FRAMES),
     )
     frame_index_col = np.asarray(hf_dataset.select_columns(["frame_index"])["frame_index"])
     if not segments:
         raise ValueError(
             f"{dataset_root.name}: no segments remain after applying min_segment_frames="
-            f"{preprocess_cfg.min_segment_frames(meta.fps, min_sampled_frames=MIN_SAMPLED_FRAMES)}. "
-            "Adjust target_fps or dataset annotations before extracting latents."
+            f"{preprocess_cfg.min_segment_frames(min_sampled_frames=MIN_SAMPLED_FRAMES)}. "
+            "Adjust frame_stride or dataset annotations before extracting latents."
         )
     logger.info("Extracting %d segments (stride=%d)", len(segments), stride)
 

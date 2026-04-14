@@ -1,0 +1,30 @@
+{
+  "preprocess": {
+    "obs_cam_keys": [
+      "observation.images.cam_high",
+      "observation.images.cam_left_wrist",
+      "observation.images.cam_right_wrist"
+    ],
+    "frame_stride": 5,
+    "camera_preset": "one_primary_two_wrist_224x320"
+  },
+  "training": {
+    "latent_layout": "horizontal_concat",
+    "action_transform": "identity",
+    "action_dim": 30,
+    "used_action_channel_ids": [0, 1, 2, 3, 4, 5, 6, 28, 7, 8, 9, 10, 11, 12, 13, 29],
+    "action_norm_method": "quantiles",
+    "norm_stat": {
+      "q01": [
+        0.305, -0.226, 0.200, -0.023, -0.056, -0.269, -0.293,
+        0.294, -0.443, 0.213, -0.796, -0.408, -0.284, -0.445,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+      ],
+      "q99": [
+        0.757, 0.477, 0.643, 0.984, 0.993, 0.280, 0.475,
+        0.756, 0.041, 0.536, 0.998, 0.897, 0.602, 0.503,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0, 1.0
+      ]
+    }
+  }
+}

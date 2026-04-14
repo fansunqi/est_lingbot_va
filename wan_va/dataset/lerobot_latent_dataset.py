@@ -123,7 +123,7 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
                 f"latents/metadata.json ({self.latent_metadata.codebase_version!r}). "
                 "Re-extract latents after changing dataset metadata."
             )
-        self.frame_stride = self.preprocess_config.frame_stride(self.meta.fps)
+        self.frame_stride = self.preprocess_config.frame_stride
         self.time_downsample = self.latent_metadata.vae_temporal_downsample
         self.action_steps_per_latent_frame = self.frame_stride * self.time_downsample
         actual_fps = self.meta.fps / self.frame_stride
@@ -164,7 +164,6 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
             hf_dataset=full_hf,
             subtasks=self.meta.subtasks,
             min_segment_frames=self.preprocess_config.min_segment_frames(
-                self.meta.fps,
                 min_sampled_frames=MIN_SAMPLED_FRAMES,
             ),
         )
@@ -235,7 +234,7 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
         if not self.segments:
             raise ValueError(
                 f"{self.root.name}: no segments remain after applying min_segment_frames="
-                f"{self.preprocess_config.min_segment_frames(self.meta.fps, min_sampled_frames=MIN_SAMPLED_FRAMES)}"
+                f"{self.preprocess_config.min_segment_frames(min_sampled_frames=MIN_SAMPLED_FRAMES)}"
             )
         if self.task_emb.ndim != 3:
             raise ValueError(

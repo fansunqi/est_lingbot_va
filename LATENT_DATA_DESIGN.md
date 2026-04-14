@@ -129,9 +129,9 @@ latent 文件应尽量保持精简。
 - `latent_width`
 - `fps`
 
-`frame_ids` 记录的是 VAE 编码之前实际采样到的原始帧。它在提取阶段用于验证同一 segment 的所有相机是否具有完全一致的时间采样。训练阶段不会读取它：`frame_stride` 由 `preprocess_config.frame_stride(meta.fps)` 推导，并结合 `latents/metadata.json` 中固化的 `actual_fps` 使用。
+`frame_ids` 记录的是 VAE 编码之前实际采样到的原始帧。它在提取阶段用于验证同一 segment 的所有相机是否具有完全一致的时间采样。训练阶段不会读取它：`frame_stride` 直接由 `preprocess_config.frame_stride` 获取，并结合 `latents/metadata.json` 中固化的 `actual_fps` 使用。
 
-`fps` 记录 latent 提取时使用的目标采样率。它主要用于人工检查，在训练阶段不会被读取。
+`fps` 记录 latent 提取时的实际采样帧率（`dataset_fps / frame_stride`）。它主要用于人工检查和一致性校验，在训练热路径中不会被直接读取。
 
 主要的空间节省来自于不再在每个 latent 文件里重复存储 `text_emb` 张量。
 

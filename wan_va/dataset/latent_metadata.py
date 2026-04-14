@@ -157,17 +157,17 @@ def validate_train_config_against_preprocess(
 @dataclass(frozen=True)
 class LatentPreprocessConfig:
     obs_cam_keys: list[str]
-    target_fps: int
+    frame_stride: int
     camera_preset: str
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any], *, label: str) -> "LatentPreprocessConfig":
-        _require_keys(payload, ["obs_cam_keys", "target_fps", "camera_preset"], label)
+        _require_keys(payload, ["obs_cam_keys", "frame_stride", "camera_preset"], label)
 
         obs_cam_keys = _validate_string_list(payload["obs_cam_keys"], f"{label}.obs_cam_keys")
         if len(set(obs_cam_keys)) != len(obs_cam_keys):
             raise ValueError(f"{label}.obs_cam_keys: duplicate camera keys are not allowed")
-        target_fps = _validate_positive_int(payload["target_fps"], f"{label}.target_fps")
+        frame_stride = _validate_positive_int(payload["frame_stride"], f"{label}.frame_stride")
         camera_preset = _validate_nonempty_string(payload["camera_preset"], f"{label}.camera_preset")
         spec = _camera_preset_spec(camera_preset, label=f"{label}.camera_preset")
         if len(obs_cam_keys) != spec.camera_count:
@@ -190,7 +190,7 @@ class LatentPreprocessConfig:
 
         return cls(
             obs_cam_keys=obs_cam_keys,
-            target_fps=target_fps,
+            frame_stride=frame_stride,
             camera_preset=camera_preset,
         )
 
@@ -204,18 +204,15 @@ class LatentPreprocessConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "obs_cam_keys": list(self.obs_cam_keys),
-            "target_fps": self.target_fps,
+            "frame_stride": self.frame_stride,
             "camera_preset": self.camera_preset,
         }
 
-    def frame_stride(self, dataset_fps: float) -> int:
-        return max(1, round(dataset_fps / self.target_fps))
-
-    def min_segment_frames(self, dataset_fps: float, *, min_sampled_frames: int) -> int:
+    def min_segment_frames(self, *, min_sampled_frames: int) -> int:
         """Minimum raw-frame segment length to produce at least *min_sampled_frames* after striding."""
         if min_sampled_frames < 1:
             raise ValueError(f"min_sampled_frames must be >= 1, got {min_sampled_frames}")
-        return self.frame_stride(dataset_fps) * (min_sampled_frames - 1) + 1
+        return self.frame_stride * (min_sampled_frames - 1) + 1
 
     def resolution_for(self, cam_key: str) -> tuple[int, int]:
         try:
