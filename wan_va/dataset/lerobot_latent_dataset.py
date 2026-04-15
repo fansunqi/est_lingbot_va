@@ -10,8 +10,6 @@ Follows LATENT_DATA_DESIGN.md:
 - Text embeddings cached per-dataset (task_emb / subtask_emb / empty_emb)
 """
 
-from __future__ import annotations
-
 import logging
 from bisect import bisect_right
 from functools import partial
@@ -29,6 +27,7 @@ from lerobot.datasets.io_utils import load_nested_dataset
 
 from .latent_metadata import (
     LATENT_METADATA_STATUS_COMPLETE,
+    build_norm_stat_from_raw_stats,
     load_dataset_user_config,
     load_frozen_latent_metadata,
     validate_train_config_against_preprocess,
@@ -54,7 +53,7 @@ def get_relative_pose(pose):
     first_rot = R.from_quat(np.tile(pose[:1, 3:7], (pose.shape[0], 1)))
     relative_rot = first_rot.inv() * rot
     relative_pose = np.concatenate([pose[:, :3] - pose[:1, :3], relative_rot.as_quat()], axis=1)
-    return torch.from_numpy(relative_pose)
+    return relative_pose
 
 
 def _infer_raw_action_dim(hf_dataset) -> int:
@@ -107,9 +106,6 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
         self.used_video_keys: list[str] = self.preprocess_config.obs_cam_keys
         self.camera_resolutions = self.preprocess_config.resolved_camera_resolutions()
 
-        self.q01 = np.array(self.train_config.norm_stat["q01"], dtype="float")[None]
-        self.q99 = np.array(self.train_config.norm_stat["q99"], dtype="float")[None]
-
         self.meta = LeRobotDatasetMetadata(repo_id="local", root=self.root)
         ds_version = self.meta.info.get("codebase_version", "unknown")
         if ds_version != "v3.0":
@@ -141,6 +137,39 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
             raw_action_dim,
             label=f"{self.root.name}: dataset config",
         )
+
+        # --- Build q01 / q99 normalization arrays ---
+        if self.train_config.norm_stat is not None:
+            # Non-identity transform: user-supplied norm_stat
+            q01 = np.array(self.train_config.norm_stat["q01"], dtype="float")
+            q99 = np.array(self.train_config.norm_stat["q99"], dtype="float")
+        else:
+            # Identity transform: read from dataset's meta/stats.json
+            from lerobot.datasets.io_utils import load_stats
+            stats = load_stats(self.root)
+            if stats is None or "action" not in stats:
+                raise ValueError(
+                    f"{self.root.name}: action_transform is 'identity' but "
+                    f"meta/stats.json is missing or does not contain 'action' statistics. "
+                    f"Compute dataset statistics (e.g. via LeRobotDataset) before training."
+                )
+            action_stats = stats["action"]
+            if "q01" not in action_stats or "q99" not in action_stats:
+                raise ValueError(
+                    f"{self.root.name}: meta/stats.json 'action' entry is missing "
+                    f"'q01' and/or 'q99' quantile statistics."
+                )
+            norm_stat = build_norm_stat_from_raw_stats(
+                action_stats["q01"],
+                action_stats["q99"],
+                self.train_config.action_dim,
+                self.train_config.inverse_used_action_channel_ids,
+                self.train_config.used_action_channel_ids,
+            )
+            q01 = np.array(norm_stat["q01"], dtype="float")
+            q99 = np.array(norm_stat["q99"], dtype="float")
+        self.q01 = q01[None]  # (1, action_dim)
+        self.q99 = q99[None]  # (1, action_dim)
         if hasattr(config, "action_dim") and self.train_config.action_dim != config.action_dim:
             raise ValueError(
                 f"{self.root.name}: dataset action_dim={self.train_config.action_dim} does not match "

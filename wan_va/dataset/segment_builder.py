@@ -1,7 +1,4 @@
-# Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 """Shared segment building logic for extraction and training."""
-
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional

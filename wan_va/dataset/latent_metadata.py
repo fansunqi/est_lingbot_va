@@ -1,9 +1,9 @@
-from __future__ import annotations
-
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 
 DATASET_USER_CONFIG_FILENAME = Path("meta/wan_va_config.json")
@@ -119,6 +119,33 @@ def _build_inverse_ids(action_dim: int, used_action_channel_ids: list[int]) -> l
     return inverse_ids
 
 
+def build_norm_stat_from_raw_stats(
+    raw_q01: np.ndarray,
+    raw_q99: np.ndarray,
+    action_dim: int,
+    inverse_used_action_channel_ids: list[int],
+    used_action_channel_ids: list[int],
+) -> dict[str, list[float]]:
+    """Build model-space norm_stat from raw dataset statistics.
+
+    Mirrors the channel remapping performed in ``_action_post_process``:
+    raw actions are zero-padded by one column and then indexed by
+    ``inverse_used_action_channel_ids``.  We apply the same indexing to
+    the raw q01/q99 arrays so that each model-space channel gets the
+    correct statistic.  Unused (sentinel) channels receive 0.
+    """
+    raw_dim = len(raw_q01)
+    pad_len = max(len(used_action_channel_ids), raw_dim) + 1
+    q01_padded = np.zeros(pad_len, dtype=np.float64)
+    q01_padded[:raw_dim] = raw_q01
+    q99_padded = np.zeros(pad_len, dtype=np.float64)
+    q99_padded[:raw_dim] = raw_q99
+    return {
+        "q01": q01_padded[inverse_used_action_channel_ids].tolist(),
+        "q99": q99_padded[inverse_used_action_channel_ids].tolist(),
+    }
+
+
 def _camera_preset_spec(camera_preset: str, *, label: str) -> CameraPresetSpec:
     try:
         return CAMERA_PRESET_SPECS[camera_preset]
@@ -229,7 +256,11 @@ class LatentTrainConfig:
     used_action_channel_ids: list[int]
     inverse_used_action_channel_ids: list[int]
     action_norm_method: str
-    norm_stat: dict[str, list[float]]
+    norm_stat: dict[str, list[float]] | None
+    # norm_stat is None when action_transform == "identity" (auto-read from
+    # the dataset's meta/stats.json at training time).  When action_transform
+    # is NOT "identity" the user must supply norm_stat explicitly because the
+    # transform changes the action space and the raw dataset stats are invalid.
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any], *, label: str) -> "LatentTrainConfig":
@@ -241,7 +272,6 @@ class LatentTrainConfig:
                 "action_dim",
                 "used_action_channel_ids",
                 "action_norm_method",
-                "norm_stat",
             ],
             label,
         )
@@ -285,18 +315,38 @@ class LatentTrainConfig:
                 f"supported={sorted(_SUPPORTED_ACTION_NORM_METHODS)}"
             )
 
-        norm_stat = payload["norm_stat"]
-        if not isinstance(norm_stat, dict):
-            raise ValueError(f"{label}.norm_stat: expected an object")
-        _require_keys(norm_stat, ["q01", "q99"], f"{label}.norm_stat")
-        q01 = norm_stat["q01"]
-        q99 = norm_stat["q99"]
-        if not isinstance(q01, list) or not isinstance(q99, list):
-            raise ValueError(f"{label}.norm_stat: q01 and q99 must both be lists")
-        if len(q01) != action_dim or len(q99) != action_dim:
-            raise ValueError(
-                f"{label}.norm_stat: q01/q99 must both have length {action_dim}"
-            )
+        # --- norm_stat handling depends on action_transform ---
+        if action_transform == "identity":
+            if "norm_stat" in payload:
+                raise ValueError(
+                    f"{label}.norm_stat: must not be specified when action_transform is "
+                    f"'identity'. Statistics will be read automatically from the "
+                    f"dataset's meta/stats.json at training time."
+                )
+            norm_stat = None
+        else:
+            if "norm_stat" not in payload:
+                raise ValueError(
+                    f"{label}: norm_stat is required when action_transform is "
+                    f"{action_transform!r} (non-identity transforms change the action "
+                    f"space, so raw dataset statistics are not valid)."
+                )
+            raw_norm_stat = payload["norm_stat"]
+            if not isinstance(raw_norm_stat, dict):
+                raise ValueError(f"{label}.norm_stat: expected an object")
+            _require_keys(raw_norm_stat, ["q01", "q99"], f"{label}.norm_stat")
+            q01 = raw_norm_stat["q01"]
+            q99 = raw_norm_stat["q99"]
+            if not isinstance(q01, list) or not isinstance(q99, list):
+                raise ValueError(f"{label}.norm_stat: q01 and q99 must both be lists")
+            if len(q01) != action_dim or len(q99) != action_dim:
+                raise ValueError(
+                    f"{label}.norm_stat: q01/q99 must both have length {action_dim}"
+                )
+            norm_stat = {
+                "q01": [float(v) for v in q01],
+                "q99": [float(v) for v in q99],
+            }
 
         inverse_ids = payload.get("inverse_used_action_channel_ids")
         expected_inverse_ids = _build_inverse_ids(action_dim, list(used_action_channel_ids))
@@ -314,25 +364,24 @@ class LatentTrainConfig:
             used_action_channel_ids=list(used_action_channel_ids),
             inverse_used_action_channel_ids=list(inverse_ids),
             action_norm_method=action_norm_method,
-            norm_stat={
-                "q01": [float(v) for v in q01],
-                "q99": [float(v) for v in q99],
-            },
+            norm_stat=norm_stat,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "latent_layout": self.latent_layout,
             "action_transform": self.action_transform,
             "action_dim": self.action_dim,
             "used_action_channel_ids": list(self.used_action_channel_ids),
             "inverse_used_action_channel_ids": list(self.inverse_used_action_channel_ids),
             "action_norm_method": self.action_norm_method,
-            "norm_stat": {
+        }
+        if self.norm_stat is not None:
+            d["norm_stat"] = {
                 "q01": list(self.norm_stat["q01"]),
                 "q99": list(self.norm_stat["q99"]),
-            },
-        }
+            }
+        return d
 
     def transformed_action_dim(self, raw_action_dim: int, *, label: str) -> int:
         """Return the action width after applying action_transform to raw parquet actions.

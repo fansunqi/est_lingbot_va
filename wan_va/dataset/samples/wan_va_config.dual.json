@@ -6,10 +6,10 @@
       "observation.images.cam_right_wrist"
     ],
     "frame_stride": 5,
-    "camera_preset": "one_primary_two_wrist_224x320"
+    "camera_preset": "one_primary_two_wrist_tshape_256x320"
   },
   "training": {
-    "latent_layout": "horizontal_concat",
+    "latent_layout": "robotwin_tshape",
     "action_transform": "identity",
     "action_dim": 30,
     "used_action_channel_ids": [0, 1, 2, 3, 4, 5, 6, 28, 7, 8, 9, 10, 11, 12, 13, 29],

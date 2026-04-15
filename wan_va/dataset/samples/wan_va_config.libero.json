@@ -1,9 +1,6 @@
 {
   "preprocess": {
-    "obs_cam_keys": [
-      "observation.images.agentview_rgb",
-      "observation.images.eye_in_hand_rgb"
-    ],
+    "obs_cam_keys": ["observation.images.cam_high", "observation.images.cam_low"],
     "frame_stride": 1,
     "camera_preset": "one_primary_one_wrist_128"
   },
@@ -12,18 +9,6 @@
     "action_transform": "identity",
     "action_dim": 30,
     "used_action_channel_ids": [0, 1, 2, 3, 4, 5, 28],
-    "action_norm_method": "quantiles",
-    "norm_stat": {
-      "q01": [
-        -0.659, -0.844, -0.938, -0.121, -0.160, -0.266,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        -1.0, 0
-      ],
-      "q99": [
-        0.900, 0.854, 0.938, 0.171, 0.184, 0.344,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1.0, 0
-      ]
-    }
+    "action_norm_method": "quantiles"
   }
 }

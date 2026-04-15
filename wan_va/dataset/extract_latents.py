@@ -1,4 +1,3 @@
-# Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 """
 Latent extraction and text-embedding caching.
 
@@ -18,8 +17,6 @@ Usage::
 Uses the shared ``build_segments`` logic so extraction boundaries are
 guaranteed to match training-time expectations.
 """
-
-from __future__ import annotations
 
 import argparse
 import logging
@@ -112,13 +109,19 @@ def decode_video_segment(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def encode_video(vae, video: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def encode_video(
+    vae_wrapper: WanVAEStreamingWrapper,
+    video: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
     """Encode ``(1, C, T, H, W)`` → normalised latent ``(1, z_dim, T', H', W')``."""
     video = video.to(device=device, dtype=dtype)
-    enc_out = WanVAEStreamingWrapper(vae).encode_chunk(video)
+    vae_wrapper.clear_cache()
+    enc_out = vae_wrapper.encode_chunk(video)
     mu, _ = torch.chunk(enc_out, 2, dim=1)
-    mean = torch.tensor(vae.config.latents_mean).to(mu.device).view(1, -1, 1, 1, 1)
-    std = torch.tensor(vae.config.latents_std).to(mu.device).view(1, -1, 1, 1, 1)
+    mean = torch.tensor(vae_wrapper.vae.config.latents_mean).to(mu.device).view(1, -1, 1, 1, 1)
+    std = torch.tensor(vae_wrapper.vae.config.latents_std).to(mu.device).view(1, -1, 1, 1, 1)
     return ((mu.float() - mean) / std).to(dtype)
 
 
@@ -485,6 +488,7 @@ def extract_latents(
 
     lerobot_ds = LeRobotDataset(repo_id="local", root=dataset_root, download_videos=False)
     vae = load_vae(str(model_path / "vae"), torch_dtype=dtype, torch_device=device)
+    vae_wrapper = WanVAEStreamingWrapper(vae)
 
     latent_base = dataset_root / "latents"
     for cam_key in cam_keys:
@@ -516,7 +520,7 @@ def extract_latents(
             video, frame_ids = decode_video_segment(
                 lerobot_ds, cam_key, seg, stride, frame_index_col, h_i, w_i,
             )
-            latent = encode_video(vae, video, device, dtype).squeeze(0)
+            latent = encode_video(vae_wrapper, video, device, dtype).squeeze(0)
             ref_frame_ids, ref_latent_frames = _validate_segment_latents(
                 dataset_root,
                 seg,
