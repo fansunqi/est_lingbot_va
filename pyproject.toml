@@ -14,7 +14,7 @@ dependencies = [
     "accelerate",
     "einops",
     "easydict",
-    # "flash-attn",
+    "flash-attn",
     "numpy",
     "tqdm",
     "imageio[ffmpeg]",
