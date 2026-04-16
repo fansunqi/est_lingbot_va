@@ -8,7 +8,8 @@
     "latent_layout": "horizontal_concat",
     "action_transform": "identity",
     "action_dim": 30,
-    "used_action_channel_ids": [0, 1, 2, 3, 4, 5, 28],
+    "action_keys": ["action"],
+    "used_action_channel_ids": [[0, 1, 2, 3, 4, 5, 28]],
     "action_norm_method": "quantiles"
   }
 }

@@ -112,37 +112,50 @@ def _validate_string_list(values: Any, label: str) -> list[str]:
     return list(values)
 
 
-def _build_inverse_ids(action_dim: int, used_action_channel_ids: list[int]) -> list[int]:
-    inverse_ids = [len(used_action_channel_ids)] * action_dim
-    for i, channel_id in enumerate(used_action_channel_ids):
-        inverse_ids[channel_id] = i
+def _build_inverse_ids(
+    action_dim: int,
+    action_key_channel_map: list[list[int | None]],
+) -> list[int]:
+    """Map each model-space channel to a column in the zero-padded raw action.
+
+    Active channels → their raw-concat offset.  Unused channels → the
+    sentinel column (``total_raw_dim``, i.e. the trailing zero-pad).
+    """
+    total_raw_dim = sum(len(sub) for sub in action_key_channel_map)
+    inverse_ids = [total_raw_dim] * action_dim  # default: sentinel
+    raw_offset = 0
+    for sub_map in action_key_channel_map:
+        for model_id in sub_map:
+            if model_id is not None:
+                inverse_ids[model_id] = raw_offset
+            raw_offset += 1
     return inverse_ids
 
 
 def build_norm_stat_from_raw_stats(
-    raw_q01: np.ndarray,
-    raw_q99: np.ndarray,
-    action_dim: int,
+    per_key_q01: list[np.ndarray],
+    per_key_q99: list[np.ndarray],
     inverse_used_action_channel_ids: list[int],
-    used_action_channel_ids: list[int],
+    action_key_channel_map: list[list[int | None]],
 ) -> dict[str, list[float]]:
-    """Build model-space norm_stat from raw dataset statistics.
+    """Build model-space q01/q99 from per-key raw dataset statistics.
 
-    Mirrors the channel remapping performed in ``_action_post_process``:
-    raw actions are zero-padded by one column and then indexed by
-    ``inverse_used_action_channel_ids``.  We apply the same indexing to
-    the raw q01/q99 arrays so that each model-space channel gets the
-    correct statistic.  Unused (sentinel) channels receive 0.
+    Concatenates per-key stats in raw order (plus a sentinel zero), then
+    indexes by ``inverse_used_action_channel_ids`` — mirroring the same
+    remapping applied to action data in ``_action_post_process``.
     """
-    raw_dim = len(raw_q01)
-    pad_len = max(len(used_action_channel_ids), raw_dim) + 1
-    q01_padded = np.zeros(pad_len, dtype=np.float64)
-    q01_padded[:raw_dim] = raw_q01
-    q99_padded = np.zeros(pad_len, dtype=np.float64)
-    q99_padded[:raw_dim] = raw_q99
+    total_raw_dim = sum(len(sub) for sub in action_key_channel_map)
+    raw_q01 = np.zeros(total_raw_dim + 1, dtype=np.float64)  # +1 sentinel
+    raw_q99 = np.zeros(total_raw_dim + 1, dtype=np.float64)
+    offset = 0
+    for ki, sub_map in enumerate(action_key_channel_map):
+        n = len(sub_map)
+        raw_q01[offset:offset + n] = per_key_q01[ki]
+        raw_q99[offset:offset + n] = per_key_q99[ki]
+        offset += n
     return {
-        "q01": q01_padded[inverse_used_action_channel_ids].tolist(),
-        "q99": q99_padded[inverse_used_action_channel_ids].tolist(),
+        "q01": raw_q01[inverse_used_action_channel_ids].tolist(),
+        "q99": raw_q99[inverse_used_action_channel_ids].tolist(),
     }
 
 
@@ -250,17 +263,36 @@ class LatentPreprocessConfig:
 
 @dataclass(frozen=True)
 class LatentTrainConfig:
+    """Training-time action configuration.
+
+    Fields
+    ------
+    action_keys:
+        Dataset field names to read, e.g. ``["action"]`` or
+        ``["actions.end.position", "actions.effector.position"]``.
+    action_key_channel_map:
+        Nested list parallel to *action_keys* (serialised as
+        ``used_action_channel_ids`` in the JSON config).  Each sub-list has
+        length equal to the field's flattened dimension.  Non-null entries
+        are model-space target indices; ``None`` skips that raw dimension.
+    used_action_channel_ids / inverse_used_action_channel_ids:
+        Flattened active model-space IDs and their inverse mapping, derived
+        automatically from *action_key_channel_map*.
+    norm_stat:
+        ``None`` when ``action_transform == "identity"`` — q01/q99 are then
+        auto-read from ``meta/stats.json`` at training time.  Non-identity
+        transforms require the user to supply *norm_stat* explicitly.
+    """
+
     latent_layout: str
     action_transform: str
     action_dim: int
+    action_keys: list[str]
+    action_key_channel_map: list[list[int | None]]
     used_action_channel_ids: list[int]
     inverse_used_action_channel_ids: list[int]
     action_norm_method: str
     norm_stat: dict[str, list[float]] | None
-    # norm_stat is None when action_transform == "identity" (auto-read from
-    # the dataset's meta/stats.json at training time).  When action_transform
-    # is NOT "identity" the user must supply norm_stat explicitly because the
-    # transform changes the action space and the raw dataset stats are invalid.
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any], *, label: str) -> "LatentTrainConfig":
@@ -270,6 +302,7 @@ class LatentTrainConfig:
                 "latent_layout",
                 "action_transform",
                 "action_dim",
+                "action_keys",
                 "used_action_channel_ids",
                 "action_norm_method",
             ],
@@ -293,18 +326,55 @@ class LatentTrainConfig:
             )
 
         action_dim = _validate_positive_int(payload["action_dim"], f"{label}.action_dim")
-        used_action_channel_ids = payload["used_action_channel_ids"]
-        if (
-            not isinstance(used_action_channel_ids, list)
-            or any(not isinstance(v, int) or isinstance(v, bool) for v in used_action_channel_ids)
-        ):
-            raise ValueError(f"{label}.used_action_channel_ids: expected a list of integers")
-        if len(set(used_action_channel_ids)) != len(used_action_channel_ids):
-            raise ValueError(f"{label}.used_action_channel_ids: duplicate channel ids are not allowed")
-        if any(v < 0 or v >= action_dim for v in used_action_channel_ids):
+        action_keys = _validate_string_list(payload["action_keys"], f"{label}.action_keys")
+        if len(set(action_keys)) != len(action_keys):
+            raise ValueError(f"{label}.action_keys: duplicate keys are not allowed")
+
+        if action_transform != "identity" and len(action_keys) > 1:
             raise ValueError(
-                f"{label}.used_action_channel_ids: ids must be in [0, {action_dim})"
+                f"{label}: action_transform={action_transform!r} requires exactly one "
+                f"action_key because it hard-codes the concat layout; got {len(action_keys)} keys. "
+                f"Use 'identity' for multi-field action datasets."
             )
+
+        raw_channel_ids = payload["used_action_channel_ids"]
+        if not isinstance(raw_channel_ids, list) or not raw_channel_ids:
+            raise ValueError(f"{label}.used_action_channel_ids: expected a non-empty list of lists")
+        if len(raw_channel_ids) != len(action_keys):
+            raise ValueError(
+                f"{label}.used_action_channel_ids: expected {len(action_keys)} sub-lists "
+                f"(one per action_key), got {len(raw_channel_ids)}"
+            )
+
+        action_key_channel_map: list[list[int | None]] = []
+        flat_used_ids: list[int] = []
+        seen_model_ids: set[int] = set()
+
+        for ki, (key, sub_list) in enumerate(zip(action_keys, raw_channel_ids)):
+            sub_label = f"{label}.used_action_channel_ids[{ki}] ({key!r})"
+            if not isinstance(sub_list, list):
+                raise ValueError(f"{sub_label}: expected a list, got {type(sub_list).__name__}")
+            parsed_sub: list[int | None] = []
+            for ji, elem in enumerate(sub_list):
+                if elem is None:
+                    parsed_sub.append(None)
+                elif isinstance(elem, int) and not isinstance(elem, bool):
+                    if elem < 0 or elem >= action_dim:
+                        raise ValueError(
+                            f"{sub_label}[{ji}]: model-space id {elem} out of range [0, {action_dim})"
+                        )
+                    if elem in seen_model_ids:
+                        raise ValueError(
+                            f"{sub_label}[{ji}]: duplicate model-space id {elem}"
+                        )
+                    seen_model_ids.add(elem)
+                    flat_used_ids.append(elem)
+                    parsed_sub.append(elem)
+                else:
+                    raise ValueError(
+                        f"{sub_label}[{ji}]: expected int or null, got {elem!r}"
+                    )
+            action_key_channel_map.append(parsed_sub)
 
         action_norm_method = _validate_nonempty_string(
             payload["action_norm_method"], f"{label}.action_norm_method"
@@ -315,21 +385,19 @@ class LatentTrainConfig:
                 f"supported={sorted(_SUPPORTED_ACTION_NORM_METHODS)}"
             )
 
-        # --- norm_stat handling depends on action_transform ---
         if action_transform == "identity":
             if "norm_stat" in payload:
                 raise ValueError(
-                    f"{label}.norm_stat: must not be specified when action_transform is "
-                    f"'identity'. Statistics will be read automatically from the "
-                    f"dataset's meta/stats.json at training time."
+                    f"{label}.norm_stat: must not be specified when action_transform "
+                    f"is 'identity' (statistics are read from meta/stats.json)."
                 )
             norm_stat = None
         else:
             if "norm_stat" not in payload:
                 raise ValueError(
                     f"{label}: norm_stat is required when action_transform is "
-                    f"{action_transform!r} (non-identity transforms change the action "
-                    f"space, so raw dataset statistics are not valid)."
+                    f"{action_transform!r} (non-identity transforms invalidate "
+                    f"raw dataset statistics)."
                 )
             raw_norm_stat = payload["norm_stat"]
             if not isinstance(raw_norm_stat, dict):
@@ -349,7 +417,7 @@ class LatentTrainConfig:
             }
 
         inverse_ids = payload.get("inverse_used_action_channel_ids")
-        expected_inverse_ids = _build_inverse_ids(action_dim, list(used_action_channel_ids))
+        expected_inverse_ids = _build_inverse_ids(action_dim, action_key_channel_map)
         if inverse_ids is None:
             inverse_ids = expected_inverse_ids
         elif inverse_ids != expected_inverse_ids:
@@ -361,7 +429,9 @@ class LatentTrainConfig:
             latent_layout=latent_layout,
             action_transform=action_transform,
             action_dim=action_dim,
-            used_action_channel_ids=list(used_action_channel_ids),
+            action_keys=list(action_keys),
+            action_key_channel_map=[list(sub) for sub in action_key_channel_map],
+            used_action_channel_ids=list(flat_used_ids),
             inverse_used_action_channel_ids=list(inverse_ids),
             action_norm_method=action_norm_method,
             norm_stat=norm_stat,
@@ -372,7 +442,8 @@ class LatentTrainConfig:
             "latent_layout": self.latent_layout,
             "action_transform": self.action_transform,
             "action_dim": self.action_dim,
-            "used_action_channel_ids": list(self.used_action_channel_ids),
+            "action_keys": list(self.action_keys),
+            "used_action_channel_ids": [list(sub) for sub in self.action_key_channel_map],
             "inverse_used_action_channel_ids": list(self.inverse_used_action_channel_ids),
             "action_norm_method": self.action_norm_method,
         }
@@ -384,14 +455,7 @@ class LatentTrainConfig:
         return d
 
     def transformed_action_dim(self, raw_action_dim: int, *, label: str) -> int:
-        """Return the action width after applying action_transform to raw parquet actions.
-
-        Note: ``action_dim`` is the *model-space* width (e.g. 30) used for
-        channel remapping via ``inverse_used_action_channel_ids``.  It is
-        intentionally **not** compared to ``raw_action_dim`` here — a compact
-        dataset (e.g. 6-dim) is mapped into a wider model space by
-        ``_action_post_process``.
-        """
+        """Action width after ``action_transform`` (identity preserves width)."""
         if self.action_transform == "identity":
             return raw_action_dim
 
@@ -403,13 +467,31 @@ class LatentTrainConfig:
 
         return _ROBOTWIN_RELATIVE_POSE_TRANSFORMED_ACTION_DIM
 
-    def validate_runtime_contract(self, raw_action_dim: int, *, label: str):
-        transformed_dim = self.transformed_action_dim(raw_action_dim, label=label)
-        sentinel_id = len(self.used_action_channel_ids)
-        if sentinel_id > transformed_dim:
+    def validate_runtime_contract(self, raw_action_dims: list[int], *, label: str):
+        """Check that channel maps match actual dataset field dimensions."""
+        if len(raw_action_dims) != len(self.action_keys):
             raise ValueError(
-                f"{label}: used_action_channel_ids has length {sentinel_id}, but "
-                f"training.action_transform={self.action_transform!r} exposes only {transformed_dim} channels"
+                f"{label}: expected {len(self.action_keys)} raw_action_dims "
+                f"(one per action_key), got {len(raw_action_dims)}"
+            )
+        for ki, (key, sub_map, rdim) in enumerate(
+            zip(self.action_keys, self.action_key_channel_map, raw_action_dims)
+        ):
+            if len(sub_map) != rdim:
+                raise ValueError(
+                    f"{label}: action_key {key!r} has {rdim} dimensions in the dataset, "
+                    f"but used_action_channel_ids[{ki}] has length {len(sub_map)}"
+                )
+        total_raw_dim = sum(raw_action_dims)
+        transformed_dim = self.transformed_action_dim(total_raw_dim, label=label)
+        max_raw_offset = max(
+            (v for v in self.inverse_used_action_channel_ids if v < total_raw_dim),
+            default=-1,
+        )
+        if max_raw_offset >= transformed_dim:
+            raise ValueError(
+                f"{label}: an active channel maps to raw offset {max_raw_offset}, but "
+                f"action_transform={self.action_transform!r} produces only {transformed_dim} columns"
             )
 
 

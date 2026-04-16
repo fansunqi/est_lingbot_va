@@ -56,14 +56,20 @@ def get_relative_pose(pose):
     return relative_pose
 
 
-def _infer_raw_action_dim(hf_dataset) -> int:
+def _infer_raw_action_dims(hf_dataset, action_keys: list[str]) -> list[int]:
+    """Return the flattened dimension of each action key from the first row."""
     if len(hf_dataset) == 0:
         raise ValueError("dataset is empty")
-
-    action = np.asarray(hf_dataset[0]["action"])
-    if action.ndim != 1 or action.shape[0] == 0:
-        raise ValueError(f"expected 1-D non-empty action vectors, got shape {action.shape}")
-    return int(action.shape[0])
+    row = hf_dataset[0]
+    dims: list[int] = []
+    for key in action_keys:
+        if key not in row:
+            raise ValueError(f"action key {key!r} not found in dataset columns")
+        arr = np.asarray(row[key]).flatten()
+        if arr.size == 0:
+            raise ValueError(f"action key {key!r} has zero-length data")
+        dims.append(int(arr.size))
+    return dims
 
 
 # ---------------------------------------------------------------------------
@@ -132,42 +138,17 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
 
         features = get_hf_features_from_features(self.meta.features)
         full_hf = load_nested_dataset(self.root / "data", features=features)
-        raw_action_dim = _infer_raw_action_dim(full_hf)
+        raw_action_dims = _infer_raw_action_dims(full_hf, self.train_config.action_keys)
         self.train_config.validate_runtime_contract(
-            raw_action_dim,
+            raw_action_dims,
             label=f"{self.root.name}: dataset config",
         )
 
-        # --- Build q01 / q99 normalization arrays ---
         if self.train_config.norm_stat is not None:
-            # Non-identity transform: user-supplied norm_stat
             q01 = np.array(self.train_config.norm_stat["q01"], dtype="float")
             q99 = np.array(self.train_config.norm_stat["q99"], dtype="float")
         else:
-            # Identity transform: read from dataset's meta/stats.json
-            from lerobot.datasets.io_utils import load_stats
-            stats = load_stats(self.root)
-            if stats is None or "action" not in stats:
-                raise ValueError(
-                    f"{self.root.name}: action_transform is 'identity' but "
-                    f"meta/stats.json is missing or does not contain 'action' statistics. "
-                    f"Compute dataset statistics (e.g. via LeRobotDataset) before training."
-                )
-            action_stats = stats["action"]
-            if "q01" not in action_stats or "q99" not in action_stats:
-                raise ValueError(
-                    f"{self.root.name}: meta/stats.json 'action' entry is missing "
-                    f"'q01' and/or 'q99' quantile statistics."
-                )
-            norm_stat = build_norm_stat_from_raw_stats(
-                action_stats["q01"],
-                action_stats["q99"],
-                self.train_config.action_dim,
-                self.train_config.inverse_used_action_channel_ids,
-                self.train_config.used_action_channel_ids,
-            )
-            q01 = np.array(norm_stat["q01"], dtype="float")
-            q99 = np.array(norm_stat["q99"], dtype="float")
+            q01, q99 = self._load_norm_stat_from_dataset_stats()
         self.q01 = q01[None]  # (1, action_dim)
         self.q99 = q99[None]  # (1, action_dim)
         if hasattr(config, "action_dim") and self.train_config.action_dim != config.action_dim:
@@ -199,7 +180,7 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
 
         # Action-only view; avoids deep-copying the full dataset inside with_format.
         self._hf_torch_view = (
-            full_hf.select_columns(["action"])
+            full_hf.select_columns(self.train_config.action_keys)
                    .with_format(type="torch")
         )
         del full_hf
@@ -304,6 +285,51 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
             )
 
     # ------------------------------------------------------------------
+    # Action normalization stats
+    # ------------------------------------------------------------------
+
+    def _load_norm_stat_from_dataset_stats(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read per-key q01/q99 from ``meta/stats.json`` (identity transforms only)."""
+        from lerobot.datasets.io_utils import load_stats
+
+        stats = load_stats(self.root)
+        if stats is None:
+            raise ValueError(
+                f"{self.root.name}: meta/stats.json is missing. "
+                f"Compute dataset statistics before training."
+            )
+        per_key_q01: list[np.ndarray] = []
+        per_key_q99: list[np.ndarray] = []
+        for key, sub_map in zip(self.train_config.action_keys, self.train_config.action_key_channel_map):
+            if key not in stats:
+                raise ValueError(
+                    f"{self.root.name}: meta/stats.json has no entry for {key!r}."
+                )
+            key_stats = stats[key]
+            if "q01" not in key_stats or "q99" not in key_stats:
+                raise ValueError(
+                    f"{self.root.name}: stats for {key!r} missing 'q01'/'q99'."
+                )
+            q01_k = np.asarray(key_stats["q01"]).flatten()
+            q99_k = np.asarray(key_stats["q99"]).flatten()
+            expected_dim = len(sub_map)
+            if len(q01_k) != expected_dim or len(q99_k) != expected_dim:
+                raise ValueError(
+                    f"{self.root.name}: stats for {key!r} have q01/q99 length "
+                    f"{len(q01_k)}/{len(q99_k)}, expected {expected_dim} "
+                    f"(matching used_action_channel_ids sub-list)."
+                )
+            per_key_q01.append(q01_k)
+            per_key_q99.append(q99_k)
+        ns = build_norm_stat_from_raw_stats(
+            per_key_q01,
+            per_key_q99,
+            self.train_config.inverse_used_action_channel_ids,
+            self.train_config.action_key_channel_map,
+        )
+        return np.array(ns["q01"], dtype="float"), np.array(ns["q99"], dtype="float")
+
+    # ------------------------------------------------------------------
     # Action post-processing
     # ------------------------------------------------------------------
 
@@ -342,7 +368,11 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
         cat_latent = self._load_cat_latents(seg)
         text_emb = self._get_text_emb(seg)
 
-        action = self._hf_torch_view[seg.global_from : seg.global_to]["action"].numpy()
+        row_slice = self._hf_torch_view[seg.global_from : seg.global_to]
+        n_rows = seg.global_to - seg.global_from
+        parts = [row_slice[key].numpy().reshape(n_rows, -1)
+                 for key in self.train_config.action_keys]
+        action = np.concatenate(parts, axis=1)  # (T, total_raw_dim)
         actions, actions_mask = self._action_post_process(cat_latent.shape[0], action)
 
         return {

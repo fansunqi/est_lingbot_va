@@ -1,6 +1,6 @@
 # wan_va_config.json 样本配置
 
-本目录提供多套样本配置，选择一套复制到数据集根目录下 `meta/wan_va_config.json`，然后按需修改。
+选择一套样本配置复制到数据集 `meta/wan_va_config.json`，按需修改。
 
 ```bash
 cp wan_va/dataset/samples/wan_va_config.<场景>.json /path/to/your_dataset/meta/wan_va_config.json
@@ -10,9 +10,7 @@ cp wan_va/dataset/samples/wan_va_config.<场景>.json /path/to/your_dataset/meta
 
 ---
 
-## 你需要修改什么
-
-### preprocess（预处理 — 修改后需重新提取 latent）
+## preprocess（修改后需重新提取 latent）
 
 | 字段 | 说明 | 必须改？ |
 |---|---|---|
@@ -23,29 +21,51 @@ cp wan_va/dataset/samples/wan_va_config.<场景>.json /path/to/your_dataset/meta
 - **`obs_cam_keys` 顺序**：首个相机为主视角（top / high），其余为腕部视角；双腕时先左后右。
 - **`frame_stride` 选取原则**：使 `actual_fps = dataset_fps / frame_stride` 落在 **5–15 fps** 之间，10 fps 附近为佳。
 
-### training（训练 — 修改后无需重新提取 latent）
+## training（修改后无需重新提取 latent）
 
 | 字段 | 说明 | 必须改？ |
 |---|---|---|
-| `latent_layout` | latent 拼接方式，须与 `camera_preset` 匹配 | 一般不需要改 |
-| `action_transform` | action 变换方式 | 非 RoboTwin 数据集**固定** `identity` |
-| `action_dim` | 模型空间 action 宽度 | **固定为 30，不可修改** |
-| `used_action_channel_ids` | 有效 action 通道索引 | **是**，按数据集实际 action 语义调整，单臂默认为左臂 |
-| `action_norm_method` | 归一化方法 | 目前仅支持 `quantiles` |
-| `norm_stat` | 各通道的 1% / 99% 分位数 | 见下方说明 |
+| `latent_layout` | latent 拼接方式，须与 `camera_preset` 匹配 | 不改 |
+| `action_transform` | action 变换；非 RoboTwin 固定 `identity` | 不改 |
+| `action_dim` | 模型空间宽度，**固定 30** | 不改 |
+| `action_keys` | 从数据集读取 action 的字段名列表 | **是** |
+| `used_action_channel_ids` | 嵌套列表，每个字段到 30 维模型空间的通道映射 | **是** |
+| `action_norm_method` | 归一化方法，目前仅 `quantiles` | 不改 |
+| `norm_stat` | `identity` 时**禁止填写**（自动读取 `meta/stats.json`）；非 `identity` 时**必须填写** | 条件 |
 
-> **`norm_stat` 规则**：
-> - 当 `action_transform` 为 `"identity"` 时，**不要填写** `norm_stat`（填了会报错）。训练时会自动从数据集的 `meta/stats.json` 读取 `action` 字段的 `q01` / `q99` 分位数。
-> - 当 `action_transform` 不是 `"identity"`（如 `"robotwin_relative_pose_bimanual"`）时，**必须手动填写** `norm_stat`，因为 action 变换改变了原始 action 空间，数据集中的统计量不再适用。此时 `q01` 和 `q99` 的长度必须等于 `action_dim`（30），未使用的通道填 `0`。
+---
 
-### 30 维 action 语义约定
+## action_keys 与 used_action_channel_ids
+
+`action_keys` 指定读取哪些字段；`used_action_channel_ids` 是等长的嵌套列表，每个子列表将对应字段的每个 raw 维度映射到模型空间 `[0, 30)` 的位置。`null` 表示跳过该维度。子列表长度须等于字段 flatten 后的维度数，所有非 null 值全局不可重复。
+
+```jsonc
+// 单字段数据集
+"action_keys": ["action"],
+"used_action_channel_ids": [[0, 1, 2, 3, 4, 5, 28]]
+
+// 多字段数据集
+"action_keys": ["actions.end.position", "actions.end.orientation", "actions.effector.position"],
+"used_action_channel_ids": [
+  [0, 1, 2, 7, 8, 9],              // position  (2,3)→6D
+  [3, 4, 5, 6, 10, 11, 12, 13],    // orientation (2,4)→8D
+  [28, 29]                          // effector  (2,)→2D
+]
+
+// 部分选择 — null 跳过
+"used_action_channel_ids": [[0, null, 2, 7, null, 9]]
+```
+
+---
+
+## 30 维 action 语义
 
 | 维度 | 内容 |
 |---|---|
-| 0–6 | 左臂末端执行器（EEF）：x, y, z, qx, qy, qz, qw |
-| 7–13 | 右臂末端执行器（EEF）：x, y, z, qx, qy, qz, qw |
-| 14–20 | 左臂关节角 joint 1–7（本版本不使用，强制留空）|
-| 21–27 | 右臂关节角 joint 1–7（本版本不使用，强制留空）|
+| 0–6 | 左臂 EEF：x, y, z, qx, qy, qz, qw |
+| 7–13 | 右臂 EEF：x, y, z, qx, qy, qz, qw |
+| 14–20 | 左臂关节角（本版本留空）|
+| 21–27 | 右臂关节角（本版本留空）|
 | 28 | 左手夹爪 |
 | 29 | 右手夹爪 |
 
@@ -54,7 +74,7 @@ cp wan_va/dataset/samples/wan_va_config.<场景>.json /path/to/your_dataset/meta
 
 ---
 
-## 可用的相机预设
+## 相机预设
 
 | 预设名 | 相机数 | 各相机 Resize | 对应 latent_layout |
 |---|---|---|---|
@@ -70,12 +90,11 @@ cp wan_va/dataset/samples/wan_va_config.<场景>.json /path/to/your_dataset/meta
 ## 完整流程
 
 ```bash
-# 1. 复制样本配置到数据集目录
+# 1. 复制样本配置
 cp wan_va/dataset/samples/wan_va_config.demo.json \
    /path/to/your_dataset/meta/wan_va_config.json
 
-# 2. 按需编辑 obs_cam_keys、used_action_channel_ids 等
-#    （identity 场景无需填写 norm_stat，会自动从 meta/stats.json 读取）
+# 2. 编辑 obs_cam_keys、action_keys、used_action_channel_ids
 vim /path/to/your_dataset/meta/wan_va_config.json
 
 # 3. 提取 latent
@@ -83,5 +102,5 @@ python -m wan_va.dataset.extract_latents \
     --dataset-root /path/to/your_dataset \
     --model-path   /path/to/pretrained_wan
 
-# 4. 开始训练（训练代码会自动读取 meta/wan_va_config.json）
+# 4. 开始训练
 ```
