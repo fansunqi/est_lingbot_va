@@ -1,20 +1,22 @@
-"""Convert a local Wan2.2-TI2V-5B checkpoint to the Lingbot-VA layout.
+"""Convert Wan2.2-TI2V-5B weights into the Lingbot-VA layout.
+
+Recommended downloads::
+
+    hf download Wan-AI/Wan2.2-TI2V-5B --local-dir /path/to/Wan2.2-TI2V-5B
+    hf download robbyant/lingbot-va-base --local-dir /path/to/lingbot-va-base
 
 Usage::
 
     python script/convert_wan_to_diffusers.py \
         --wan_path /path/to/Wan2.2-TI2V-5B \
-        --text_encoder_dir /path/to/text_encoder \
-        --tokenizer_dir /path/to/tokenizer \
+        --text_encoder_dir /path/to/lingbot-va-base/text_encoder \
+        --tokenizer_dir /path/to/lingbot-va-base/tokenizer \
         --output_path /path/to/output
 
-The text encoder and tokenizer directories must already be in HuggingFace
-format (e.g. saved via ``save_pretrained``).  They are copied as-is into
-the output.
-
-The Lingbot-specific ``condition_embedder_action`` is warm-started from
-the converted ``condition_embedder``; ``action_embedder`` and
-``action_proj_out`` are freshly initialised (default ``nn.Linear`` init).
+``text_encoder`` and ``tokenizer`` are copied from ``lingbot-va-base``
+because this script expects HuggingFace-format directories, while the Wan
+release does not provide matching HF ``text_encoder/`` and ``tokenizer/``
+folders for direct reuse here.
 """
 
 import argparse
@@ -106,7 +108,6 @@ vae22_diffusers_config = {
         0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
         0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
     ],
-    "clip_output": False,
 }
 
 
