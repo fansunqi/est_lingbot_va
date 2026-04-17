@@ -43,9 +43,9 @@ from wan_va.dataset.latent_metadata import (
     load_frozen_latent_metadata,
     write_frozen_latent_metadata,
 )
-from wan_va.dataset.segment_builder import MIN_SAMPLED_FRAMES, Segment, build_segments, get_latent_filename
+from wan_va.dataset.segment_builder import MIN_SAMPLED_FRAMES, Segment, build_segments, get_latent_filename, read_index_columns
+from diffusers import AutoencoderKLWan
 from wan_va.modules.utils import (
-    WanVAEStreamingWrapper,
     load_text_encoder,
     load_tokenizer,
     load_vae,
@@ -110,18 +110,16 @@ def decode_video_segment(
 
 @torch.no_grad()
 def encode_video(
-    vae_wrapper: WanVAEStreamingWrapper,
+    vae: AutoencoderKLWan,
     video: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """Encode ``(1, C, T, H, W)`` → normalised latent ``(1, z_dim, T', H', W')``."""
     video = video.to(device=device, dtype=dtype)
-    vae_wrapper.clear_cache()
-    enc_out = vae_wrapper.encode_chunk(video)
-    mu, _ = torch.chunk(enc_out, 2, dim=1)
-    mean = torch.tensor(vae_wrapper.vae.config.latents_mean).to(mu.device).view(1, -1, 1, 1, 1)
-    std = torch.tensor(vae_wrapper.vae.config.latents_std).to(mu.device).view(1, -1, 1, 1, 1)
+    mu = vae.encode(video).latent_dist.mean
+    mean = torch.tensor(vae.config.latents_mean).to(mu.device).view(1, -1, 1, 1, 1)
+    std = torch.tensor(vae.config.latents_std).to(mu.device).view(1, -1, 1, 1, 1)
     return ((mu.float() - mean) / std).to(dtype)
 
 
@@ -315,8 +313,10 @@ def _validate_segment_latents(
 def _validate_dataset_convention(
     dataset_root: Path,
     meta: LeRobotDatasetMetadata,
-    hf_dataset,
     preprocess_cfg,
+    frame_col: np.ndarray,
+    task_col: np.ndarray,
+    subtask_col: np.ndarray | None,
 ):
     missing_cam_keys = [cam_key for cam_key in preprocess_cfg.obs_cam_keys if cam_key not in meta.features]
     if missing_cam_keys:
@@ -327,16 +327,8 @@ def _validate_dataset_convention(
     has_subtask = (
         meta.subtasks is not None
         and len(meta.subtasks) > 0
-        and "subtask_index" in hf_dataset.column_names
+        and subtask_col is not None
     )
-
-    columns = ["frame_index", "task_index"]
-    if has_subtask:
-        columns.append("subtask_index")
-    index_view = hf_dataset.select_columns(columns)
-    frame_col = np.asarray(index_view["frame_index"])
-    task_col = np.asarray(index_view["task_index"])
-    subtask_col = np.asarray(index_view["subtask_index"]) if has_subtask else None
 
     if len(meta.tasks) == 0:
         raise ValueError(f"{dataset_root.name}: meta/tasks is empty")
@@ -468,16 +460,18 @@ def extract_latents(
     cam_keys = preprocess_cfg.obs_cam_keys
 
     meta, hf_dataset = _load_v30_dataset(dataset_root)
-    _validate_dataset_convention(dataset_root, meta, hf_dataset, preprocess_cfg)
+    idx_cols = read_index_columns(hf_dataset)
+    frame_index_col, task_col, subtask_col = idx_cols
+
+    _validate_dataset_convention(dataset_root, meta, preprocess_cfg, frame_index_col, task_col, subtask_col)
     stride = preprocess_cfg.frame_stride
 
     segments = build_segments(
         episodes=meta.episodes,
-        hf_dataset=hf_dataset,
         subtasks=meta.subtasks,
         min_segment_frames=preprocess_cfg.min_segment_frames(min_sampled_frames=MIN_SAMPLED_FRAMES),
+        index_columns=idx_cols,
     )
-    frame_index_col = np.asarray(hf_dataset.select_columns(["frame_index"])["frame_index"])
     if not segments:
         raise ValueError(
             f"{dataset_root.name}: no segments remain after applying min_segment_frames="
@@ -488,7 +482,6 @@ def extract_latents(
 
     lerobot_ds = LeRobotDataset(repo_id="local", root=dataset_root, download_videos=False)
     vae = load_vae(str(model_path / "vae"), torch_dtype=dtype, torch_device=device)
-    vae_wrapper = WanVAEStreamingWrapper(vae)
 
     latent_base = dataset_root / "latents"
     for cam_key in cam_keys:
@@ -520,7 +513,8 @@ def extract_latents(
             video, frame_ids = decode_video_segment(
                 lerobot_ds, cam_key, seg, stride, frame_index_col, h_i, w_i,
             )
-            latent = encode_video(vae_wrapper, video, device, dtype).squeeze(0)
+            latent = encode_video(vae, video, device, dtype).squeeze(0)
+            del video
             ref_frame_ids, ref_latent_frames = _validate_segment_latents(
                 dataset_root,
                 seg,
@@ -544,8 +538,12 @@ def extract_latents(
                 },
                 out_path,
             )
+            del latent
 
     logger.info("Latent extraction complete.")
+    del vae
+    torch.cuda.empty_cache()
+
     text_emb_dir = dataset_root / "text_emb"
     _save_text_embeddings(dataset_root, model_path, meta, device, dtype)
     _validate_completed_outputs(

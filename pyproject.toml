@@ -38,3 +38,6 @@ packages = ["wan_va"]
 
 [tool.uv]
 no-build-isolation-package = ["flash-attn"]
+override-dependencies = [
+    "torchcodec==0.9.*", # latest for PyTorch 2.9
+]
