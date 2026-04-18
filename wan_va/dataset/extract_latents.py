@@ -123,26 +123,40 @@ def encode_video(
 def encode_texts(
     tokenizer, text_encoder, texts: list[str],
     device: torch.device, dtype: torch.dtype, max_seq_len: int = 512,
+    batch_size: int = 32,
 ) -> torch.Tensor:
     """Encode texts → ``(N, max_seq_len, hidden_dim)``."""
     from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 
-    inputs = tokenizer(
-        [prompt_clean(t) for t in texts],
-        padding="max_length", max_length=max_seq_len, truncation=True,
-        add_special_tokens=True, return_attention_mask=True, return_tensors="pt",
-    )
     enc_device = next(text_encoder.parameters()).device
-    embeds = text_encoder(
-        inputs.input_ids.to(enc_device), inputs.attention_mask.to(enc_device),
-    ).last_hidden_state
+    out: torch.Tensor | None = None
+    row = 0
 
-    seq_lens = inputs.attention_mask.gt(0).sum(dim=1).long()
-    result = []
-    for emb, slen in zip(embeds, seq_lens):
-        padded = torch.cat([emb[:slen], emb.new_zeros(max_seq_len - slen, emb.size(1))])
-        result.append(padded)
-    return torch.stack(result).to(dtype=dtype, device="cpu")
+    for i in tqdm(range(0, len(texts), batch_size),
+                   desc="Encoding texts", total=(len(texts) + batch_size - 1) // batch_size):
+        batch_texts = texts[i:i + batch_size]
+        inputs = tokenizer(
+            [prompt_clean(t) for t in batch_texts],
+            padding="max_length", max_length=max_seq_len, truncation=True,
+            add_special_tokens=True, return_attention_mask=True, return_tensors="pt",
+        )
+        embeds = text_encoder(
+            inputs.input_ids.to(enc_device), inputs.attention_mask.to(enc_device),
+        ).last_hidden_state
+
+        seq_lens = inputs.attention_mask.gt(0).sum(dim=1)
+
+        if out is None:
+            hidden_dim = embeds.shape[-1]
+            out = torch.zeros(len(texts), max_seq_len, hidden_dim, dtype=dtype)
+
+        for emb, slen in zip(embeds, seq_lens):
+            out[row, :slen] = emb[:slen].to(dtype=dtype)
+            row += 1
+
+    if out is None:
+        raise ValueError("encode_texts called with empty text list")
+    return out
 
 
 def _extract_indexed_texts(df, index_col: str, text_col: str | None, label: str) -> list[str]:
