@@ -100,7 +100,11 @@ vim /path/to/your_dataset/meta/wan_va_config.json
 # 3. 提取 latent
 python -m wan_va.dataset.extract_latents \
     --dataset-root /path/to/your_dataset \
-    --model-path   /path/to/pretrained_wan
+    --model-path   /path/to/pretrained_wan \
+    --num-gpus 6
+# --num-gpus 0（默认）使用所有可见 GPU。
+# 如果发现 CPU 占用率接近 100% 且部分 GPU 利用率为 0%，
+# 说明并行 worker 过多，请适当调低 --num-gpus。
 
 # 4. 开始训练
 ```

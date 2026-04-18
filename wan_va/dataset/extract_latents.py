@@ -12,7 +12,13 @@ Usage::
 
     python -m wan_va.dataset.extract_latents \\
         --dataset-root /path/to/v30_dataset \\
-        --model-path   /path/to/pretrained_wan
+        --model-path   /path/to/pretrained_wan \\
+        --num-gpus 6
+
+``--num-gpus 0`` (default) uses all visible GPUs.  If you observe CPU
+utilisation pinned near 100 % and some GPUs idling at 0 %, reduce
+``--num-gpus`` until CPU headroom reappears — too many parallel workers
+can saturate CPU / IO and hurt overall throughput.
 """
 
 import argparse
@@ -370,6 +376,7 @@ def _extraction_worker(
     rank: int, world_size: int, gpu_ids: list[int],
     dataset_root: Path, model_path: Path, dtype: torch.dtype,
     seg_work: list, stride: int, vae_temporal_downsample: int, actual_fps: float,
+    progress_counter,
 ):
     """Encode latents for ``seg_work[rank::world_size]`` on ``cuda:{gpu_ids[rank]}``."""
     device = torch.device(f"cuda:{gpu_ids[rank]}")
@@ -395,10 +402,10 @@ def _extraction_worker(
     try:
         # max_workers=1: torchcodec's VideoDecoder is not thread-safe.
         prefetch: Future | None = None
+        bar = tqdm(total=len(seg_work), desc="Extracting latents",
+                   smoothing=0.05, disable=(rank != 0))
         with ThreadPoolExecutor(max_workers=1) as pool:
-            for si, (seg, cams) in enumerate(
-                tqdm(my_work, desc=f"GPU {gpu_ids[rank]}", disable=(rank != 0))
-            ):
+            for si, (seg, cams) in enumerate(my_work):
                 decoded = prefetch.result() if prefetch is not None else _decode_seg(seg, cams)
                 prefetch = (
                     pool.submit(_decode_seg, *my_work[si + 1])
@@ -435,7 +442,14 @@ def _extraction_worker(
                         "fps": actual_fps,
                     }, out_path)
                     del latent
+
+                with progress_counter.get_lock():
+                    progress_counter.value += 1
+                    count = progress_counter.value
+                if rank == 0:
+                    bar.update(count - bar.n)
     finally:
+        bar.close()
         del vae
         torch.cuda.empty_cache()
 
@@ -515,11 +529,13 @@ def extract_latents(
         default_gpu = gpu_ids[0]
         logger.info("Encoding on %d GPU(s) %s — %d segments", len(gpu_ids), gpu_ids, len(seg_work))
 
+        counter = mp.get_context("spawn").Value('i', 0)
         args = (
             len(gpu_ids), gpu_ids, dataset_root, model_path, dtype,
             seg_work, stride,
             in_progress_metadata.vae_temporal_downsample,
             in_progress_metadata.actual_fps,
+            counter,
         )
         if len(gpu_ids) <= 1:
             _extraction_worker(0, *args)
