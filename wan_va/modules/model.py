@@ -106,7 +106,7 @@ class FlexAttnFunc(nn.Module):
         B, _, L_F, L_H, L_W = latent_shape
         _, _, A_F, A_H, A_W = action_shape
 
-        latent_seq_id = torch.arange(B)[:, None, None, None].\
+        latent_seq_id = torch.arange(B, device=device)[:, None, None, None].\
             expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2])  # (B, F', H', W')
         if latents_mask is not None:
             assert patch_size[0] == 1, \
@@ -115,7 +115,7 @@ class FlexAttnFunc(nn.Module):
             mask_4d = latents_mask.to(device=device)[:, :, None, None].expand_as(latent_seq_id)
             latent_seq_id = latent_seq_id.masked_fill(~mask_4d, -1)
         latent_seq_id = latent_seq_id.flatten()
-        action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W)  # (B, A_F, A_H, A_W)
+        action_seq_id = torch.arange(B, device=device)[:, None, None, None].expand(-1, A_F, A_H, A_W)  # (B, A_F, A_H, A_W)
         if latents_mask is not None:
             # A_F == L_F (same frame_ids), so latents_mask applies directly to action tokens.
             mask_4d = latents_mask.to(device=device)[:, :, None, None].expand_as(action_seq_id)
