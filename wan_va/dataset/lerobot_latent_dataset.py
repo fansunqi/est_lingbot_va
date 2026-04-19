@@ -351,6 +351,7 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
         action = action[:, inv_ids]
         action_mask = action_mask[:, inv_ids]
         action = (action - self.q01) / (self.q99 - self.q01 + 1e-6) * 2.0 - 1.0
+        action = np.clip(action, -1.5, 1.5)
         action = rearrange(action, "(f n) c -> c f n 1", f=latent_frame_num)
         action_mask = rearrange(action_mask, "(f n) c -> c f n 1", f=latent_frame_num)
         action *= action_mask
