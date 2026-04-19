@@ -1,3 +1,64 @@
+# Internal Quick Start
+
+> **Maintainer note** (mzh) — 以下为内部使用指南，与上游原版 README 无关。
+
+## 1. 环境配置
+
+在公司集群上，**代码仓库及其虚拟环境建议放在 `/home` 的子目录下**。由于集群对一些目录的文件访问与通信效率很低，如果环境放在共享盘或其它慢目录，Python 启动和模块导入都会明显变慢。
+
+推荐做法是：
+
+- 将仓库克隆到 `/home/<某个文件夹>/...` 这样的本地子目录中运行。
+- 在项目根目录执行 `uv sync` 创建并同步依赖。
+- 使用 `source .venv/bin/activate` 激活项目虚拟环境。
+
+## 2. VAE Latent 预处理
+
+每个数据集在训练前都需要单独提取 VAE latent。配置方式详见 [`wan_va/dataset/README.md`](wan_va/dataset/README.md)。
+
+```bash
+python -m wan_va.dataset.extract_latents \
+    --dataset-root /path/to/your_dataset \
+    --model-path   /apdcephfs_gy5/share_303588738/leoyizhang/model/wan-base \
+    --num-gpus 6
+```
+
+- `--num-gpus 6`：公司机器上建议限制为 6。开得过大时，容易出现数据读取阻塞，CPU 占用率突增到 100%，但整体吞吐反而变差。
+- 脚本支持断点续跑；如果中途中断或遇到异常，直接重新执行即可。
+
+<details>
+<summary><b>FAQ: 找不到 ffmpeg</b></summary>
+
+```bash
+conda create -n ffmpeg python -y
+conda install -n ffmpeg -c conda-forge ffmpeg -y
+
+# 注意：不要激活 conda 环境，仅借用其 ffmpeg 二进制
+source .venv/bin/activate
+export FFMPEG_ENV="$(conda env list | awk '$1=="ffmpeg" {print $NF}')"
+export PATH="$FFMPEG_ENV/bin:$PATH"
+export LD_LIBRARY_PATH="$FFMPEG_ENV/lib:${LD_LIBRARY_PATH:-}"
+```
+
+设置后直接重新运行提取脚本即可。
+</details>
+
+## 3. 训练
+
+训练配置说明详见 [`wan_va/configs/README.md`](wan_va/configs/README.md)。
+
+```bash
+# 1. 先修改 wandb 配置
+vim script/run_va_posttrain.sh   # 填写 WANDB_API_KEY / WANDB_BASE_URL / WANDB_TEAM_NAME 等
+
+# 2. 启动单机多卡训练（直接可在公司集群上运行的示例）
+NGPU=8 CONFIG_NAME='test_train' bash script/run_va_posttrain.sh
+```
+
+> **OOM 警告**：当前版本尚未实现变长序列拼接优化与序列长度上限控制，**不要随意把 `batch_size` 调到大于 1**。在 100 GB 显存的卡上，这样做很容易 OOM。若需要增大有效 batch，优先调高 `gradient_accumulation_steps`。后续版本会增加相应处理，同时均衡各 GPU 负载。
+
+---
+
 <h1 align="center">LingBot-VA: Causal World Modeling for Robot Control</h1>
 
 <p align="center">
@@ -120,7 +181,7 @@ This processes the example data from `examples/0/` and saves visualizations to `
 
 **Preparing the Environment**
 
-You can follow the official instructions from the original RoboTwin-2.0 repository:  
+You can follow the official instructions from the original RoboTwin-2.0 repository:
 [https://robotwin-platform.github.io/doc/usage/robotwin-install.html](https://robotwin-platform.github.io/doc/usage/robotwin-install.html)
 
 
@@ -497,7 +558,7 @@ manipulation (Fold Clothes, Fold Pants). Our method achieves state-of-the-art pe
 <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;">
   <!-- 指标说明 -->
   <p style="font-size: 12px; color: #666; margin-bottom: 5px;">* All metrics are reported in percentage (%). Higher values are <b>bolded</b>.</p>
-  
+
   <table style="border-collapse: collapse; width: auto; font-size: 13px; line-height: 1.2;">
     <thead>
       <tr style="border-top: 2px solid black;">
@@ -576,4 +637,4 @@ This work builds upon several excellent open-source projects:
 For questions, discussions, or collaborations:
 
 - **Issues**: Open an [issue](https://github.com/robbyant/lingbot-va/issues) on GitHub
-- **Email**: Contact Dr. [Qihang Zhang](https://zqh0253.github.io/) (liuhuan.zqh@antgroup.com) or Dr. [Lin Li](https://lilin-hitcrt.github.io/) (fengchang.ll@antgroup.com) 
+- **Email**: Contact Dr. [Qihang Zhang](https://zqh0253.github.io/) (liuhuan.zqh@antgroup.com) or Dr. [Lin Li](https://lilin-hitcrt.github.io/) (fengchang.ll@antgroup.com)
