@@ -6,7 +6,7 @@ from .shared_config import va_shared_cfg
 
 va_franka_cfg = EasyDict(__name__='Config: VA franka')
 va_franka_cfg.update(va_shared_cfg)
-va_shared_cfg.infer_mode = 'server'
+va_franka_cfg.infer_mode = 'server'
 
 va_franka_cfg.wan22_pretrained_model_name_or_path = "/path/to/pretrained/model"
 

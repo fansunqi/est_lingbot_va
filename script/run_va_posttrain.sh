@@ -3,7 +3,10 @@
 set -x
 
 umask 007
- 
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../.venv/bin/activate"
+
 NGPU=${NGPU:-"8"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
@@ -30,7 +33,7 @@ config_name=${CONFIG_NAME}
 
 ## cmd setting
 export TOKENIZERS_PARALLELISM=false
-PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
+PYTORCH_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
 python -m torch.distributed.run \
     --nproc_per_node=${num_gpu} \
     --local-ranks-filter=${log_rank} \

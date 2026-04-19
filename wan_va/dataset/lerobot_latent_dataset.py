@@ -151,7 +151,7 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
             q01, q99 = self._load_norm_stat_from_dataset_stats()
         self.q01 = q01[None]  # (1, action_dim)
         self.q99 = q99[None]  # (1, action_dim)
-        if hasattr(config, "action_dim") and self.train_config.action_dim != config.action_dim:
+        if self.train_config.action_dim != config.action_dim:
             raise ValueError(
                 f"{self.root.name}: dataset action_dim={self.train_config.action_dim} does not match "
                 f"training config action_dim={config.action_dim}"
