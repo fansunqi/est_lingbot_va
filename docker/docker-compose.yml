@@ -1,0 +1,38 @@
+services:
+  lingbot-eval:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lingbot-va-eval:latest
+    container_name: lingbot-eval
+
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Mount code repos and model weights
+    volumes:
+      - ${LINGBOT_VA_PATH:-./../}:/workspace/lingbot-va
+      - ${ROBOTWIN_PATH:-./../../RoboTwin}:/workspace/RoboTwin
+      - ${MODEL_PATH}:/workspace/models/lingbot-va-posttrain-robotwin
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - no_proxy=localhost,127.0.0.1,0.0.0.0
+      - NO_PROXY=localhost,127.0.0.1,0.0.0.0
+
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+
+    # Use host network for easy websocket communication
+    network_mode: host
+
+    # Shared memory for PyTorch DataLoader
+    shm_size: '8g'

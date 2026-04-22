@@ -130,9 +130,17 @@ class VA_Server:
         text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
+        if self.enable_offload:
+            self.transformer.to('cpu')
+            torch.cuda.empty_cache()
+            self.text_encoder.to(self.device)
         text_encoder_device = next(self.text_encoder.parameters()).device
         prompt_embeds = self.text_encoder(text_input_ids.to(text_encoder_device),
                                           mask.to(text_encoder_device)).last_hidden_state
+        if self.enable_offload:
+            self.text_encoder.to('cpu')
+            torch.cuda.empty_cache()
+            self.transformer.to(self.device)
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack([
@@ -347,6 +355,13 @@ class VA_Server:
                                             align_corners=False).unsqueeze(0)
             videos.append(history_video_k)
 
+        if self.enable_offload:
+            self.transformer.to('cpu')
+            torch.cuda.empty_cache()
+            self.vae.to(self.device)
+            if self.streaming_vae_half is not None and self.streaming_vae_half.vae is not self.vae:
+                self.streaming_vae_half.vae.to(self.device)
+
         if self.env_type == 'robotwin_tshape':
             videos_high = videos[0] / 255.0 * 2.0 - 1.0
             videos_left_and_right = torch.cat(videos[1:],
@@ -366,6 +381,13 @@ class VA_Server:
             vae_device = next(self.streaming_vae.vae.parameters()).device
             videos_chunk = videos.to(vae_device).to(self.dtype)
             enc_out = self.streaming_vae.encode_chunk(videos_chunk)
+
+        if self.enable_offload:
+            self.vae.to('cpu')
+            if self.streaming_vae_half is not None and self.streaming_vae_half.vae is not self.vae:
+                self.streaming_vae_half.vae.to('cpu')
+            torch.cuda.empty_cache()
+            self.transformer.to(self.device)
 
         mu, logvar = torch.chunk(enc_out, 2, dim=1)
         latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)

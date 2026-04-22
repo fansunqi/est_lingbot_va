@@ -1,5 +1,7 @@
 #!/bin/bash
 export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:$LD_LIBRARY_PATH
+export no_proxy=localhost,127.0.0.1,0.0.0.0
+export NO_PROXY=localhost,127.0.0.1,0.0.0.0
 
 task_groups=(
   "stack_bowls_three handover_block hanging_mug scan_object lift_pot put_object_cabinet stack_blocks_three place_shoe"
