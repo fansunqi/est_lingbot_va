@@ -8,7 +8,7 @@ import wandb
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -36,14 +36,15 @@ from modules.utils import (
 from utils import (
     init_logger, 
     logger, 
-    get_mesh_id, 
+    get_mesh_id_packed,
     sample_timestep_id,
     data_seq_to_patch,
     warmup_constant_lambda,
     FlowMatchScheduler
 )
 
-from dataset import MultiLatentLeRobotDataset, collate_variable_f
+from dataset import MultiLatentLeRobotDataset, PackingDataset
+from dataset.packing import packed_collate
 import gc
 
 
@@ -85,7 +86,10 @@ class Trainer:
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
+            attn_mode='flex',
         )
+        if self.transformer.config.attn_mode != 'flex':
+            raise RuntimeError("packed training requires attn_mode='flex'")
 
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
@@ -118,21 +122,25 @@ class Trainer:
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(config=config)
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=config.world_size,
+        packing_cfg = config.packing
+        self._packing_epoch = 0
+        self.train_dataset = PackingDataset(
+            multi_ds=MultiLatentLeRobotDataset(config=config),
+            max_tokens=packing_cfg.max_tokens,
+            max_episodes_per_bin=packing_cfg.max_episodes_per_bin,
+            world_size=config.world_size,
             rank=config.rank,
-            shuffle=True,
-            seed=42
-        ) if config.world_size > 1 else None
+            seed=42,
+            epoch=self._packing_epoch,
+        )
+        self._log_packing_alignment(packing_cfg)
         self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            shuffle=(train_sampler is None),
+            self.train_dataset,
+            batch_size=1,
+            shuffle=False,
             num_workers=config.load_worker,
-            sampler=train_sampler,
-            collate_fn=collate_variable_f,
+            collate_fn=packed_collate,
+            persistent_workers=False,
         )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -145,62 +153,83 @@ class Trainer:
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
-        # if hasattr(config, 'resume_from') and config.resume_from:
-        #     self._load_training_state(config.resume_from)
-    
+        self._bin_in_epoch = 0
+        if hasattr(config, 'resume_from') and config.resume_from:
+            self._load_training_state(config.resume_from)
+
+    def _log_packing_alignment(self, packing_cfg):
+        """Log packing calibration at startup."""
+        logger.info(
+            "Packing: tpf=%d  F_max=%d  max_tokens=%d  overlap=%d  bins=%d",
+            self.train_dataset.tokens_per_frame, self.train_dataset.F_max,
+            packing_cfg.max_tokens, self.train_dataset.overlap,
+            len(self.train_dataset),
+        )
+
     def _get_next_batch(self):
-        """Get next batch from iterator, reset if epoch is finished."""
+        """Get next batch; at an epoch boundary rebuild the packing plan."""
         if self.train_loader_iter is None:
             self.train_loader_iter = iter(self.train_loader)
-        
+
         try:
             batch = next(self.train_loader_iter)
         except StopIteration:
-            # Reset sampler and iterator when epoch finishes
-            if hasattr(self.train_loader.sampler, 'set_epoch'):
-                self.train_loader.sampler.set_epoch(self.train_loader.sampler.epoch + 1)
+            self._packing_epoch += 1
+            self._bin_in_epoch = 0
+            self.train_dataset.set_epoch(self._packing_epoch, start_bin=0)
             self.train_loader_iter = iter(self.train_loader)
             batch = next(self.train_loader_iter)
-        
+
+        self._bin_in_epoch += 1
         return batch
 
     @torch.no_grad()
-    def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
-        B, C, F, H, W = latent.shape
+    def _add_noise(self, latent, train_scheduler, episode_boundaries,
+                   action_mask=None, action_mode=False, noisy_cond_prob=0.,
+                   frame_offsets=None):
+        B, _, F_dim, H, W = latent.shape
+        ep_lens = [int(x) for x in episode_boundaries.tolist()]
+        assert sum(ep_lens) == F_dim
 
-        timestep_ids = sample_timestep_id(batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps)
-        noise = torch.zeros_like(latent).normal_()
+        timestep_ids = sample_timestep_id(
+            batch_size=F_dim,
+            num_train_timesteps=train_scheduler.num_train_timesteps,
+        )
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
-        noisy_latents =train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
-        targets =train_scheduler.training_target(latent, noise, timesteps)
+        noise = torch.zeros_like(latent).normal_()
+        noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
+        targets = train_scheduler.training_target(latent, noise, timesteps)
 
+        # Episode-global RoPE grid_id.
         patch_f, patch_h, patch_w = self.patch_size
         if action_mode:
             patch_f = patch_h = patch_w = 1
-        
-        latent_grid_id = get_mesh_id(
-            latent.shape[-3] // patch_f,  # F
-            latent.shape[-2] // patch_h,  # H
-            latent.shape[-1] // patch_w,  # W
-            t=1 if action_mode else 0,  # 1 for action mode (0 for latent), not used
-            f_w=1,
-            f_shift=0,
-            action=action_mode
-        ).to(self.device)  # shape: [4, seq_len]
-        latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
+        fo = [o // patch_f for o in frame_offsets] if frame_offsets else None
+        latent_grid_id = get_mesh_id_packed(
+            [L // patch_f for L in ep_lens], H // patch_h, W // patch_w,
+            t=1 if action_mode else 0, action=action_mode,
+            frame_offsets=fo,
+        ).to(self.device)[None].repeat(B, 1, 1)
 
-        if torch.rand(1).item() < noisy_cond_prob:
-            cond_timestep_ids = sample_timestep_id(
-                    batch_size=F,
-                    min_timestep_bd=0.5, 
-                    max_timestep_bd=1.0, 
+        cond_timesteps = torch.zeros_like(timesteps)
+        if noisy_cond_prob > 0.:
+            drop = torch.rand(len(ep_lens)) < noisy_cond_prob
+            if drop.any():
+                ep_lens_t = torch.as_tensor(ep_lens, device=self.device)
+                drop_per_frame = torch.repeat_interleave(
+                    drop.to(self.device), ep_lens_t,
+                )
+                cond_ids = sample_timestep_id(
+                    batch_size=F_dim,
+                    min_timestep_bd=0.5, max_timestep_bd=1.0,
                     num_train_timesteps=train_scheduler.num_train_timesteps,
                 )
-            noise = torch.zeros_like(latent).normal_()
-            cond_timesteps = train_scheduler.timesteps[cond_timestep_ids].to(device=self.device)
-            latent = train_scheduler.add_noise(latent, noise, cond_timesteps, t_dim=2)
-        else:
-            cond_timesteps = torch.zeros_like(timesteps)
+                cond_ts = train_scheduler.timesteps[cond_ids].to(device=self.device)
+                noised = train_scheduler.add_noise(
+                    latent, torch.zeros_like(latent).normal_(), cond_ts, t_dim=2,
+                )
+                latent = torch.where(drop_per_frame.view(1, 1, F_dim, 1, 1), noised, latent)
+                cond_timesteps = torch.where(drop_per_frame, cond_ts, cond_timesteps)
 
         if action_mask is not None:
             noisy_latents *= action_mask.float()
@@ -218,36 +247,47 @@ class Trainer:
 
     @torch.no_grad()
     def _prepare_input_dict(self, batch_dict):
-        """Prepare input dict following infer code pattern from wan_va_server.py."""
-        # Generate grid_id following infer code (no batch dimension yet)
-        # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
+        ep_bounds = batch_dict['episode_boundaries']
+        ep_lens = [int(x) for x in ep_bounds.tolist()]
+
+        # Per-episode RoPE offset from frame_ids_episode.
+        fids = batch_dict['frame_ids_episode'].squeeze(0)
+        cum = 0
+        frame_offsets = []
+        for L in ep_lens:
+            frame_offsets.append(int(fids[cum].item()))
+            cum += L
+
         latent_dict = self._add_noise(
-            latent=batch_dict['latents'], 
-            train_scheduler=self.train_scheduler_latent, 
-            action_mask=None, 
-            action_mode=False,
-            noisy_cond_prob=0.5)
-        
+            latent=batch_dict['latents'],
+            train_scheduler=self.train_scheduler_latent,
+            episode_boundaries=ep_bounds,
+            noisy_cond_prob=0.5,
+            frame_offsets=frame_offsets,
+        )
         action_dict = self._add_noise(
-            latent=batch_dict['actions'], 
-            train_scheduler=self.train_scheduler_action, 
-            action_mask=batch_dict['actions_mask'], 
+            latent=batch_dict['actions'],
+            train_scheduler=self.train_scheduler_action,
+            episode_boundaries=ep_bounds,
+            action_mask=batch_dict['actions_mask'],
             action_mode=True,
-            noisy_cond_prob=0.0)
+            frame_offsets=frame_offsets,
+        )
 
         latent_dict['text_emb'] = batch_dict['text_emb']
-        if 'latents_mask' in batch_dict:
-            latent_dict['latents_mask'] = batch_dict['latents_mask']
+        latent_dict['latents_mask'] = batch_dict['latents_mask']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_dict['actions_mask']
 
-        input_dict = {
+        return {
             'latent_dict': latent_dict,
             'action_dict': action_dict,
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
+            'seq_ids_per_frame': batch_dict['seq_ids'],
+            'frame_ids_per_frame': batch_dict['frame_ids_episode'],
+            'n_episodes': int(ep_bounds.shape[0]),
         }
-        return input_dict
 
     def convert_input_format(self, input_dict):
         """Convert input dict to match transformer input format if needed."""
@@ -269,19 +309,13 @@ class Trainer:
         latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
         action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
 
-        frame_valid = (
-            input_dict['latent_dict']['latents_mask'].flatten().float()
-            if 'latents_mask' in input_dict['latent_dict'] else None
-        )
+        frame_valid = input_dict['latent_dict']['latents_mask'].flatten().float()
 
         latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
         latent_loss = latent_loss.permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)  # (B*F, H*W*C)
         latent_loss_per_frame = latent_loss.sum(dim=1) / latent_loss.shape[1]
-        latent_loss = (
-            (latent_loss_per_frame * frame_valid).sum() / (frame_valid.sum() + 1e-6)
-            if frame_valid is not None else latent_loss_per_frame.mean()
-        )
+        latent_loss = (latent_loss_per_frame * frame_valid).sum() / (frame_valid.sum() + 1e-6)
 
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
         action_loss = action_loss * action_loss_weight[:, None, :, None, None]
@@ -289,10 +323,7 @@ class Trainer:
         action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)
         action_loss = action_loss.permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)  # (B*F, H*W*C)
         action_loss_per_frame = action_loss.sum(dim=1) / (action_mask.sum(dim=1) + 1e-6)
-        action_loss = (
-            (action_loss_per_frame * frame_valid).sum() / (frame_valid.sum() + 1e-6)
-            if frame_valid is not None else action_loss_per_frame.mean()
-        )
+        action_loss = (action_loss_per_frame * frame_valid).sum() / (frame_valid.sum() + 1e-6)
 
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
 
@@ -338,10 +369,11 @@ class Trainer:
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
+            # Optimizer state gather is collective — all ranks must call.
+            optim_state = get_optimizer_state_dict(
+                self.transformer, self.optimizer,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
 
             # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
@@ -366,14 +398,16 @@ class Trainer:
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
 
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
+                # Training state.
+                training_state_path = checkpoint_dir / "training_state.pt"
+                torch.save({
+                    'step': self.step,
+                    'packing_epoch': self._packing_epoch,
+                    'bin_in_epoch': self._bin_in_epoch,
+                    'optimizer_state_dict': optim_state,
+                    'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
+                }, training_state_path)
+                logger.info(f"Saved training state to {training_state_path}")
 
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
 
@@ -391,33 +425,63 @@ class Trainer:
                 dist.barrier()
 
     def _load_training_state(self, checkpoint_path):
-        """Load training state (optimizer + step) after FSDP and optimizer creation."""
+        """Restore step, packing position, optimizer and LR scheduler."""
         checkpoint_dir = Path(checkpoint_path)
         training_state_path = checkpoint_dir / "training_state.pt"
 
         if not training_state_path.exists():
             if self.config.rank == 0:
-                logger.warning(f"Training state not found: {training_state_path}, starting from step 0")
+                logger.warning(
+                    f"Training state not found: {training_state_path}, starting from step 0"
+                )
             return
 
         if self.config.rank == 0:
             logger.info(f"Loading training state from {training_state_path}")
 
-        # All ranks load the training state directly
-        training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
-
-        # All ranks load optimizer state (required for FSDP)
-        set_optimizer_state_dict(
-            self.transformer, self.optimizer,
-            optim_state_dict=training_state['optimizer_state_dict'],
-            options=StateDictOptions(full_state_dict=True, strict=False)
+        training_state = torch.load(
+            training_state_path, map_location='cpu', weights_only=False
         )
-        self.step = training_state.get('step', 0)
+
+        if 'optimizer_state_dict' in training_state:
+            set_optimizer_state_dict(
+                self.transformer, self.optimizer,
+                optim_state_dict=training_state['optimizer_state_dict'],
+                options=StateDictOptions(full_state_dict=True, strict=False),
+            )
+        else:
+            logger.warning("Missing 'optimizer_state_dict' — cold optimizer restart.")
+
+        if 'lr_scheduler_state_dict' in training_state:
+            self.lr_scheduler.load_state_dict(
+                training_state['lr_scheduler_state_dict']
+            )
+        else:
+            logger.warning("Missing 'lr_scheduler_state_dict' — schedule restarts from 0.")
+
+        self.step = int(training_state.get('step', 0))
+        self._packing_epoch = int(training_state.get('packing_epoch', 0))
+        self._bin_in_epoch = int(training_state.get('bin_in_epoch', 0))
+
+        # Fast-forward the packing dataset to the saved position.
+        self.train_dataset.set_epoch(self._packing_epoch, start_bin=0)
+        per_rank_bin_count = len(self.train_dataset)
+        if self._bin_in_epoch >= per_rank_bin_count:
+            self._packing_epoch += 1
+            self._bin_in_epoch = 0
+            self.train_dataset.set_epoch(self._packing_epoch, start_bin=0)
+        elif self._bin_in_epoch > 0:
+            self.train_dataset.set_epoch(self._packing_epoch, start_bin=self._bin_in_epoch)
+        self.train_loader_iter = None
 
         if self.config.rank == 0:
-            logger.info(f"Training state loaded, resuming from step {self.step}")
+            logger.info(
+                "Resumed from step=%d, packing_epoch=%d, bin_in_epoch=%d "
+                "(bins remaining on rank=%d)",
+                self.step, self._packing_epoch, self._bin_in_epoch,
+                len(self.train_dataset),
+            )
 
-        # Synchronize all ranks
         if dist.is_initialized():
             dist.barrier()
 

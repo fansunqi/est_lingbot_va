@@ -11,7 +11,6 @@ Follows LATENT_DATA_DESIGN.md:
 """
 
 import logging
-from bisect import bisect_right
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
@@ -76,12 +75,18 @@ def _infer_raw_action_dims(hf_dataset, action_keys: list[str]) -> list[int]:
 # Per-dataset latent dataset
 # ---------------------------------------------------------------------------
 
-class LatentLeRobotDataset(torch.utils.data.Dataset):
-    """Single-dataset latent loader.  Does NOT inherit from ``LeRobotDataset``."""
+class LatentLeRobotDataset:
+    """Single-dataset latent loader. Used by ``PackingDataset`` via
+    ``load_segment_window`` / ``sample_text_emb``."""
 
     def __init__(self, root: str | Path, config):
         self.root = Path(root)
         self.cfg_prob: float = config.cfg_prob
+        self.patch_size = tuple(config.patch_size)
+        if len(self.patch_size) != 3:
+            raise ValueError(
+                f"config.patch_size must be a 3-tuple (F, H, W), got {self.patch_size}"
+            )
         self.expected_model_path = (
             str(Path(config.wan22_pretrained_model_name_or_path).resolve())
             if hasattr(config, "wan22_pretrained_model_name_or_path")
@@ -358,84 +363,81 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
         return torch.from_numpy(action).float(), torch.from_numpy(action_mask).bool()
 
     # ------------------------------------------------------------------
-    # __getitem__ / __len__
+    # Packing support: tokens-per-frame + windowed segment loader
     # ------------------------------------------------------------------
 
-    def __len__(self):
-        return len(self.segments)
+    @property
+    def tokens_per_frame(self) -> int:
+        """Transformer tokens per latent frame."""
+        from .token_math import tokens_per_frame as _tpf
+        H_lat, W_lat = self._concat_latent_hw()
+        return _tpf(
+            H_lat=H_lat, W_lat=W_lat,
+            patch_h=self.patch_size[1],
+            patch_w=self.patch_size[2],
+            n_action=self.action_steps_per_latent_frame,
+        )
 
-    def __getitem__(self, idx) -> dict:
-        seg = self.segments[idx % len(self.segments)]
-        cat_latent = self._load_cat_latents(seg)
-        text_emb = self._get_text_emb(seg)
+    def segment_latent_frames(self, seg: Segment) -> int:
+        """On-disk latent frame count for *seg*."""
+        n_sampled = (seg.global_to - seg.global_from + self.frame_stride - 1) // self.frame_stride
+        return (n_sampled - 1) // self.time_downsample + 1
+
+    def _concat_latent_hw(self) -> tuple[int, int]:
+        """``(H_lat, W_lat)`` of the concatenated latent."""
+        from .latent_metadata import DEFAULT_VAE_SPATIAL_DOWNSAMPLE as DS
+        resolved = self.preprocess_config.resolved_camera_resolutions()
+        latent_hws = [(H // DS, W // DS) for H, W in
+                      (resolved[k] for k in self.used_video_keys)]
+        if self.train_config.latent_layout == "robotwin_tshape":
+            primary_H, primary_W = latent_hws[0]
+            return primary_H + latent_hws[1][0], primary_W
+        H_lat = latent_hws[0][0]
+        W_lat = sum(w for _, w in latent_hws)
+        return H_lat, W_lat
+
+    def load_segment_window(
+        self,
+        seg: Segment,
+        attn_start: int,
+        attn_stop: int,
+    ) -> dict:
+        """Load latent-frame window ``[attn_start, attn_stop)`` of *seg*.
+
+        Actions are post-processed over the *full* segment before slicing,
+        so reference-frame-dependent transforms (e.g. relative pose) stay
+        anchored to the true episode start.
+        """
+        cat_latent = self._load_cat_latents(seg)  # (F_lat, H, W, C)
+        latent_F = cat_latent.shape[0]
+        if not (0 <= attn_start < attn_stop <= latent_F):
+            raise ValueError(
+                f"load_segment_window: bad range [{attn_start}, {attn_stop}) "
+                f"for segment with latent_F={latent_F}"
+            )
 
         row_slice = self._hf_torch_view[seg.global_from : seg.global_to]
         n_rows = seg.global_to - seg.global_from
         parts = [row_slice[key].numpy().reshape(n_rows, -1)
                  for key in self.train_config.action_keys]
-        action = np.concatenate(parts, axis=1)  # (T, total_raw_dim)
-        actions, actions_mask = self._action_post_process(cat_latent.shape[0], action)
-
+        action = np.concatenate(parts, axis=1)
+        actions_full, actions_mask_full = self._action_post_process(latent_F, action)
         return {
-            "latents": cat_latent.permute(3, 0, 1, 2),  # C F H W
-            "text_emb": text_emb,
-            "actions": actions,
-            "actions_mask": actions_mask,
+            "latents": cat_latent[attn_start:attn_stop].permute(3, 0, 1, 2),  # C F H W
+            "actions": actions_full[:, attn_start:attn_stop],
+            "actions_mask": actions_mask_full[:, attn_start:attn_stop],
         }
 
-
-# ---------------------------------------------------------------------------
-# Collate function for variable-length segments
-# ---------------------------------------------------------------------------
-
-_VARIABLE_F_KEYS: frozenset[str] = frozenset({"latents", "actions", "actions_mask"})
-
-
-def collate_variable_f(batch: list[dict]) -> dict:
-    """Collate variable-length segments into a padded batch.
-
-    Tensors in ``_VARIABLE_F_KEYS`` are zero-padded along dim 1 (F) to the
-    maximum length in the batch; all other tensors are stacked as-is.
-    A ``latents_mask (B, F)`` boolean tensor is added alongside ``latents``
-    to mark valid vs. padding frames for loss and attention masking.
-    """
-    result: dict = {}
-    latents_mask: torch.Tensor | None = None
-
-    for key in batch[0]:
-        vals = [item[key] for item in batch]
-        if (
-            isinstance(vals[0], torch.Tensor)
-            and vals[0].ndim >= 2
-            and key in _VARIABLE_F_KEYS
-        ):
-            max_f = max(v.shape[1] for v in vals)
-            padded = []
-            for v in vals:
-                gap = max_f - v.shape[1]
-                if gap:
-                    pad_shape = list(v.shape)
-                    pad_shape[1] = gap
-                    v = torch.cat([v, v.new_zeros(pad_shape)], dim=1)
-                padded.append(v)
-            result[key] = torch.stack(padded)
-
-            if key == "latents":
-                valid_fs = torch.tensor([item["latents"].shape[1] for item in batch])
-                latents_mask = torch.arange(max_f).unsqueeze(0) < valid_fs.unsqueeze(1)
-        else:
-            result[key] = torch.stack(vals)
-
-    if latents_mask is not None:
-        result["latents_mask"] = latents_mask
-    return result
+    def sample_text_emb(self, seg: Segment) -> torch.Tensor:
+        """Draw one text embedding for *seg* (with CFG dropout)."""
+        return self._get_text_emb(seg)
 
 
 # ---------------------------------------------------------------------------
 # Multi-dataset wrapper
 # ---------------------------------------------------------------------------
 
-class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
+class MultiLatentLeRobotDataset:
     """Combines multiple ``LatentLeRobotDataset`` instances."""
 
     def __init__(self, config, num_init_worker: int = 128):
@@ -451,10 +453,10 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
             self._datasets: list[LatentLeRobotDataset] = pool.map(construct_fn, dataset_roots)
 
         self._validate_batch_compatibility()
-        self._cum_lengths = self._build_index()
+        total_segments = sum(len(ds.segments) for ds in self._datasets)
         logger.info(
             "MultiLatentLeRobotDataset: %d datasets, %d total segments",
-            len(self._datasets), self._cum_lengths[-1],
+            len(self._datasets), total_segments,
         )
 
     def _validate_batch_compatibility(self):
@@ -516,18 +518,27 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
                     f"vs {ds.root.name}={tuple(ds.text_shape[1:])}"
                 )
 
-    def _build_index(self):
-        acc = 0
-        cum_lengths = []
-        for ds in self._datasets:
-            acc += len(ds)
-            cum_lengths.append(acc)
-        return cum_lengths
+    # ------------------------------------------------------------------
+    # Packing support
+    # ------------------------------------------------------------------
 
-    def __len__(self):
-        return self._cum_lengths[-1]
+    @property
+    def tokens_per_frame(self) -> int:
+        """Token count per latent frame (constant across sub-datasets)."""
+        tpfs = {ds.tokens_per_frame for ds in self._datasets}
+        if len(tpfs) != 1:
+            raise RuntimeError(f"Sub-datasets disagree on tokens_per_frame: {tpfs}")
+        return next(iter(tpfs))
 
-    def __getitem__(self, idx) -> dict:
-        did = bisect_right(self._cum_lengths, idx)
-        base = 0 if did == 0 else self._cum_lengths[did - 1]
-        return self._datasets[did][idx - base]
+    def iter_segment_metadata(self):
+        """Yield ``(global_idx, dataset_idx, local_idx, seg)`` for every segment."""
+        global_idx = 0
+        for did, ds in enumerate(self._datasets):
+            for local_idx, seg in enumerate(ds.segments):
+                yield global_idx, did, local_idx, seg
+                global_idx += 1
+
+    def resolve_segment(self, dataset_idx: int, local_idx: int):
+        """Return ``(sub_dataset, segment)`` for a metadata reference."""
+        ds = self._datasets[dataset_idx]
+        return ds, ds.segments[local_idx]

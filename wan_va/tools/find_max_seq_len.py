@@ -6,6 +6,12 @@ Loads the real model with FSDP + activation checkpointing (identical to
 lengths, and runs forward + backward + optimizer step to measure peak
 memory.
 
+Packed training carries one text embedding row per packed episode and the
+FlexAttention cross-attention BlockMask grows with ``N_ep``, so the probe
+simulates a packed configuration: set ``--probe-n-episodes`` at the upper
+envelope of what your data distribution produces, and the reported
+``max_tokens`` is valid for any bin with ``N_ep <= --probe-n-episodes``.
+
 After 2+ successful trials, a linear extrapolation predicts whether the
 next attempt would exceed the memory ceiling; if so, the probe stops
 *before* triggering OOM (which could corrupt FSDP collective state).
@@ -14,7 +20,8 @@ A ``try/except`` around each trial acts as a last-resort safety net.
 Usage::
 
     torchrun --nproc_per_node=8 -m wan_va.tools.find_max_seq_len \\
-        --model-path /path/to/pretrained_wan
+        --model-path /path/to/pretrained_wan \\
+        --probe-n-episodes 128
 """
 
 import argparse
@@ -30,17 +37,21 @@ from einops import rearrange
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from dataset.token_math import (
+    tokens_per_frame as _shared_tpf,
+    TRAIN_CHUNK_SIZE_MAX,
+    TRAIN_WINDOW_SIZE_MAX,
+)
 from distributed.fsdp import shard_model, apply_ac
 from distributed.util import _configure_model, init_distributed
 from modules.utils import load_transformer
-from utils import get_mesh_id, sample_timestep_id, data_seq_to_patch, FlowMatchScheduler
+from utils import get_mesh_id_packed, sample_timestep_id, data_seq_to_patch, FlowMatchScheduler
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Probe geometry — only F varies.  forward_train flattens everything to
-# (1, total_seq, 3072), so peak memory depends on total_seq alone.
+# Probe geometry — only F varies.  Peak memory ∝ total_seq + N_ep text cost.
 # ---------------------------------------------------------------------------
 PROBE_H_LATENT = 16
 PROBE_W_LATENT = 16
@@ -51,12 +62,18 @@ PROBE_TEXT_SEQ = 512
 PROBE_TEXT_DIM = 4096
 PATCH_SIZE = (1, 2, 2)
 
-PROBE_CHUNK_SIZE = 1   # worst-case mask density
-PROBE_WINDOW_SIZE = 64
+# Match training worst-case mask density.
+PROBE_CHUNK_SIZE = TRAIN_CHUNK_SIZE_MAX
+PROBE_WINDOW_SIZE = TRAIN_WINDOW_SIZE_MAX
 
-_LAT_TOK_PER_FRAME = (PROBE_H_LATENT // PATCH_SIZE[1]) * (PROBE_W_LATENT // PATCH_SIZE[2])
-_ACT_TOK_PER_FRAME = PROBE_N_ACTION
-TOKENS_PER_FRAME = 2 * _LAT_TOK_PER_FRAME + 2 * _ACT_TOK_PER_FRAME  # x2: noisy + cond
+
+TOKENS_PER_FRAME = _shared_tpf(
+    H_lat=PROBE_H_LATENT,
+    W_lat=PROBE_W_LATENT,
+    patch_h=PATCH_SIZE[1],
+    patch_w=PATCH_SIZE[2],
+    n_action=PROBE_N_ACTION,
+)
 
 
 def _pad128(n: int) -> int:
@@ -65,6 +82,17 @@ def _pad128(n: int) -> int:
 
 def _total_seq_for_f(f: int) -> int:
     return _pad128(f * TOKENS_PER_FRAME)
+
+
+def _episode_split(f: int, n_episodes: int) -> list[int]:
+    """Split ``f`` frames across ``n_episodes`` episodes as evenly as possible.
+
+    Returns a list of length ``n_episodes`` (reduced to ``f`` if
+    ``n_episodes > f``) whose entries sum to ``f`` and differ by at most 1.
+    """
+    n_episodes = max(1, min(n_episodes, f))
+    base, extra = divmod(f, n_episodes)
+    return [base + (1 if i < extra else 0) for i in range(n_episodes)]
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +125,11 @@ def print_conversion_table(max_seq: int):
     for name, (h, w, desc) in _PRESETS.items():
         for stride in (1, 2, 4, 5):
             n_action = stride * 4
-            lat = (h // PATCH_SIZE[1]) * (w // PATCH_SIZE[2])
-            tpf = 2 * lat + 2 * n_action
+            tpf = _shared_tpf(
+                H_lat=h, W_lat=w,
+                patch_h=PATCH_SIZE[1], patch_w=PATCH_SIZE[2],
+                n_action=n_action,
+            )
             f100 = _max_f_for_budget(max_seq, tpf)
             f90 = _max_f_for_budget(int(max_seq * 0.9), tpf)
             label = f"{name} ({desc})" if stride == 1 else ""
@@ -109,50 +140,68 @@ def print_conversion_table(max_seq: int):
 
 
 # ---------------------------------------------------------------------------
-# Synthetic input — mirrors Trainer._add_noise + _prepare_input_dict
+# Synthetic input — mirrors Trainer under packing.
 # ---------------------------------------------------------------------------
 
 def build_synthetic_input(
     f: int,
+    n_episodes: int,
     device: torch.device,
     scheduler_latent: FlowMatchScheduler,
     scheduler_action: FlowMatchScheduler,
 ) -> dict:
     B, dtype = 1, torch.bfloat16
+    ep_lens = _episode_split(f, n_episodes)
+    n_ep = len(ep_lens)
+    ep_lens_t = torch.as_tensor(ep_lens, dtype=torch.long, device=device)
+
+    def _per_frame_timesteps(sched, *, cond=False):
+        kw = {"min_timestep_bd": 0.5, "max_timestep_bd": 1.0} if cond else {}
+        ids = sample_timestep_id(
+            batch_size=f, num_train_timesteps=sched.num_train_timesteps, **kw,
+        )
+        return sched.timesteps[ids].to(device=device)
+
+    def _per_ep_grid(h, w, *, action):
+        grid_ep_lens = ep_lens if action else [L // PATCH_SIZE[0] for L in ep_lens]
+        return get_mesh_id_packed(
+            grid_ep_lens, h, w, t=1 if action else 0, action=action,
+        ).to(device)[None].repeat(B, 1, 1)
 
     # Latent
+    timesteps = _per_frame_timesteps(scheduler_latent)
     latent = torch.randn(B, PROBE_IN_CHANNELS, f, PROBE_H_LATENT, PROBE_W_LATENT,
-                          device=device, dtype=dtype)
+                         device=device, dtype=dtype)
     noise = torch.randn_like(latent)
-    ts_ids = sample_timestep_id(batch_size=f, num_train_timesteps=scheduler_latent.num_train_timesteps)
-    timesteps = scheduler_latent.timesteps[ts_ids].to(device=device)
     noisy = scheduler_latent.add_noise(latent, noise, timesteps, t_dim=2)
     targets = scheduler_latent.training_target(latent, noise, timesteps)
-
-    grid = get_mesh_id(
-        f // PATCH_SIZE[0], PROBE_H_LATENT // PATCH_SIZE[1], PROBE_W_LATENT // PATCH_SIZE[2],
-        t=0, f_w=1, f_shift=0, action=False,
-    ).to(device)[None].repeat(B, 1, 1)
+    grid = _per_ep_grid(PROBE_H_LATENT // PATCH_SIZE[1],
+                        PROBE_W_LATENT // PATCH_SIZE[2], action=False)
 
     cond_latent = latent.clone()
     if torch.rand(1).item() < 0.5:
-        cond_ids = sample_timestep_id(batch_size=f, min_timestep_bd=0.5, max_timestep_bd=1.0,
-                                       num_train_timesteps=scheduler_latent.num_train_timesteps)
-        cond_ts = scheduler_latent.timesteps[cond_ids].to(device=device)
-        cond_latent = scheduler_latent.add_noise(latent, torch.randn_like(latent), cond_ts, t_dim=2)
+        cond_ts = _per_frame_timesteps(scheduler_latent, cond=True)
+        cond_latent = scheduler_latent.add_noise(
+            latent, torch.randn_like(latent), cond_ts, t_dim=2,
+        )
     else:
         cond_ts = torch.zeros_like(timesteps)
 
     # Action
-    action = torch.randn(B, PROBE_ACTION_DIM, f, PROBE_N_ACTION, 1, device=device, dtype=dtype)
+    a_ts = _per_frame_timesteps(scheduler_action)
+    action = torch.randn(B, PROBE_ACTION_DIM, f, PROBE_N_ACTION, 1,
+                         device=device, dtype=dtype)
     a_noise = torch.randn_like(action)
-    a_ids = sample_timestep_id(batch_size=f, num_train_timesteps=scheduler_action.num_train_timesteps)
-    a_ts = scheduler_action.timesteps[a_ids].to(device=device)
     a_noisy = scheduler_action.add_noise(action, a_noise, a_ts, t_dim=2)
     a_targets = scheduler_action.training_target(action, a_noise, a_ts)
+    a_grid = _per_ep_grid(PROBE_N_ACTION, 1, action=True)
 
-    a_grid = get_mesh_id(f, PROBE_N_ACTION, 1, t=1, f_w=1, f_shift=0, action=True,
-                          ).to(device)[None].repeat(B, 1, 1)
+    ep_ids = torch.arange(n_ep, dtype=torch.long, device=device)
+    seq_ids_per_frame = torch.repeat_interleave(ep_ids, ep_lens_t)[None]
+    ep_starts = torch.cumsum(ep_lens_t, 0) - ep_lens_t
+    frame_ids_per_frame = (
+        torch.arange(f, dtype=torch.long, device=device) - ep_starts.repeat_interleave(ep_lens_t)
+    )[None]
 
     return {
         "latent_dict": {
@@ -160,7 +209,8 @@ def build_synthetic_input(
             "timesteps": timesteps[None].repeat(B, 1),
             "cond_timesteps": cond_ts[None].repeat(B, 1),
             "grid_id": grid,
-            "text_emb": torch.randn(B, PROBE_TEXT_SEQ, PROBE_TEXT_DIM, device=device, dtype=dtype),
+            "text_emb": torch.randn(n_ep, PROBE_TEXT_SEQ, PROBE_TEXT_DIM,
+                                    device=device, dtype=dtype),
             "latents_mask": torch.ones(B, f, device=device, dtype=torch.bool),
         },
         "action_dict": {
@@ -172,6 +222,9 @@ def build_synthetic_input(
         },
         "chunk_size": PROBE_CHUNK_SIZE,
         "window_size": PROBE_WINDOW_SIZE,
+        "seq_ids_per_frame": seq_ids_per_frame,
+        "frame_ids_per_frame": frame_ids_per_frame,
+        "n_episodes": n_ep,
     }
 
 
@@ -212,7 +265,8 @@ def compute_loss(input_dict, pred, sched_lat, sched_act) -> torch.Tensor:
 # Single trial
 # ---------------------------------------------------------------------------
 
-def run_trial(f, transformer, optimizer, device, sched_lat, sched_act, ceiling_mb) -> int | None:
+def run_trial(f, n_episodes, transformer, optimizer, device,
+              sched_lat, sched_act, ceiling_mb) -> int | None:
     """Forward + backward + step.  Returns peak MB or None on failure."""
     gc.collect()
     torch.cuda.empty_cache()
@@ -222,7 +276,7 @@ def run_trial(f, transformer, optimizer, device, sched_lat, sched_act, ceiling_m
         return None
 
     try:
-        inp = build_synthetic_input(f, device, sched_lat, sched_act)
+        inp = build_synthetic_input(f, n_episodes, device, sched_lat, sched_act)
         out = transformer(inp, train_mode=True)
         loss = compute_loss(inp, out, sched_lat, sched_act)
         loss.backward()
@@ -252,6 +306,14 @@ def main():
                         help="Initial probe F (default 256, safe for >=90GB GPUs)")
     parser.add_argument("--mem-ceiling", type=float, default=0.90,
                         help="Fraction of GPU memory treated as ceiling (default 0.90)")
+    parser.add_argument("--probe-n-episodes", type=int, default=128,
+                        help=(
+                            "Packed episodes to simulate per trial "
+                            "(default 128, capped at F). Set to the upper "
+                            "envelope of N_ep you expect in your data; the "
+                            "reported max_tokens is valid for any bin with "
+                            "N_ep <= this value."
+                        ))
     args = parser.parse_args()
 
     rank = int(os.getenv("RANK", 0))
@@ -271,15 +333,18 @@ def main():
         logger.info("  World size:  %d GPUs", world_size)
         logger.info("  GPU:         %s (%d MB)", torch.cuda.get_device_name(device), total_mb)
         logger.info("  Ceiling:     %d MB (%.0f%%)", ceiling_mb, args.mem_ceiling * 100)
-        logger.info("  Probe:       tok/frame=%d, chunk=%d, window=%d",
-                     TOKENS_PER_FRAME, PROBE_CHUNK_SIZE, PROBE_WINDOW_SIZE)
+        logger.info("  Probe:       tok/frame=%d, chunk=%d, window=%d, N_ep=%d",
+                     TOKENS_PER_FRAME, PROBE_CHUNK_SIZE, PROBE_WINDOW_SIZE,
+                     args.probe_n_episodes)
         logger.info("=" * 70)
 
     # Load model (identical to Trainer.__init__)
     transformer = load_transformer(
         os.path.join(args.model_path, "transformer"),
         torch_dtype=torch.float32, torch_device="cpu",
+        attn_mode='flex',
     )
+    assert transformer.config.attn_mode == 'flex'
     apply_ac(transformer)
     transformer = _configure_model(
         model=transformer, shard_fn=shard_model,
@@ -299,11 +364,13 @@ def main():
     sched_act = FlowMatchScheduler(shift=1.0, sigma_min=0.0, extra_one_step=True)
     sched_act.set_timesteps(1000, training=True)
 
-    # Warmup: compile FlexAttn + establish optimizer state (momentum/variance buffers)
+    # Warmup: compile FlexAttn + establish optimizer state.
+    warmup_f = max(4, args.probe_n_episodes)
     if is_main:
         logger.info("Warmup (compiling FlexAttn + optimizer state)...")
     for _ in range(2):
-        run_trial(4, transformer, optimizer, device, sched_lat, sched_act, ceiling_mb)
+        run_trial(warmup_f, args.probe_n_episodes, transformer, optimizer, device,
+                  sched_lat, sched_act, ceiling_mb)
     if dist.is_initialized():
         dist.barrier()
     if is_main:
@@ -332,7 +399,8 @@ def main():
                                     seq, f, "-", "-", predicted, ceiling_mb)
                     break
 
-        peak = run_trial(f, transformer, optimizer, device, sched_lat, sched_act, ceiling_mb)
+        peak = run_trial(f, args.probe_n_episodes, transformer, optimizer,
+                         device, sched_lat, sched_act, ceiling_mb)
 
         # Sync across ranks
         ok = torch.tensor([1 if peak is not None else 0], device=device, dtype=torch.long)

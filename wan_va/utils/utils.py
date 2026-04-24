@@ -6,7 +6,7 @@ import torch
 
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-__all__ = ['get_mesh_id', 'save_async', 'data_seq_to_patch']
+__all__ = ['get_mesh_id', 'get_mesh_id_packed', 'save_async', 'data_seq_to_patch']
 
 
 def data_seq_to_patch(
@@ -51,6 +51,35 @@ def get_mesh_id(f, h, w, t, f_w=1, f_shift=0, action=False):
     ).flatten(1)
     grid_id = torch.cat([grid_id, torch.full_like(grid_id[:1], t)], dim=0)
     return grid_id
+
+
+def get_mesh_id_packed(ep_lens, h, w, t, action=False, frame_offsets=None):
+    """Concatenated ``get_mesh_id`` over packed episodes.
+
+    ``frame_offsets``: optional per-episode start frame so that chunks of a
+    long episode carry episode-global RoPE positions instead of starting at 0.
+    """
+    ep_lens_t = torch.as_tensor(ep_lens, dtype=torch.long)
+    F_total = int(ep_lens_t.sum())
+    ep_start = torch.cumsum(ep_lens_t, 0) - ep_lens_t
+    ep_of_frame = torch.repeat_interleave(torch.arange(ep_lens_t.numel()), ep_lens_t)
+    f_idx = torch.arange(F_total) - ep_start[ep_of_frame]  # episode-local 0..L-1
+    if frame_offsets is not None:
+        offsets_t = torch.as_tensor(frame_offsets, dtype=torch.long)
+        f_idx = f_idx + offsets_t[ep_of_frame]
+
+    ff = f_idx[:, None, None].expand(F_total, h, w).contiguous()
+    if action:
+        offset = (torch.arange(1, h + 1, dtype=torch.float32) / (h + 1)).view(1, -1, 1)
+        ff = ff.to(offset.dtype) + offset
+        hh = torch.full_like(ff, -1)
+        ww = torch.full_like(ff, -1)
+    else:
+        hh = torch.arange(h)[None, :, None].expand(F_total, h, w).contiguous()
+        ww = torch.arange(w)[None, None, :].expand(F_total, h, w).contiguous()
+
+    grid_id = torch.stack([ff, hh, ww], dim=0).flatten(1)
+    return torch.cat([grid_id, torch.full_like(grid_id[:1], t)], dim=0)
 
 
 def save_async(obj, file_path):

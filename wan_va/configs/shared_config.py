@@ -13,3 +13,8 @@ va_shared_cfg.save_root = '/apdcephfs_gy5/share_303588738/leoyizhang/train'
 va_shared_cfg.patch_size = (1, 2, 2)
 
 va_shared_cfg.enable_offload = False
+
+# Sequence packing.  max_episodes_per_bin must match --probe-n-episodes.
+va_shared_cfg.packing = EasyDict()
+va_shared_cfg.packing.max_tokens = 117504
+va_shared_cfg.packing.max_episodes_per_bin = 128

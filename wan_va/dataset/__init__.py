@@ -2,11 +2,11 @@
 from .lerobot_latent_dataset import (
     LatentLeRobotDataset,
     MultiLatentLeRobotDataset,
-    collate_variable_f,
 )
+from .packing import PackingDataset
 
 __all__ = [
     "LatentLeRobotDataset",
     "MultiLatentLeRobotDataset",
-    "collate_variable_f",
+    "PackingDataset",
 ]

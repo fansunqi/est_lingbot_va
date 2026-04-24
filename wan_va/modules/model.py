@@ -100,58 +100,61 @@ class FlexAttnFunc(nn.Module):
         window_size,
         patch_size,
         device,
-        latents_mask=None,  # (B, F) bool — True = valid, False = collate-padding
+        text_seq_len,
+        seq_ids_per_frame,
+        frame_ids_per_frame,
+        n_episodes,
     ):
+        """Build self- and cross-attention block masks for packed training."""
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
         _, _, A_F, A_H, A_W = action_shape
+        assert patch_size[0] == 1, \
+            f"mask build assumes no temporal patchification, got patch_size[0]={patch_size[0]}"
 
-        latent_seq_id = torch.arange(B, device=device)[:, None, None, None].\
-            expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2])  # (B, F', H', W')
-        if latents_mask is not None:
-            assert patch_size[0] == 1, \
-                f"latents_mask assumes no temporal patchification, but patch_size[0]={patch_size[0]}"
-            # Padding frame tokens → seq_id=-1, excluded by seq_mask (same as 128-alignment padding).
-            mask_4d = latents_mask.to(device=device)[:, :, None, None].expand_as(latent_seq_id)
-            latent_seq_id = latent_seq_id.masked_fill(~mask_4d, -1)
-        latent_seq_id = latent_seq_id.flatten()
-        action_seq_id = torch.arange(B, device=device)[:, None, None, None].expand(-1, A_F, A_H, A_W)  # (B, A_F, A_H, A_W)
-        if latents_mask is not None:
-            # A_F == L_F (same frame_ids), so latents_mask applies directly to action tokens.
-            mask_4d = latents_mask.to(device=device)[:, :, None, None].expand_as(action_seq_id)
-            action_seq_id = action_seq_id.masked_fill(~mask_4d, -1)
-        action_seq_id = action_seq_id.flatten()
+        seq_pf = seq_ids_per_frame.to(device=device, dtype=torch.long)
+        frame_pf = frame_ids_per_frame.to(device=device, dtype=torch.long)
+
+        lat_spatial = (L_H // patch_size[1]) * (L_W // patch_size[2])
+        act_spatial = A_H * A_W
+
+        def _broadcast(per_frame, spatial):
+            return per_frame[:, :, None].expand(-1, -1, spatial).flatten()
+
+        latent_seq_id = _broadcast(seq_pf, lat_spatial)
+        action_seq_id = _broadcast(seq_pf, act_spatial)
+        latent_frame_id = _broadcast(frame_pf, lat_spatial)
+        action_frame_id = _broadcast(frame_pf, act_spatial)
+
         seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
-
-        latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
-        action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
-
-        noise_ids = torch.cat(
-            [
-                torch.zeros_like(latent_frame_id),
-                torch.ones_like(latent_frame_id),
-                torch.zeros_like(action_frame_id),
-                torch.ones_like(action_frame_id),
-            ]
+        frame_ids = torch.cat(
+            [latent_frame_id // chunk_size * 2] * 2
+            + [action_frame_id // chunk_size * 2 + 1] * 2
         )
+        noise_ids = torch.cat([
+            torch.zeros_like(latent_frame_id),
+            torch.ones_like(latent_frame_id),
+            torch.zeros_like(action_frame_id),
+            torch.ones_like(action_frame_id),
+        ])
 
         seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
         noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
 
-        mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size)
-        block_mask = FlexAttnFunc.compiled_create_block_mask(
-                mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
-            )
-        FlexAttnFunc.attention_mask = block_mask
+        mask_mod = FlexAttnFunc._get_mask_mod(
+            seq_ids.long().to(device), frame_ids.long().to(device),
+            noise_ids.long().to(device), window_size,
+        )
+        FlexAttnFunc.attention_mask = FlexAttnFunc.compiled_create_block_mask(
+            mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True,
+        )
 
-        text_seq_ids = torch.arange(B)[:, None].expand(-1, 512).flatten()
-        mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids.long().to(device))
-        block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
-                mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
-            )
-        FlexAttnFunc.cross_attention_mask = block_mask_cross
+        text_seq_ids = torch.arange(n_episodes)[:, None].expand(-1, text_seq_len).flatten().long().to(device)
+        mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids)
+        FlexAttnFunc.cross_attention_mask = FlexAttnFunc.compiled_create_block_mask(
+            mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True,
+        )
     
     @staticmethod
     @torch.no_grad()
@@ -782,7 +785,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
                                device=hidden_states.device,
-                               latents_mask=latent_dict.get('latents_mask'),
+                               text_seq_len=latent_dict['text_emb'].shape[-2],
+                               seq_ids_per_frame=input_dict['seq_ids_per_frame'],
+                               frame_ids_per_frame=input_dict['frame_ids_per_frame'],
+                               n_episodes=input_dict['n_episodes'],
                                )
 
         for block in self.blocks:
