@@ -16,5 +16,5 @@ va_shared_cfg.enable_offload = False
 
 # Sequence packing.  max_episodes_per_bin must match --probe-n-episodes.
 va_shared_cfg.packing = EasyDict()
-va_shared_cfg.packing.max_tokens = 117504
+va_shared_cfg.packing.max_tokens = 125440
 va_shared_cfg.packing.max_episodes_per_bin = 128

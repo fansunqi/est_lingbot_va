@@ -1,119 +1,81 @@
-(lingbot-va) (base) [root@TENCENT64 lingbot-va]# torchrun --nproc_per_node=8 -m wan_va.tools.find_max_seq_len --model-path /apdcephfs_gy5/share_303588738/le
-oyizhang/model/wan-base
-W0419 23:27:45.312000 2460740 torch/distributed/run.py:803]
-W0419 23:27:45.312000 2460740 torch/distributed/run.py:803] *****************************************
-W0419 23:27:45.312000 2460740 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your
-system being overloaded, please further tune the variable for optimal performance in your application as needed.
-W0419 23:27:45.312000 2460740 torch/distributed/run.py:803] *****************************************
-Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 78.13it/s]
-Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 82.83it/s]
+(lingbot-va) [root@TENCENT64 lingbot-va]# torchrun --nproc_per_node=8 -m wan_va.tools.find_max_seq_len --model-path /apdcephfs_gy5/share_303588738/leoyizhang/model/wan-base --probe-n-episodes 128
+W0425 22:28:18.725000 3293959 torch/distributed/run.py:852]
+W0425 22:28:18.725000 3293959 torch/distributed/run.py:852] *****************************************
+W0425 22:28:18.725000 3293959 torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+W0425 22:28:18.725000 3293959 torch/distributed/run.py:852] *****************************************
+Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 11.13it/s]
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 103.31it/s]
 ======================================================================
 Max sequence length probe
   Model:       /apdcephfs_gy5/share_303588738/leoyizhang/model/wan-base
   World size:  8 GPUs
   GPU:         NVIDIA H20 (97285 MB)
   Ceiling:     87556 MB (90%)
-  Probe:       tok/frame=136, chunk=1, window=64
+  Probe:       tok/frame=136, chunk=4, window=64, N_ep=128
 ======================================================================
-Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 86.54it/s]
-Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 83.34it/s]
-Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 85.04it/s]
-Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 86.79it/s]
-Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 85.95it/s]
-Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 86.45it/s]
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current
-context. You can specify `device_id` in `init_process_group` to mute this warning.
-  warnings.warn(  # warn only once
-[rank0]:[W419 23:27:59.646075948 ProcessGroupNCCL.cpp:5068] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterog
-eneous. You can specify device_id in init_process_group()
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 105.70it/s]
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 101.27it/s]
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 107.32it/s]
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 106.47it/s]
+/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+[rank0]:[W425 22:29:16.241734975 ProcessGroupNCCL.cpp:5138] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 68.20it/s]
+Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 69.91it/s]
 Warmup (compiling FlexAttn + optimizer state)...
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/__init__.py:1551: UserWarning: Please use the new API settings to control TF32 behavior, such
- as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.a
-llow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://py
-torch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
-  return _C._get_float32_matmul_precision()
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/__init__.py:1551: UserWarning: Please use the new API settings to control TF32 behavior, such
- as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.a
-llow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://py
-torch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
-  return _C._get_float32_matmul_precision()
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/__init__.py:1551: UserWarning: Please use the new API settings to control TF32 behavior, such
- as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.a
-llow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://py
-torch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
-  return _C._get_float32_matmul_precision()
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/__init__.py:1551: UserWarning: Please use the new API settings to control TF32 behavior, such
- as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.a
-llow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://py
-torch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
-  return _C._get_float32_matmul_precision()
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/__init__.py:1551: UserWarning: Please use the new API settings to control TF32 behavior, such
- as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.a
-llow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://py
-torch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
-  return _C._get_float32_matmul_precision()
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/__init__.py:1551: UserWarning: Please use the new API settings to control TF32 behavior, such
- as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.a
-llow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://py
-torch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
-  return _C._get_float32_matmul_precision()
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/__init__.py:1551: UserWarning: Please use the new API settings to control TF32 behavior, such
- as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.a
-llow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://py
-torch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
-  return _C._get_float32_matmul_precision()
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/__init__.py:1551: UserWarning: Please use the new API settings to control TF32 behavior, such
- as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.a
-llow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://py
-torch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
-  return _C._get_float32_matmul_precision()
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current
-context. You can specify `device_id` in `init_process_group` to mute this warning.
-  warnings.warn(  # warn only once
+/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
 Warmup done.
 
   total_seq |    F_probe |    peak_MB | headroom | status
 -----------+------------+------------+----------+---------
-      34816 |        256 |      30451 |   57105M | ok
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current
-context. You can specify `device_id` in `init_process_group` to mute this warning.
-  warnings.warn(  # warn only once
-      69632 |        512 |      50366 |   37190M | ok
-/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current
-context. You can specify `device_id` in `init_process_group` to mute this warning.
-  warnings.warn(  # warn only once
-     104448 |        768 |      71463 |   16093M | ok
-     130560 |        960 |      87289 |     267M | ok
+/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+      34816 |        256 |      32447 |   55109M | ok
+/home/test/lingbot-va/.venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+      69632 |        512 |      53598 |   33958M | ok
+     104448 |        768 |      74765 |   12791M | ok
+     130560 |        960 |          - |        - | SKIP (predicted 90640MB > 87556MB)
+
+Binary refinement between F=768 and F=960 ...
+     117504 |        864 |      82707 |    4849M | ok (bisect)
+     124032 |        912 |      86678 |     878M | ok (bisect)
+     127360 |        936 |          - |        - | SKIP predicted 88702MB (bisect)
+     125696 |        924 |          - |        - | SKIP predicted 87690MB (bisect)
+     124928 |        918 |      87216 |     340M | ok (bisect)
+     125312 |        921 |      87453 |     103M | ok (bisect)
+     125440 |        922 |      87532 |      24M | ok (bisect)
+     125568 |        923 |          - |        - | SKIP predicted 87611MB (bisect)
 
 ======================================================================
-Max F_probe     = 960  (total_seq = 130560, peak = 87289 MB)
-90% safety      = 117504 tokens
-Linear fit      = 0.61 MB/token + 8159 MB
+Best measured F = 922  (total_seq = 125440, peak = 87532 MB)  (upper bound not measured, true max may be slightly higher)
+90% safety      = 112896 tokens
+Linear fit      = 0.62 MB/token + 10112 MB
 ======================================================================
 
 === Preset conversion (N_action = frame_stride * vae_t_downsample) ===
 Preset                                       | stride | tok/frame | max_F(100%) | max_F(90%)
 ---------------------------------------------+--------+-----------+-------------+-----------
-one_primary_one_wrist_256 (hconcat 2x256^2)  |      1 |       264 |         494 |        445
-                                             |      2 |       272 |         480 |        432
-                                             |      4 |       288 |         453 |        408
-                                             |      5 |       296 |         441 |        396
+one_primary_one_wrist_256 (hconcat 2x256^2)  |      1 |       264 |         475 |        427
+                                             |      2 |       272 |         461 |        415
+                                             |      4 |       288 |         435 |        392
+                                             |      5 |       296 |         423 |        381
 
-one_primary_one_wrist_128 (hconcat 2x128^2)  |      1 |        72 |        1813 |       1632
-                                             |      2 |        80 |        1632 |       1468
-                                             |      4 |        96 |        1360 |       1224
-                                             |      5 |       104 |        1255 |       1129
+one_primary_one_wrist_128 (hconcat 2x128^2)  |      1 |        72 |        1742 |       1568
+                                             |      2 |        80 |        1568 |       1411
+                                             |      4 |        96 |        1306 |       1176
+                                             |      5 |       104 |        1206 |       1085
 
-one_primary_two_wrist_224x320 (hconcat 3x224x320) |      1 |       428 |         305 |        274
-                                             |      2 |       436 |         299 |        269
-                                             |      4 |       452 |         288 |        259
-                                             |      5 |       460 |         283 |        255
+one_primary_two_wrist_224x320 (hconcat 3x224x320) |      1 |       428 |         293 |        263
+                                             |      2 |       436 |         287 |        258
+                                             |      4 |       452 |         277 |        249
+                                             |      5 |       460 |         272 |        245
 
-one_primary_two_wrist_tshape_256x320 (tshape 256x320+2x128x160) |      1 |       248 |         526 |        473
-                                             |      2 |       256 |         510 |        459
-                                             |      4 |       272 |         480 |        432
-                                             |      5 |       280 |         466 |        419
+one_primary_two_wrist_tshape_256x320 (tshape 256x320+2x128x160) |      1 |       248 |         505 |        455
+                                             |      2 |       256 |         490 |        441
+                                             |      4 |       272 |         461 |        415
+                                             |      5 |       280 |         448 |        403
 
 Formula: max_F = max_total_seq // (2*(H_l/p_h * W_l/p_w) + 2*(stride*4))
 Note: vae_temporal_downsample defaults to 4. 90%% column recommended for production.
-(lingbot-va) (base) [root@TENCENT64 lingbot-va]# tmux capture-pane -t lingbot_train:0 -S - -E - -p > /apdcephfs_private/qy_dy/mzh/lingbot-va/output.txt

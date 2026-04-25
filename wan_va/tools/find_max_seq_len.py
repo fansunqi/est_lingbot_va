@@ -12,10 +12,17 @@ simulates a packed configuration: set ``--probe-n-episodes`` at the upper
 envelope of what your data distribution produces, and the reported
 ``max_tokens`` is valid for any bin with ``N_ep <= --probe-n-episodes``.
 
-After 2+ successful trials, a linear extrapolation predicts whether the
-next attempt would exceed the memory ceiling; if so, the probe stops
-*before* triggering OOM (which could corrupt FSDP collective state).
-A ``try/except`` around each trial acts as a last-resort safety net.
+The search has two phases:
+
+1. **Exponential growth** — adaptive 2x/1.5x/1.25x steps, gated by
+   linear extrapolation.  Transitions to phase 2 when headroom < 5%.
+2. **Binary refinement** — bisects between last-ok and upper-candidate
+   F, each midpoint guarded by the same linear extrapolation.
+
+OOM is **not** caught: under FSDP a per-rank OOM mid-collective
+deadlocks all subsequent collectives.  Linear extrapolation (phase 1)
+and collective reserved-memory gating (both phases) prevent nearly all
+OOM; if one still occurs ``torchrun`` tears down every worker cleanly.
 
 Usage::
 
@@ -66,7 +73,6 @@ PATCH_SIZE = (1, 2, 2)
 PROBE_CHUNK_SIZE = TRAIN_CHUNK_SIZE_MAX
 PROBE_WINDOW_SIZE = TRAIN_WINDOW_SIZE_MAX
 
-
 TOKENS_PER_FRAME = _shared_tpf(
     H_lat=PROBE_H_LATENT,
     W_lat=PROBE_W_LATENT,
@@ -76,6 +82,10 @@ TOKENS_PER_FRAME = _shared_tpf(
 )
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _pad128(n: int) -> int:
     return n + (128 - n % 128) % 128
 
@@ -84,11 +94,16 @@ def _total_seq_for_f(f: int) -> int:
     return _pad128(f * TOKENS_PER_FRAME)
 
 
-def _episode_split(f: int, n_episodes: int) -> list[int]:
-    """Split ``f`` frames across ``n_episodes`` episodes as evenly as possible.
+def _next_f(f: int, ratio: float) -> int:
+    """Next probe F with adaptive growth; guaranteed to advance by >= 1."""
+    mult = 1.25 if ratio > 0.75 else 1.5 if ratio > 0.5 else 2.0
+    return max(f + 1, int(f * mult))
 
-    Returns a list of length ``n_episodes`` (reduced to ``f`` if
-    ``n_episodes > f``) whose entries sum to ``f`` and differ by at most 1.
+
+def _episode_split(f: int, n_episodes: int) -> list[int]:
+    """Split *f* frames across *n_episodes* as evenly as possible.
+
+    Returns a list whose entries sum to *f* and differ by at most 1.
     """
     n_episodes = max(1, min(n_episodes, f))
     base, extra = divmod(f, n_episodes)
@@ -262,37 +277,62 @@ def compute_loss(input_dict, pred, sched_lat, sched_act) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Single trial
+# Single trial (local GPU) + cross-rank synchronisation
 # ---------------------------------------------------------------------------
 
-def run_trial(f, n_episodes, transformer, optimizer, device,
-              sched_lat, sched_act, ceiling_mb) -> int | None:
-    """Forward + backward + step.  Returns peak MB or None on failure."""
+def _run_trial(f, n_episodes, transformer, optimizer, device,
+               sched_lat, sched_act) -> int:
+    """Forward + backward + step.  Returns peak MB.
+
+    OOM is not caught — under FSDP it leaves NCCL rank-inconsistent,
+    deadlocking any follow-up collective.  ``torchrun`` handles teardown.
+    """
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
 
-    if torch.cuda.memory_reserved(device) // (1024 * 1024) > ceiling_mb * 0.95:
-        return None
+    inp = build_synthetic_input(f, n_episodes, device, sched_lat, sched_act)
+    out = transformer(inp, train_mode=True)
+    loss = compute_loss(inp, out, sched_lat, sched_act)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(transformer.parameters(), 2.0)
+    optimizer.step()
+    optimizer.zero_grad()
+    del inp, out, loss
+    torch.cuda.synchronize(device)
 
-    try:
-        inp = build_synthetic_input(f, n_episodes, device, sched_lat, sched_act)
-        out = transformer(inp, train_mode=True)
-        loss = compute_loss(inp, out, sched_lat, sched_act)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(transformer.parameters(), 2.0)
-        optimizer.step()
-        optimizer.zero_grad()
-        del inp, out, loss
-        torch.cuda.synchronize(device)
-    except torch.cuda.OutOfMemoryError:
-        optimizer.zero_grad(set_to_none=True)
+    return torch.cuda.max_memory_allocated(device) // (1024 * 1024)
+
+
+def _sync_trial(f, n_episodes, transformer, optimizer, device,
+                sched_lat, sched_act,
+                ceiling_mb: int = 0) -> tuple[int | None, bool]:
+    """Run one trial across all ranks.  Returns ``(peak_mb, skipped)``.
+
+    A collective reserved-memory pre-check ensures all ranks enter or
+    skip together.  OOM propagates to ``torchrun`` (see ``_run_trial``).
+    """
+    if ceiling_mb:
         gc.collect()
         torch.cuda.empty_cache()
-        return None
+        reserved = torch.cuda.memory_reserved(device) // (1 << 20)
+        skip = torch.tensor(
+            [int(reserved > ceiling_mb * 0.95)], device=device, dtype=torch.long,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(skip, op=dist.ReduceOp.MAX)
+        if skip.item():
+            return None, True
 
-    peak = torch.cuda.max_memory_allocated(device) // (1024 * 1024)
-    return peak if peak <= ceiling_mb else None
+    peak = _run_trial(f, n_episodes, transformer, optimizer, device,
+                      sched_lat, sched_act)
+
+    pk = torch.tensor([peak], device=device, dtype=torch.long)
+    if dist.is_initialized():
+        dist.all_reduce(pk, op=dist.ReduceOp.MAX)
+        dist.barrier()
+
+    return int(pk.item()), False
 
 
 # ---------------------------------------------------------------------------
@@ -364,31 +404,50 @@ def main():
     sched_act = FlowMatchScheduler(shift=1.0, sigma_min=0.0, extra_one_step=True)
     sched_act.set_timesteps(1000, training=True)
 
-    # Warmup: compile FlexAttn + establish optimizer state.
+    # Common kwargs for _sync_trial calls.
+    trial_kw = dict(
+        n_episodes=args.probe_n_episodes,
+        transformer=transformer, optimizer=optimizer, device=device,
+        sched_lat=sched_lat, sched_act=sched_act,
+        ceiling_mb=ceiling_mb,
+    )
+
+    # Warmup: compile FlexAttn + allocate optimizer state.
     warmup_f = max(4, args.probe_n_episodes)
     if is_main:
         logger.info("Warmup (compiling FlexAttn + optimizer state)...")
-    for _ in range(2):
-        run_trial(warmup_f, args.probe_n_episodes, transformer, optimizer, device,
-                  sched_lat, sched_act, ceiling_mb)
-    if dist.is_initialized():
-        dist.barrier()
+    for i in range(2):
+        peak, _ = _sync_trial(warmup_f, **trial_kw)
+        if peak is None:
+            if is_main:
+                logger.error(
+                    "Warmup %d skipped — reserved mem near ceiling. "
+                    "Try reducing --probe-n-episodes (current %d) "
+                    "or freeing GPU memory.",
+                    i, args.probe_n_episodes,
+                )
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            return
     if is_main:
         logger.info("Warmup done.\n")
 
-    # Probe: grow F until predicted peak exceeds ceiling
+    # === Phase 1: exponential growth ==================================
     results: list[tuple[int, int, int]] = []  # (F, total_seq, peak_mb)
     f = args.start_f
+    upper_f: int | None = None   # upper bound for bisect (predicted / measured)
+    upper_tested = False          # was upper_f a real measured failure?
 
     if is_main:
         logger.info(" %10s | %10s | %10s | %8s | %s",
                      "total_seq", "F_probe", "peak_MB", "headroom", "status")
-        logger.info("-" * 10 + "-+-" + "-" * 10 + "-+-" + "-" * 10 + "-+-" + "-" * 8 + "-+-" + "-" * 8)
+        logger.info("-" * 10 + "-+-" + "-" * 10 + "-+-" + "-" * 10 + "-+-"
+                     + "-" * 8 + "-+-" + "-" * 8)
 
     while True:
         seq = _total_seq_for_f(f)
 
-        # Predictive gate: skip if extrapolation says we'd exceed ceiling
+        # Predictive gate.
         if len(results) >= 2:
             (_, s0, p0), (_, s1, p1) = results[-2], results[-1]
             if s1 != s0:
@@ -397,38 +456,83 @@ def main():
                     if is_main:
                         logger.info(" %10d | %10d | %10s | %8s | SKIP (predicted %.0fMB > %dMB)",
                                     seq, f, "-", "-", predicted, ceiling_mb)
+                    upper_f = f
                     break
 
-        peak = run_trial(f, args.probe_n_episodes, transformer, optimizer,
-                         device, sched_lat, sched_act, ceiling_mb)
+        peak, _ = _sync_trial(f, **trial_kw)
 
-        # Sync across ranks
-        ok = torch.tensor([1 if peak is not None else 0], device=device, dtype=torch.long)
-        pk = torch.tensor([peak or 0], device=device, dtype=torch.long)
-        if dist.is_initialized():
-            dist.all_reduce(ok, op=dist.ReduceOp.MIN)
-            dist.all_reduce(pk, op=dist.ReduceOp.MAX)
-
-        if ok.item():
-            synced_peak = int(pk.item())
-            headroom = ceiling_mb - synced_peak
-            results.append((f, seq, synced_peak))
+        if peak is None:
             if is_main:
-                logger.info(" %10d | %10d | %10d | %7dM | ok", seq, f, synced_peak, headroom)
-            if headroom < ceiling_mb * 0.05:
-                break
-            # Adaptive growth rate based on memory usage
-            ratio = synced_peak / ceiling_mb
-            f = int(f * (1.25 if ratio > 0.75 else 1.5 if ratio > 0.5 else 2))
-        else:
-            if is_main:
-                logger.info(" %10d | %10d | %10s | %8s | STOP (ceiling or OOM)", seq, f, "-", "-")
+                logger.info(" %10d | %10d | %10s | %8s | SKIP (reserved mem near ceiling)",
+                            seq, f, "-", "-")
+            upper_f = f
             break
 
-        if dist.is_initialized():
-            dist.barrier()
+        headroom = ceiling_mb - peak
+        if peak > ceiling_mb:
+            if is_main:
+                logger.info(" %10d | %10d | %10d | %7dM | OVER ceiling",
+                            seq, f, peak, headroom)
+            upper_f, upper_tested = f, True
+            break
 
-    # Summary
+        results.append((f, seq, peak))
+        if is_main:
+            logger.info(" %10d | %10d | %10d | %7dM | ok", seq, f, peak, headroom)
+        if headroom < ceiling_mb * 0.05:
+            # Let bisect refine the last few percent.
+            upper_f = _next_f(f, peak / ceiling_mb)
+            break
+        f = _next_f(f, peak / ceiling_mb)
+
+    # === Phase 2: binary refinement ===================================
+    if results and upper_f is not None and upper_f > results[-1][0]:
+        lo = results[-1][0]
+        hi = upper_f
+        hi_measured = upper_tested   # tracks whether *current* hi was measured
+        if is_main:
+            logger.info("\nBinary refinement between F=%d and F=%d ...", lo, hi)
+
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            mid_seq = _total_seq_for_f(mid)
+
+            # Predictive OOM guard.
+            if len(results) >= 2:
+                (_, s0, p0), (_, s1, p1) = results[-2], results[-1]
+                if s1 != s0:
+                    predicted = p1 + (p1 - p0) / (s1 - s0) * (mid_seq - s1)
+                    if predicted > ceiling_mb:
+                        hi = mid
+                        hi_measured = False
+                        if is_main:
+                            logger.info(
+                                " %10d | %10d | %10s | %8s | SKIP predicted %.0fMB (bisect)",
+                                mid_seq, mid, "-", "-", predicted)
+                        continue
+
+            peak, _ = _sync_trial(mid, **trial_kw)
+            if peak is None or peak > ceiling_mb:
+                hi = mid
+                hi_measured = peak is not None  # real measurement, not a skip
+                if is_main:
+                    tag = f"peak {peak}MB" if peak is not None else "reserved mem"
+                    logger.info(" %10d | %10d | %10s | %8s | %s (bisect)",
+                                mid_seq, mid,
+                                "-" if peak is None else str(peak),
+                                "-", tag)
+            else:
+                headroom = ceiling_mb - peak
+                results.append((mid, mid_seq, peak))
+                lo = mid
+                if is_main:
+                    logger.info(" %10d | %10d | %10d | %7dM | ok (bisect)",
+                                mid_seq, mid, peak, headroom)
+
+        results.sort(key=lambda r: r[0])
+        upper_tested = hi_measured
+
+    # === Summary ======================================================
     if not results:
         if is_main:
             logger.info("\nNo successful trials. Try smaller --start-f.")
@@ -438,12 +542,22 @@ def main():
     if is_main:
         logger.info("")
         logger.info("=" * 70)
-        logger.info("Max F_probe     = %d  (total_seq = %d, peak = %d MB)", best_f, best_seq, best_peak)
+        if upper_tested:
+            label = "Max F_probe"
+            note = ""
+        else:
+            label = "Best measured F"
+            note = "  (upper bound not measured, true max may be slightly higher)"
+        logger.info("%-15s = %d  (total_seq = %d, peak = %d MB)%s",
+                     label, best_f, best_seq, best_peak, note)
         logger.info("90%% safety      = %d tokens", int(best_seq * 0.9))
         if len(results) >= 2:
             (_, s0, p0), (_, s1, p1) = results[-2], results[-1]
             if s1 != s0:
-                logger.info("Linear fit      = %.2f MB/token + %.0f MB", (p1-p0)/(s1-s0), p0 - (p1-p0)/(s1-s0)*s0)
+                slope = (p1 - p0) / (s1 - s0)
+                intercept = p0 - slope * s0
+                logger.info("Linear fit      = %.2f MB/token + %.0f MB",
+                             slope, intercept)
         logger.info("=" * 70)
         print_conversion_table(best_seq)
 
