@@ -147,13 +147,13 @@ class FlexAttnFunc(nn.Module):
             noise_ids.long().to(device), window_size,
         )
         FlexAttnFunc.attention_mask = FlexAttnFunc.compiled_create_block_mask(
-            mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True,
+            mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device,
         )
 
         text_seq_ids = torch.arange(n_episodes)[:, None].expand(-1, text_seq_len).flatten().long().to(device)
         mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids)
         FlexAttnFunc.cross_attention_mask = FlexAttnFunc.compiled_create_block_mask(
-            mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True,
+            mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device,
         )
     
     @staticmethod

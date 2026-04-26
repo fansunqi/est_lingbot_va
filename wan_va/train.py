@@ -23,19 +23,14 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model, apply_ac
-from distributed.util import (
-    _configure_model, 
-    init_distributed, 
-    dist_mean, 
-    dist_max
-)
+from distributed.util import _configure_model, init_distributed
 from einops import rearrange
 from modules.utils import (
     load_transformer,
 )
 from utils import (
-    init_logger, 
-    logger, 
+    init_logger,
+    logger,
     get_mesh_id_packed,
     sample_timestep_id,
     data_seq_to_patch,
@@ -117,7 +112,7 @@ class Trainer:
             foreach=False,
         )
 
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer,
             lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
 
         # Setup dataloaders
@@ -331,9 +326,9 @@ class Trainer:
         """Train a single batch, returns losses for logging."""
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
-        
+
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        
+
         if not should_sync:
             self.transformer.set_requires_gradient_sync(False)
         else:
@@ -346,14 +341,14 @@ class Trainer:
         loss.backward()
 
         losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
-        
+
         # Only update weights after accumulating gradients
         if should_sync:
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
-            
+
             losses['total_norm'] = total_norm
             losses['should_log'] = True
         else:
@@ -507,9 +502,9 @@ class Trainer:
         while self.step < self.config.num_steps:
             # Get next batch (handles epoch reset automatically)
             batch = self._get_next_batch()
-            
+
             losses = self._train_step(batch, step_in_accumulation)
-            
+
             # Accumulate losses for logging
             accumulated_latent_losses.append(losses['latent_loss'])
             accumulated_action_losses.append(losses['action_loss'])
@@ -520,18 +515,26 @@ class Trainer:
                 lr = self.lr_scheduler.get_last_lr()[0]
 
                 # Average accumulated losses
-                latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
-                action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
-                max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
-                max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                _loss_vec = torch.stack([
+                    torch.stack(accumulated_latent_losses).sum().detach(),
+                    torch.stack(accumulated_action_losses).sum().detach(),
+                ])
+                _loss_vec_max = _loss_vec.clone()
+                if dist.is_initialized():
+                    dist.all_reduce(_loss_vec, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(_loss_vec_max, op=dist.ReduceOp.MAX)
+                latent_loss_show = _loss_vec[0].cpu().item()
+                action_loss_show = _loss_vec[1].cpu().item()
+                max_latent_loss_show = _loss_vec_max[0].cpu().item()
+                max_action_loss_show = _loss_vec_max[1].cpu().item()
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
                 step_in_accumulation = 0
 
-                torch.cuda.synchronize()
                 if self.step % self.config.gc_interval == 0:
+                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                     gc.collect()
 
@@ -554,16 +557,13 @@ class Trainer:
                             'grad_norm': total_norm.item(),
                             'lr': lr,
                         }, step=self.step)
-                
+
                 self.step += 1
-                
+
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
-
-            if dist.is_initialized():
-                dist.barrier()
 
         progress_bar.close()
         logger.info("Training completed!")
