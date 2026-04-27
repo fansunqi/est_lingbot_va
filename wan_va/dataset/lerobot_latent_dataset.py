@@ -183,6 +183,19 @@ class LatentLeRobotDataset:
             ),
         )
 
+        # Exclude segments skipped during extraction (corrupt video, etc.).
+        if self.latent_metadata.skipped_segments:
+            skip_keys = {
+                (s["episode_index"], s["start_frame"], s["end_frame"])
+                for s in self.latent_metadata.skipped_segments
+            }
+            before = len(self.segments)
+            self.segments = [seg for seg in self.segments if seg.key not in skip_keys]
+            logger.warning(
+                "%s: excluded %d skipped segment(s) (%d → %d)",
+                self.root.name, before - len(self.segments), before, len(self.segments),
+            )
+
         # Action-only view; avoids deep-copying the full dataset inside with_format.
         self._hf_torch_view = (
             full_hf.select_columns(self.train_config.action_keys)

@@ -22,10 +22,12 @@ can saturate CPU / IO and hurt overall throughput.
 """
 
 import argparse
+import json
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -60,6 +62,19 @@ from wan_va.dataset.segment_builder import (
 from wan_va.modules.utils import load_text_encoder, load_tokenizer, load_vae
 
 logger = logging.getLogger(__name__)
+
+# Error prefixes from torchcodec that indicate per-frame data corruption.
+# Extend this tuple when new corruption patterns are observed.
+_SKIPPABLE_DECODE_PREFIXES = (
+    "Could not push packet to decoder:",
+)
+
+
+def _is_skippable_decode_error(exc: BaseException) -> bool:
+    """Return *True* for video-data corruption that cannot be fixed by re-running."""
+    return isinstance(exc, RuntimeError) and any(
+        str(exc).startswith(p) for p in _SKIPPABLE_DECODE_PREFIXES
+    )
 
 
 def _save_torch_atomic(obj, path: Path):
@@ -357,10 +372,14 @@ def _save_text_embeddings(
 
 def _validate_completed_outputs(
     dataset_root: Path, latent_base: Path, text_emb_dir: Path,
-    cam_keys: list[str], segments: list[Segment], *, require_subtask_emb: bool,
+    cam_keys: list[str], segments: list[Segment], *,
+    require_subtask_emb: bool,
+    skip_keys: frozenset[tuple[int, int, int]] = frozenset(),
 ):
     missing = []
     for seg in segments:
+        if seg.key in skip_keys:
+            continue
         for p in _segment_output_paths(latent_base, cam_keys, seg):
             if not p.exists():
                 missing.append(p)
@@ -390,7 +409,7 @@ def _extraction_worker(
     rank: int, world_size: int, gpu_ids: list[int],
     dataset_root: Path, model_path: Path, dtype: torch.dtype,
     seg_work: list, stride: int, vae_temporal_downsample: int, actual_fps: float,
-    progress_counter,
+    progress_counter, latent_base: Path,
 ):
     """Encode latents for ``seg_work[rank::world_size]`` on ``cuda:{gpu_ids[rank]}``."""
     device = torch.device(f"cuda:{gpu_ids[rank]}")
@@ -413,18 +432,51 @@ def _extraction_worker(
             for cam in cams
         ]
 
+    skipped: list[dict[str, Any]] = []
+
+    def _tick():
+        with progress_counter.get_lock():
+            progress_counter.value += 1
+            count = progress_counter.value
+        if rank == 0:
+            bar.update(count - bar.n)
+
+    def _record_skip(seg: Segment, reason: Exception, *, cams=None):
+        logger.warning(
+            "Skipping segment ep=%d [%d, %d): %s",
+            seg.episode_index, seg.start_frame, seg.end_frame, reason,
+        )
+        skipped.append({
+            "episode_index": seg.episode_index, "start_frame": seg.start_frame,
+            "end_frame": seg.end_frame, "reason": str(reason),
+        })
+        if cams is not None:
+            for _, path, *_ in cams:
+                path.unlink(missing_ok=True)
+
     try:
-        # max_workers=1: torchcodec's VideoDecoder is not thread-safe.
         prefetch: Future | None = None
         bar = tqdm(total=len(seg_work), desc="Extracting latents",
                    smoothing=0.05, disable=(rank != 0))
         with ThreadPoolExecutor(max_workers=1) as pool:
             for si, (seg, cams) in enumerate(my_work):
-                decoded = prefetch.result() if prefetch is not None else _decode_seg(seg, cams)
+                try:
+                    decoded = prefetch.result() if prefetch is not None else _decode_seg(seg, cams)
+                except Exception as exc:
+                    decoded = None
+                    decode_error = exc
+
                 prefetch = (
                     pool.submit(_decode_seg, *my_work[si + 1])
                     if si + 1 < len(my_work) else None
                 )
+
+                if decoded is None:
+                    if not _is_skippable_decode_error(decode_error):
+                        raise decode_error
+                    _record_skip(seg, decode_error)
+                    _tick()
+                    continue
 
                 res_groups: dict[tuple[int, int], list[int]] = {}
                 for i, (_, _, h, w, _, _) in enumerate(decoded):
@@ -457,13 +509,12 @@ def _extraction_worker(
                     }, out_path)
                     del latent
 
-                with progress_counter.get_lock():
-                    progress_counter.value += 1
-                    count = progress_counter.value
-                if rank == 0:
-                    bar.update(count - bar.n)
+                _tick()
     finally:
         bar.close()
+        if skipped:
+            with open(latent_base / f".skipped_rank{rank}.json", "w") as f:
+                json.dump(skipped, f)
         del vae
         torch.cuda.empty_cache()
 
@@ -512,11 +563,24 @@ def extract_latents(
         extraction_status=LATENT_METADATA_STATUS_EXTRACTING,
     )
     metadata_path = _ensure_matching_frozen_metadata(dataset_root, in_progress_metadata)
-    write_frozen_latent_metadata(dataset_root, in_progress_metadata)
 
-    # Build work list: skip completed segments, clean partial ones.
+    prior_skipped: list[dict[str, Any]] = []
+    if metadata_path.exists():
+        prior_skipped = list(load_frozen_latent_metadata(dataset_root).skipped_segments)
+
+    _skip_key = lambda s: (s["episode_index"], s["start_frame"], s["end_frame"])
+    prior_skip_keys = {_skip_key(s) for s in prior_skipped}
+
+    write_frozen_latent_metadata(
+        dataset_root,
+        replace(in_progress_metadata, skipped_segments=tuple(prior_skipped)),
+    )
+
+    # Build work list: skip completed and previously-skipped segments.
     seg_work: list[tuple[Segment, list[tuple[str, Path, int, int]]]] = []
     for seg in segments:
+        if seg.key in prior_skip_keys:
+            continue
         seg_paths = _segment_output_paths(latent_base, cam_keys, seg)
         if all(p.exists() for p in seg_paths):
             continue
@@ -528,6 +592,9 @@ def extract_latents(
         ]))
 
     default_gpu = torch.device(device).index or 0
+
+    for stale in latent_base.glob(".skipped_rank*.json"):
+        stale.unlink()
 
     if not seg_work:
         logger.info("All segments already extracted; skipping to text embeddings.")
@@ -549,7 +616,7 @@ def extract_latents(
             seg_work, stride,
             in_progress_metadata.vae_temporal_downsample,
             in_progress_metadata.actual_fps,
-            counter,
+            counter, latent_base,
         )
         if len(gpu_ids) <= 1:
             _extraction_worker(0, *args)
@@ -557,15 +624,40 @@ def extract_latents(
             mp.spawn(_extraction_worker, args=args, nprocs=len(gpu_ids), join=True)
         logger.info("Latent extraction complete.")
 
+    # Collect and merge skip records from all workers.
+    new_skipped: list[dict[str, Any]] = []
+    for skip_file in sorted(latent_base.glob(".skipped_rank*.json")):
+        new_skipped.extend(json.loads(skip_file.read_text()))
+        skip_file.unlink()
+
+    all_skipped = {_skip_key(s): s for s in [*prior_skipped, *new_skipped]}
+
+    if all_skipped:
+        logger.warning(
+            "%s: %d segment(s) skipped due to errors:", dataset_root.name, len(all_skipped),
+        )
+        for s in all_skipped.values():
+            logger.warning(
+                "  ep=%d [%d, %d): %s",
+                s["episode_index"], s["start_frame"], s["end_frame"],
+                s.get("reason", "unknown"),
+            )
+
     device_phase3 = torch.device(f"cuda:{default_gpu}")
     text_emb_dir = dataset_root / "text_emb"
     _save_text_embeddings(dataset_root, model_path, meta, device_phase3, dtype)
     _validate_completed_outputs(
         dataset_root, latent_base, text_emb_dir, cam_keys, segments,
         require_subtask_emb=meta.subtasks is not None and len(meta.subtasks) > 0,
+        skip_keys=frozenset(all_skipped),
     )
     write_frozen_latent_metadata(
-        dataset_root, replace(in_progress_metadata, extraction_status=LATENT_METADATA_STATUS_COMPLETE),
+        dataset_root,
+        replace(
+            in_progress_metadata,
+            extraction_status=LATENT_METADATA_STATUS_COMPLETE,
+            skipped_segments=tuple(all_skipped.values()),
+        ),
     )
     logger.info("All done. Output at %s", dataset_root)
 

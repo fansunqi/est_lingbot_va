@@ -528,6 +528,7 @@ class FrozenLatentMetadata:
     vae_temporal_downsample: int = DEFAULT_VAE_TEMPORAL_DOWNSAMPLE
     extraction_status: str = LATENT_METADATA_STATUS_COMPLETE
     model_path: str | None = None
+    skipped_segments: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any], *, label: str) -> "FrozenLatentMetadata":
@@ -563,6 +564,10 @@ class FrozenLatentMetadata:
                 f"{label}.extraction_status",
             ),
             model_path=payload.get("model_path"),
+            skipped_segments=_validate_skipped_segments(
+                payload.get("skipped_segments", []),
+                f"{label}.skipped_segments",
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -574,7 +579,33 @@ class FrozenLatentMetadata:
             "vae_temporal_downsample": self.vae_temporal_downsample,
             "extraction_status": self.extraction_status,
             "model_path": self.model_path,
+            "skipped_segments": list(self.skipped_segments),
         }
+
+
+def _validate_skipped_segments(
+    value: Any, label: str,
+) -> tuple[dict[str, Any], ...]:
+    """Validate and normalise the ``skipped_segments`` field."""
+    if not isinstance(value, list):
+        raise ValueError(f"{label}: expected a list, got {type(value).__name__}")
+    result: list[dict[str, Any]] = []
+    for i, entry in enumerate(value):
+        entry_label = f"{label}[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{entry_label}: expected an object, got {type(entry).__name__}")
+        for key in ("episode_index", "start_frame", "end_frame"):
+            if key not in entry:
+                raise ValueError(f"{entry_label}: missing required key {key!r}")
+            v = entry[key]
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(f"{entry_label}.{key}: expected int, got {v!r}")
+        if "reason" in entry and not isinstance(entry["reason"], str):
+            raise ValueError(
+                f"{entry_label}.reason: expected str, got {type(entry['reason']).__name__}"
+            )
+        result.append(entry)
+    return tuple(result)
 
 
 def _validate_metadata_status(value: Any, label: str) -> str:

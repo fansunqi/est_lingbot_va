@@ -20,6 +20,11 @@ class Segment:
     task_index: int
     subtask_index: Optional[int] = None
 
+    @property
+    def key(self) -> tuple[int, int, int]:
+        """Identity triple used for latent file naming and skip-record matching."""
+        return (self.episode_index, self.start_frame, self.end_frame)
+
 
 def read_index_columns(hf_dataset) -> IndexColumns:
     """Read ``(frame_index, task_index, subtask_index?)`` as numpy arrays.
