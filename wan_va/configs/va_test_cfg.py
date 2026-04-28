@@ -7,7 +7,7 @@ va_test_cfg = EasyDict(__name__='Config: VA test')
 va_test_cfg.update(va_shared_cfg)
 va_test_cfg.infer_mode = 'server'
 
-va_test_cfg.wan22_pretrained_model_name_or_path = "/apdcephfs_gy5/share_303588738/leoyizhang/model/wan-base"
+va_test_cfg.wan22_pretrained_model_name_or_path = "/apdcephfs_gy5/share_303588738/leoyizhang/model/lingbot-va-base"
 
 va_test_cfg.attn_window = 72
 va_test_cfg.frame_chunk_size = 2

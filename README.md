@@ -4,13 +4,17 @@
 
 ## 1. 环境配置
 
-在公司集群上，**代码仓库及其虚拟环境建议放在 `/home` 的子目录下**。由于集群对一些目录的文件访问与通信效率很低，如果环境放在共享盘或其它慢目录，Python 启动和模块导入都会明显变慢。
+```bash
+# 单机开发：在仓库根目录
+uv sync                          # 创建 .venv 并安装依赖
+source .venv/bin/activate
 
-推荐做法是：
+# 多机训练：每台节点各自建 venv 到相同路径（/home 是本地盘，import 快）
+cd /apdcephfs_private/<your_dir>/lingbot-va   # 共享盘上的仓库
+UV_PROJECT_ENVIRONMENT=/home/uv_env/lingbot-va uv sync
+```
 
-- 将仓库克隆到 `/home/<某个文件夹>/...` 这样的本地子目录中运行。
-- 在项目根目录执行 `uv sync` 创建并同步依赖。
-- 使用 `source .venv/bin/activate` 激活项目虚拟环境。
+> venv 建议放 `/home`（本地盘），仓库放共享盘。共享盘上的 venv 每次 `import` 都会慢十几秒。
 
 ## 2. VAE Latent 预处理
 
@@ -51,11 +55,29 @@ export LD_LIBRARY_PATH="$FFMPEG_ENV/lib:${LD_LIBRARY_PATH:-}"
 # 1. 先修改 wandb 配置
 vim script/run_va_posttrain.sh   # 填写 WANDB_API_KEY / WANDB_BASE_URL / WANDB_TEAM_NAME 等
 
-# 2. 启动单机多卡训练（直接可在公司集群上运行的示例）
+# 2. 单机多卡
 NGPU=8 CONFIG_NAME='test_train' bash script/run_va_posttrain.sh
-```
 
-> **OOM 警告**：当前版本尚未实现变长序列拼接优化与序列长度上限控制，**不要随意把 `batch_size` 调到大于 1**。在 100 GB 显存的卡上，这样做很容易 OOM。若需要增大有效 batch，优先调高 `gradient_accumulation_steps`。后续版本会增加相应处理，同时均衡各 GPU 负载。
+# 3. 多机多卡（登录节点一条命令拉起所有节点）
+#    默认用 $NODE_IP_LIST；指定子集用 IP_LIST 覆盖（避免集群 hook 重写 NODE_IP_LIST）。
+VENV_PATH=/home/uv_env/lingbot-va \
+    CONFIG_NAME='test_train' \
+    bash script/run_va_posttrain_multinode.sh
+
+# 指定子集
+IP_LIST="ip1:8,ip2:8" \
+    VENV_PATH=/home/uv_env/lingbot-va \
+    CONFIG_NAME='test_train' \
+    bash script/run_va_posttrain_multinode.sh
+
+# 可选变量（详见脚本头注释）：
+#   MASTER_PORT / LOG_DIR / SAVE_ROOT / WANDB_NAME / NIC_OVERRIDE
+
+# 多机连通性测试（换新机器时用）
+MODE=nccl GPUS_PER_NODE=1 \
+    VENV_PATH=/home/uv_env/lingbot-va \
+    bash script/nccl_sanity_multinode.sh
+```
 
 ---
 

@@ -54,7 +54,7 @@ class Trainer:
                 # dir=log_dir,
                 config=config,
                 mode="online",
-                name='test_lln'
+                name=os.getenv("WANDB_NAME", "test_lln"),
                 # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
             )
             logger.info("WandB logging enabled")
