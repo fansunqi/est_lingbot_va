@@ -11,8 +11,6 @@ Follows LATENT_DATA_DESIGN.md:
 """
 
 import logging
-from functools import partial
-from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
@@ -453,7 +451,7 @@ class LatentLeRobotDataset:
 class MultiLatentLeRobotDataset:
     """Combines multiple ``LatentLeRobotDataset`` instances."""
 
-    def __init__(self, config, num_init_worker: int = 128):
+    def __init__(self, config):
         dataset_roots = recursive_find_dataset_roots(config.dataset_path)
         if not dataset_roots:
             raise FileNotFoundError(
@@ -461,9 +459,7 @@ class MultiLatentLeRobotDataset:
                 "(looking for meta/info.json)"
             )
 
-        construct_fn = partial(LatentLeRobotDataset, config=config)
-        with Pool(min(num_init_worker, len(dataset_roots))) as pool:
-            self._datasets: list[LatentLeRobotDataset] = pool.map(construct_fn, dataset_roots)
+        self._datasets = [LatentLeRobotDataset(root, config) for root in dataset_roots]
 
         self._validate_batch_compatibility()
         total_segments = sum(len(ds.segments) for ds in self._datasets)
