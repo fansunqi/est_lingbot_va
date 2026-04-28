@@ -47,6 +47,11 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
+        # When vae_offload=False, the VAE stays on GPU so we skip the
+        # transformer<->vae swap in every _encode_obs call. This saves a few
+        # hundred ms per chunk at the cost of ~2.7 GB extra VRAM. Defaults to
+        # the same value as enable_offload to preserve previous behavior.
+        self.vae_offload = getattr(job_config, 'vae_offload', self.enable_offload)
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
@@ -62,7 +67,7 @@ class VA_Server:
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'vae'),
             torch_dtype=self.dtype,
-            torch_device='cpu' if self.enable_offload else self.device,
+            torch_device='cpu' if self.vae_offload else self.device,
         )
         self.streaming_vae = WanVAEStreamingWrapper(self.vae)
 
@@ -95,13 +100,12 @@ class VA_Server:
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
         if self.env_type == 'robotwin_tshape':
-            vae_half = load_vae(
-                os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                             'vae'),
-                torch_dtype=self.dtype,
-                torch_device='cpu' if self.enable_offload else self.device,
-            )
-            self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+            # Share the same AutoencoderKLWan module between the two streaming
+            # wrappers. Each wrapper still owns its own feat_cache (see
+            # WanVAEStreamingWrapper.__init__), so encoding high-res and
+            # left+right-res branches remains independent. This avoids
+            # loading a duplicate 2.7 GB copy of the VAE weights.
+            self.streaming_vae_half = WanVAEStreamingWrapper(self.vae)
 
     def _get_t5_prompt_embeds(
         self,
@@ -355,9 +359,10 @@ class VA_Server:
                                             align_corners=False).unsqueeze(0)
             videos.append(history_video_k)
 
-        if self.enable_offload:
-            self.transformer.to('cpu')
-            torch.cuda.empty_cache()
+        if self.vae_offload:
+            if self.enable_offload:
+                self.transformer.to('cpu')
+                torch.cuda.empty_cache()
             self.vae.to(self.device)
             if self.streaming_vae_half is not None and self.streaming_vae_half.vae is not self.vae:
                 self.streaming_vae_half.vae.to(self.device)
@@ -382,12 +387,13 @@ class VA_Server:
             videos_chunk = videos.to(vae_device).to(self.dtype)
             enc_out = self.streaming_vae.encode_chunk(videos_chunk)
 
-        if self.enable_offload:
+        if self.vae_offload:
             self.vae.to('cpu')
             if self.streaming_vae_half is not None and self.streaming_vae_half.vae is not self.vae:
                 self.streaming_vae_half.vae.to('cpu')
             torch.cuda.empty_cache()
-            self.transformer.to(self.device)
+            if self.enable_offload:
+                self.transformer.to(self.device)
 
         mu, logvar = torch.chunk(enc_out, 2, dim=1)
         latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)

@@ -31,6 +31,10 @@ RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.s
     rm /tmp/miniconda.sh
 ENV PATH="/opt/miniconda/bin:$PATH"
 
+# Accept Conda Terms of Service (required by newer conda)
+RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
 # Create RoboTwin conda environment
 RUN conda create -n RoboTwin python=3.10 -y
 
@@ -40,15 +44,15 @@ RUN conda run --no-capture-output -n RoboTwin \
     torch==2.4.1 torchvision==0.19.1 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# Install pytorch3d (compile from source, needs torch first)
+# Install pytorch3d (prebuilt wheel for torch 2.4.1 + cu121 + py3.10)
 RUN conda run --no-capture-output -n RoboTwin \
     pip install --no-cache-dir \
-    "pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@v0.7.8"
+    pytorch3d -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt241/download.html
 
-# Install remaining RoboTwin dependencies
+# Install remaining RoboTwin dependencies (with retries for large downloads like open3d)
 COPY requirements-robotwin.txt /tmp/requirements-robotwin.txt
 RUN conda run --no-capture-output -n RoboTwin \
-    pip install --no-cache-dir -r /tmp/requirements-robotwin.txt
+    pip install --no-cache-dir --retries 5 --timeout 120 -r /tmp/requirements-robotwin.txt
 
 # ============ uv (for lingbot-va, Python 3.12) ============
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh

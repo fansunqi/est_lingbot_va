@@ -6,7 +6,15 @@ from .shared_config import va_shared_cfg
 va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
-va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/home/cxy/ocean/models/lingbot-va-posttrain-robotwin/"
+va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/mnt/Shared_06_disk1/cxy/WAM/lingbot-va-posttrain-robotwin/"
+
+# NOTE: We *don't* keep the VAE permanently on GPU even though we have the
+# whole card to ourselves. Combined transformer (~18 GB) + VAE (2.7 GB) +
+# transient conv3d activations (>=1.3 GB) can hit OOM at peaks on a 24 GB
+# 4090 once allocator fragmentation kicks in. Keep the original swap
+# behaviour and rely on `vae_half` weight sharing (see wan_va_server.py)
+# to halve the per-swap cost from 5.4 GB to 2.7 GB instead.
+va_robotwin_cfg.vae_offload = True
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2
