@@ -12,6 +12,7 @@ from .va_libero_train_cfg import va_libero_train_cfg
 from .va_libero_i2va import va_libero_i2va_cfg
 from .va_test_cfg import va_test_cfg
 from .va_test_train_cfg import va_test_train_cfg
+from .va_test_i2va import va_test_i2va_cfg
 
 VA_CONFIGS = {
     'robotwin': va_robotwin_cfg,
@@ -27,4 +28,5 @@ VA_CONFIGS = {
     'libero_i2av': va_libero_i2va_cfg,
     'test': va_test_cfg,
     'test_train': va_test_train_cfg,
+    'test_i2av': va_test_i2va_cfg,
 }
