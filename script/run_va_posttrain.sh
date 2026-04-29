@@ -39,9 +39,9 @@ if [[ -n "${SAVE_ROOT:-}" ]]; then
     overrides="--save-root ${SAVE_ROOT} ${overrides}"
 fi
 
-export WANDB_API_KEY="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"
+export WANDB_API_KEY="your key"
 export WANDB_BASE_URL="https://api.wandb.ai"
-export WANDB_TEAM_NAME="mo-zhehan"
+export WANDB_TEAM_NAME="Robotics-FiT"
 export WANDB_PROJECT="lingbot-new"
 
 ## node setting

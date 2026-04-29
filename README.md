@@ -15,6 +15,7 @@ UV_PROJECT_ENVIRONMENT=/home/uv_env/lingbot-va uv sync
 ```
 
 > venv 建议放 `/home`（本地盘），仓库放共享盘。共享盘上的 venv 每次 `import` 都会慢十几秒。
+> 训练脚本默认使用仓库内 `.venv`；多机训练时通过 `VENV_PATH=/home/uv_env/lingbot-va` 指定每台机器上都存在的同路径环境。
 
 ## 2. VAE Latent 预处理
 
@@ -29,6 +30,7 @@ python -m wan_va.dataset.extract_latents \
 
 - `--num-gpus 6`：公司机器上建议限制为 6。开得过大时，容易出现数据读取阻塞，CPU 占用率突增到 100%，但整体吞吐反而变差。
 - 脚本支持断点续跑；如果中途中断或遇到异常，直接重新执行即可。
+- 遇到已知的视频坏帧解码错误时，脚本会跳过对应 segment，并记录到元数据；后续训练会自动排除这些 segment。
 
 <details>
 <summary><b>FAQ: 找不到 ffmpeg</b></summary>
@@ -53,10 +55,11 @@ export LD_LIBRARY_PATH="$FFMPEG_ENV/lib:${LD_LIBRARY_PATH:-}"
 
 ```bash
 # 1. 先修改 wandb 配置
-vim script/run_va_posttrain.sh   # 填写 WANDB_API_KEY / WANDB_BASE_URL / WANDB_TEAM_NAME 等
+vim script/run_va_posttrain.sh   # 填写 WANDB_API_KEY 等
 
 # 2. 单机多卡
 NGPU=8 CONFIG_NAME='test_train' bash script/run_va_posttrain.sh
+# 可选：SAVE_ROOT=/path/to/save WANDB_NAME=my-run-name
 
 # 3. 多机多卡（登录节点一条命令拉起所有节点）
 #    默认用 $NODE_IP_LIST；指定子集用 IP_LIST 覆盖（避免集群 hook 重写 NODE_IP_LIST）。
