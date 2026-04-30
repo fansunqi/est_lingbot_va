@@ -1,0 +1,488 @@
+================================================================================
+                    LINGBOT-VA SERVER IMPLEMENTATION INVESTIGATION
+                              INVESTIGATION SUMMARY
+================================================================================
+
+PROJECT: /home/taiji/cxy/lingbot-va/
+INVESTIGATION DATE: 2026-04-30
+
+================================================================================
+1. WEBSOCKET SERVER IMPLEMENTATION
+================================================================================
+
+Core Implementation: wan_va/utils/Simple_Remote_Infer/deploy/websocket_policy_server.py
+
+Architecture:
+  - Framework: websockets.asyncio.server (Python websockets library)
+  - Protocol: WebSocket with msgpack binary serialization
+  - Concurrency: Fully async (asyncio)
+  - Message Format: Binary msgpack with numpy array support
+
+Key Components:
+  1. WebsocketPolicyServer class - main server
+  2. async _handler() - per-client async coroutine
+  3. _health_check() - HTTP health endpoint (/healthz)
+
+Server Features:
+  ✓ Handles multiple concurrent clients (one coroutine per client)
+  ✓ Async request/response pattern (non-blocking)
+  ✓ Binary msgpack serialization (no compression, unlimited size)
+  ✓ Per-request timing measurement (infer_ms, prev_total_ms)
+  ✓ Exception traceback sent to client on errors
+  ✓ Connection lifecycle management with graceful cleanup
+  ✓ Health check endpoint: GET /healthz → HTTP 200
+
+Configuration Details:
+  - compression=None (raw binary, no overhead)
+  - max_size=None (unlimited message size)
+  - ping_interval=None, ping_timeout=None (disabled for long inference)
+  - close_timeout=10 (10-second close handshake grace)
+
+================================================================================
+2. MULTI-CLIENT & MULTI-GPU HANDLING
+================================================================================
+
+Current Architecture (NOT true multi-session):
+
+  ❌ Single Server Multi-Client:
+     - New client reset() clears KV cache of previous client
+     - Cannot handle simultaneous independent sessions
+     - By design for single-episode-at-a-time evaluation
+
+  ✓ Multiple Servers (recommended approach):
+     - 8 servers on 8 GPUs
+     - Each server: its own model, KV cache, WebSocket listening port
+     - Clients distributed across servers via load balancing
+     - Port scheme: base_port + server_id (29556-29563)
+
+Multi-GPU Coordination:
+
+  PyTorch Distributed (torch.distributed.run):
+    - Rank 0: Hosts WebSocket server, processes client requests
+    - Rank 1-N: worker_loop() - standby (future optimization for pre-compute)
+    - Communication: torch.distributed.broadcast() for coordination
+
+  DistributedModelWrapper:
+    - Wraps VA_Server model
+    - Rank 0 broadcasts commands to other ranks
+    - Data synchronization via broadcast_object_list()
+    - Currently: Other ranks idle (nproc_per_node typically 1)
+
+Port Assignment Patterns:
+  
+  Single GPU:
+    - WebSocket: 29056 (default)
+    - Master Port: 29061
+  
+  Multi-GPU (8 GPUs):
+    - WebSocket Ports: 29556-29563 (one per GPU)
+    - Master Ports: 29661-29668 (separate per GPU's dist group)
+
+================================================================================
+3. KV CACHE MANAGEMENT PER SESSION
+================================================================================
+
+Session Definition:
+  - Triggered by client sending {reset=True, prompt="..."}
+  - Clears all previous KV cache
+  - Creates fresh empty cache for new episode
+
+Cache Structure (in attention layers):
+  
+  class KVCache {
+    k: [batch_size, window_size, num_heads, head_dim]  // Pre-allocated
+    v: [batch_size, window_size, num_heads, head_dim]  // Pre-allocated
+    id: [window_size]  // LRU eviction IDs
+    mask: [window_size]  // Valid slot indicators (boolean)
+    is_pred: [window_size]  // Prediction vs context flag
+  }
+
+Cache Lifecycle:
+
+  1. RESET (client sends reset=True):
+     - transformer.clear_cache('pos') → sets cache to None
+     - streaming_vae.clear_cache()
+     - transformer.create_empty_cache(
+         cache_name='pos',
+         attn_window=8,  // Sliding window size
+         latent_token_per_chunk=XXX,
+         action_token_per_chunk=XXX,
+         batch_size=2 if CFG else 1,  // 2 for classifier-free guidance
+         device='cuda',
+         dtype=torch.bfloat16
+       )
+     - Fresh cache allocated (all slots empty)
+
+  2. OBSERVATION ENCODING (compute_kv_cache=True):
+     - transformer(..., update_cache=2) → encode context without inference
+     - KV cache filled with observation embeddings
+     - frame_st_id incremented
+     - No action output (just load context)
+
+  3. INFERENCE DIFFUSION:
+     - Video diffusion loop (50+ steps):
+       * Steps 0-48: update_cache=0 (query cache, don't save)
+       * Step 49: update_cache=1 (query cache AND save predictions)
+     - Action diffusion loop (10+ steps):
+       * Similar pattern (query first, save last)
+     - is_pred flag marks prediction slots
+
+  4. STEP CLEAR (prepare for next episode step):
+     - clear_pred_cache() → mark all is_pred=True slots as invalid
+     - Context slots remain (LRU window)
+
+Cache Eviction Policy (LRU):
+  - When new update needs slots but all occupied:
+    1. Find free slots
+    2. If insufficient: identify oldest slots by id
+    3. Evict oldest entries (LRU)
+    4. Allocate evicted slots to new entries
+  - Effect: Sliding window of recent history maintained
+
+KV Cache Parameters (from configs):
+  - attn_window: 8 (frames of history to keep)
+  - latent_token_per_chunk: ~1000s (depends on frame chunk size)
+  - action_token_per_chunk: ~100s (depends on action dim)
+  - batch_size: 1 or 2 (for CFG)
+  - Memory: ~500MB-2GB per cache (depending on config)
+
+Multi-Session Issue:
+  
+  Scenario: Two clients on same server
+    Time T0: Client A reset() → clears cache, creates new one for A
+    Time T1: Client B reset() → CLEARS A's cache, creates new one for B
+    Problem: A's KV history lost!
+  
+  Workaround: Launch multiple server instances (one per GPU)
+    - Each server handles one client sequence
+    - No cache conflicts between servers
+    - Load balancing at application level
+
+================================================================================
+4. SERVER LAUNCH SCRIPTS
+================================================================================
+
+Single GPU Launch: evaluation/robotwin/launch_server.sh
+  
+  python -m torch.distributed.run \
+    --nproc_per_node 1 \
+    --master_port 29061 \
+    wan_va/wan_va_server.py \
+    --config-name robotwin \
+    --port 29056 \
+    --save_root visualization/
+
+Multi-GPU Launch: evaluation/robotwin/launch_server_multigpus.sh
+  
+  Loop through GPUs 0-7:
+    CUDA_VISIBLE_DEVICES=$i \
+    python -m torch.distributed.run \
+      --nproc_per_node 1 \
+      --master_port $((29661 + i)) \
+      wan_va/wan_va_server.py \
+      --config-name robotwin \
+      --port $((29556 + i)) \
+      --save_root visualization/ \
+      > logs/server_${i}_${timestamp}.log 2>&1 &
+    sleep 2
+  
+  Result: 8 independent server instances
+    - GPU 0: ws://0.0.0.0:29556
+    - GPU 1: ws://0.0.0.0:29557
+    - ...
+    - GPU 7: ws://0.0.0.0:29563
+
+Single Client Launch: evaluation/robotwin/launch_client.sh
+  
+  python -m evaluation.robotwin.eval_polict_client_openpi \
+    --config policy/ACT/deploy_policy.yml \
+    --task_name adjust_bottle \
+    --port 29056 \
+    --test_num 100 \
+    ...
+
+Multi-Client Launch: evaluation/robotwin/launch_client_multigpus.sh
+  
+  Load-balanced task assignment:
+    - balance_tasks.py groups tasks by estimated duration
+    - Each task→client→server(port)
+    - Port assignment: 29556 + client_index
+    - GPU assignment: client_index % num_gpus (round-robin)
+  
+  Loop and launch:
+    for each task:
+      port = 29556 + task_index
+      gpu = task_index % 8
+      CUDA_VISIBLE_DEVICES=$gpu python ... --port $port &
+
+Session-Level Evaluation: evaluation/robotwin/launch_session_eval.sh
+  
+  Three-phase pipeline:
+  
+  Phase 1: Collect Valid Seeds (Parallel)
+    - Multiple workers collect valid initial states
+    - Parallel execution across GPUs
+    - Merge results into valid_seeds.json
+  
+  Phase 2: Balance Task Assignments
+    - python -m evaluation.robotwin.balance_tasks
+    - Distribute tasks across num_clients
+    - Output: task_assignments/client_*.json
+  
+  Phase 3: Launch Eval Clients
+    - for each client:
+        port = START_PORT + client_index
+        gpu = CLIENT_GPUS[client_index % len(CLIENT_GPUS)]
+        launch eval_session_client --assignment client_*.json
+
+================================================================================
+5. CLIENT-SIDE WEBSOCKET IMPLEMENTATION
+================================================================================
+
+Implementation: wan_va/utils/Simple_Remote_Infer/deploy/websocket_client_policy.py
+
+Class: WebsocketClientPolicy
+  
+  Constructor:
+    - host: Server hostname (default: 0.0.0.0)
+    - port: Server port
+    - api_key: Optional authentication key
+    - Connects on init via _wait_for_server()
+
+Connection Retry Loop:
+  
+  def _wait_for_server():
+    while True:
+      try:
+        conn = websockets.sync.client.connect(
+          f"ws://{host}:{port}",
+          compression=None,
+          max_size=None,
+          additional_headers={"Authorization": f"Api-Key {api_key}"},
+          ping_interval=None,      // Disabled (long inference)
+          close_timeout=10         // 10s grace for close
+        )
+        metadata = recv(conn)
+        return conn, metadata
+      except Exception as e:
+        logging.info(f"Still waiting for server... (Error: {e})")
+        time.sleep(5)  // Retry every 5 seconds
+
+Inference Interface:
+  
+  def infer(obs: Dict) -> Dict:
+    data = pack(obs)  // msgpack
+    ws.send(data)
+    response = ws.recv()
+    if isinstance(response, str):
+      raise RuntimeError(f"Server error: {response}")
+    return unpack(response)
+  
+  def reset() -> None:
+    infer({"reset": True})
+
+Client Usage Pattern:
+  
+  1. Create client: policy = WebsocketClientPolicy(host, port)
+  2. Session start: policy.reset()
+  3. Episode loop:
+       for step in range(num_steps):
+         action = policy.infer({"obs": obs, "prompt": prompt})
+         # Execute action in environment
+         obs = env.step(action)
+
+================================================================================
+6. DATA FLOW SUMMARY
+================================================================================
+
+Complete Request-Response Flow:
+
+  CLIENT                              SERVER
+  ────────────────────────────────────────────────────────────
+  CONNECT ws://0.0.0.0:29556  ──→  ACCEPT (async handler)
+                              ←──  metadata
+  
+  SEND {reset, prompt}        ──→  _reset(prompt)
+                                   - clear_cache()
+                                   - create_empty_cache()
+                                   - encode_prompt()
+                              ←──  {}
+  
+  SEND {obs, prompt}          ──→  _infer(obs)
+                                   - _encode_obs(): 100-300ms
+                                   - VAE encode
+                                   - Video diffusion: 1000ms
+                                   - Action diffusion: 200ms
+                                   - Postprocess
+                              ←──  {action, timing}
+  
+  [Env execution: 50ms]
+  
+  SEND {obs, prompt}          ──→  (repeat, cache accumulated)
+  
+  ...
+  
+  DISCONNECT                  →   ConnectionClosed
+                                   → cleanup
+                                   → ready for next client
+
+Typical Timing:
+  - Observation send: 0.1ms
+  - Server unpack: 1ms
+  - VAE encode: 100-300ms (offload time)
+  - Inference: 1000-3000ms (diffusion steps)
+  - Pack + send response: 1ms
+  ─────────────────────────
+  Total round-trip: 1100-3300ms per step
+
+Sizing:
+  - Message size: ~10-100MB (images + state)
+  - Binary msgpack + numpy handling
+  - No compression overhead
+
+================================================================================
+7. FILES REFERENCED
+================================================================================
+
+Core Server:
+  ✓ wan_va/utils/Simple_Remote_Infer/deploy/websocket_policy_server.py
+  ✓ wan_va/utils/sever_utils.py (DistributedModelWrapper, worker_loop)
+  ✓ wan_va/wan_va_server.py (VA_Server model wrapper)
+  ✓ wan_va/modules/model.py (KV cache implementation)
+
+Client:
+  ✓ wan_va/utils/Simple_Remote_Infer/deploy/websocket_client_policy.py
+  ✓ evaluation/robotwin/websocket_client_policy.py (client-side)
+  ✓ evaluation/libero/client.py (libero environment client)
+
+Launch Scripts:
+  ✓ evaluation/robotwin/launch_server.sh (single GPU)
+  ✓ evaluation/robotwin/launch_server_multigpus.sh (8 GPUs)
+  ✓ evaluation/robotwin/launch_client.sh (single client)
+  ✓ evaluation/robotwin/launch_client_multigpus.sh (multi-client)
+  ✓ evaluation/robotwin/launch_session_eval.sh (full pipeline)
+
+Config:
+  ✓ wan_va/configs/shared_config.py (default settings)
+
+Utilities:
+  ✓ evaluation/robotwin/balance_tasks.py (load balancing)
+  ✓ evaluation/robotwin/eval_polict_client_openpi.py (client runner)
+  ✓ evaluation/robotwin/eval_session_client.py (session-based runner)
+  ✓ evaluation/robotwin/msgpack_numpy.py (serialization)
+
+================================================================================
+8. KEY FINDINGS
+================================================================================
+
+✓ Fully Asynchronous WebSocket Server:
+  - One async handler coroutine per client
+  - Can accept multiple connections simultaneously
+  - Each client gets independent request processing
+
+✓ Binary Protocol with Numpy Support:
+  - msgpack serialization (no compression)
+  - Handles numpy arrays transparently
+  - Large message support (max_size=None)
+
+✓ Per-Session KV Cache Management:
+  - Fresh cache created on reset=True
+  - Rolling window with LRU eviction
+  - Separate cache per server instance
+
+✗ NOT True Multi-Session:
+  - Single global cache per server instance
+  - New reset() clears all caches
+  - Designed for single-episode-at-a-time evaluation
+
+✓ Multi-GPU via Server Replication:
+  - Separate server instance per GPU
+  - Load balancing at application level
+  - Port assignment: base_port + server_id
+
+✓ Distributed PyTorch Coordination:
+  - Rank 0 handles I/O and inference
+  - Other ranks in standby (future optimization)
+  - Command broadcast for synchronization
+
+✓ Health Check & Monitoring:
+  - /healthz endpoint returns HTTP 200
+  - Server timing metrics in responses
+  - Comprehensive error traceback to client
+
+✓ Robust Error Handling:
+  - Connection cleanup on disconnect
+  - Exception traceback sent as response
+  - Infinite retry loop for client connections
+
+✓ Performance Optimizations:
+  - VAE offloading (CPU/GPU swap to save VRAM)
+  - KV cache sliding window (avoid recomputation)
+  - Classifier-free guidance support (batch_size=2)
+  - Async encoding for observations
+
+================================================================================
+9. GENERATED DOCUMENTATION
+================================================================================
+
+Two comprehensive markdown files have been created:
+
+1. SERVER_IMPLEMENTATION.md (This repository)
+   - 11 sections covering all aspects
+   - Detailed architecture explanation
+   - Code examples with annotations
+   - Configuration parameters
+   - Performance characteristics
+   - Multi-client handling summary
+
+2. ARCHITECTURE_DIAGRAM.md (This repository)
+   - 9 visual ASCII diagrams
+   - Multi-server deployment
+   - Per-server internal architecture
+   - Session lifecycle with state diagrams
+   - KV cache evolution during inference
+   - Client-server message protocol
+   - Port assignment patterns
+   - Distributed PyTorch coordination
+   - Complete request-response timeline
+   - Error scenarios and handling
+
+================================================================================
+10. RECOMMENDATIONS FOR MODIFICATIONS
+================================================================================
+
+If you need to modify the server:
+
+1. For True Multi-Session Support:
+   - Add session_id parameter to reset()
+   - Maintain dict[session_id → KVCache]
+   - Handle concurrent resets safely (locks/asyncio)
+   - More complex but enables simultaneous clients
+
+2. For Distributed Inference:
+   - Implement actual work in worker_loop()
+   - Use Rank 1+ for pre-loading KV cache
+   - Pipelined inference across ranks
+   - Requires synchronization barriers
+
+3. For Enhanced Monitoring:
+   - Add prometheus metrics endpoint
+   - Track cache hit/miss rates
+   - Monitor memory usage per session
+   - Log client connection events
+
+4. For Load Balancing:
+   - Implement least-loaded server selection
+   - Dynamic port assignment
+   - Health check-based routing
+   - Requires coordinating service
+
+5. For Optimization:
+   - Enable compression for large observations
+   - Cache policy warmup for common prompts
+   - Quantized KV cache storage (int8)
+   - Batch multiple inferences across clients
+
+================================================================================
+END OF INVESTIGATION SUMMARY
+================================================================================

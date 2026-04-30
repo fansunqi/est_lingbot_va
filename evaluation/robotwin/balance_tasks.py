@@ -140,12 +140,13 @@ def balance_sessions(valid_seeds: dict, num_clients: int) -> list[list[dict]]:
         List of num_clients lists. Each inner list contains dicts:
         [{"task": "lift_pot", "seed": 10000}, ...]
     """
-    # Build all work units: (step_lim, task_name, seed)
+    # Build all work units: (step_lim, task_name, seed, episode_idx)
+    # episode_idx is the global index of this seed within its task
     work_units = []
     for task_name, seeds in valid_seeds.items():
         step_lim = STEP_LIMITS.get(task_name, 1000)
-        for seed in seeds:
-            work_units.append((step_lim, task_name, seed))
+        for idx, seed in enumerate(seeds):
+            work_units.append((step_lim, task_name, seed, idx))
 
     # Sort by step_lim descending (LPT)
     work_units.sort(key=lambda x: x[0], reverse=True)
@@ -156,9 +157,9 @@ def balance_sessions(valid_seeds: dict, num_clients: int) -> list[list[dict]]:
 
     bins: list[list[dict]] = [[] for _ in range(num_clients)]
 
-    for step_lim, task_name, seed in work_units:
+    for step_lim, task_name, seed, episode_idx in work_units:
         load, idx = heapq.heappop(heap)
-        bins[idx].append({"task": task_name, "seed": seed})
+        bins[idx].append({"task": task_name, "seed": seed, "episode_idx": episode_idx})
         heapq.heappush(heap, (load + step_lim, idx))
 
     # Sort each bin by task name to group same-task episodes together

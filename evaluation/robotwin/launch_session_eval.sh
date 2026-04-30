@@ -39,6 +39,7 @@ task_config=${TASK_CONFIG:-demo_clean}
 NUM_GROUPS=${NUM_GROUPS:-7}
 
 START_PORT=${START_PORT:-29556}
+NUM_SERVERS=${NUM_SERVERS:-5}  # Number of servers running (clients are distributed across them)
 CLIENT_GPUS=(${CLIENT_GPUS:-5 6 7 5 6 7 5 6 7})
 SKIP_COLLECT=${SKIP_COLLECT:-0}
 
@@ -60,8 +61,11 @@ fi
 # Use absolute paths to avoid issues with os.chdir in Python scripts
 mkdir -p "${save_root}"
 save_root=$(realpath "${save_root}")
-SEEDS_FILE="${save_root}/valid_seeds_seed${seed}.json"
-ASSIGNMENT_DIR="${save_root}/task_assignments_seed${seed}"
+st_seed=$((10000 * (1 + seed)))
+RUN_DIR="${save_root}/stseed-${st_seed}"
+mkdir -p "${RUN_DIR}"
+SEEDS_FILE="${RUN_DIR}/valid_seeds.json"
+ASSIGNMENT_DIR="${RUN_DIR}/task_assignments"
 
 policy_name=ACT
 log_dir="./logs"
@@ -74,6 +78,7 @@ echo "  save_root:    ${save_root}"
 echo "  test_num:     ${test_num}"
 echo "  seed:         ${seed}"
 echo "  num_clients:  ${num_clients}"
+echo "  num_servers:  ${NUM_SERVERS}"
 echo "  task_config:  ${task_config}"
 echo "  client_gpus:  ${CLIENT_GPUS[*]}"
 echo "  start_port:   ${START_PORT}"
@@ -184,11 +189,12 @@ batch_time=$(date +%Y%m%d_%H%M%S)
 
 for i in $(seq 0 $(( num_clients - 1 ))); do
     gpu_id="${CLIENT_GPUS[$(( i % ${#CLIENT_GPUS[@]} ))]}"
-    port=$(( START_PORT + i ))
+    # Round-robin assign clients to servers
+    port=$(( START_PORT + (i % NUM_SERVERS) ))
     assignment_file="${ASSIGNMENT_DIR}/client_${i}.json"
     log_file="${log_dir}/session_client_${i}_${batch_time}.log"
 
-    echo -e "\033[33m  [Client $i] GPU=${gpu_id} PORT=${port} Assignment=${assignment_file}\033[0m"
+    echo -e "\033[33m  [Client $i] GPU=${gpu_id} PORT=${port} (server $(( i % NUM_SERVERS ))) Assignment=${assignment_file}\033[0m"
 
     CUDA_VISIBLE_DEVICES=${gpu_id} \
     PYTHONUNBUFFERED=1 \
@@ -198,6 +204,8 @@ for i in $(seq 0 $(( num_clients - 1 ))); do
         --assignment "${assignment_file}" \
         --port ${port} \
         --save_root "${save_root}" \
+        --seed ${seed} \
+        --client_id ${i} \
         --task_config ${task_config} \
         --video_guidance_scale 5 \
         --action_guidance_scale 1 \
@@ -211,3 +219,6 @@ echo ""
 echo -e "\033[32mAll ${num_clients} clients launched. PIDs in ${pid_file}.\033[0m"
 echo -e "\033[36mTo terminate all: kill \$(cat ${pid_file})\033[0m"
 echo -e "\033[36mTo monitor: tail -f logs/session_client_*_${batch_time}.log\033[0m"
+echo ""
+echo -e "\033[36mAfter all clients finish, merge metrics with:\033[0m"
+echo -e "\033[36m  python -m evaluation.robotwin.eval_session_client merge --metrics_dir ${RUN_DIR}/metrics\033[0m"

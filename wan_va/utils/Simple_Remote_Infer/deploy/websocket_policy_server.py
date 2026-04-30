@@ -3,6 +3,7 @@ import http
 import logging
 import time
 import traceback
+import itertools
 
 import websockets.asyncio.server as _server
 import websockets.frames
@@ -13,9 +14,11 @@ logger = logging.getLogger(__name__)
 
 
 class WebsocketPolicyServer:
-    """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
+    """Serves a policy over websocket, supporting multiple concurrent clients.
 
-    Currently only implements the `load` and `infer` methods.
+    Each connection is assigned a unique session_id, injected into every request
+    so the backend can maintain per-session KV caches. An asyncio Lock serializes
+    GPU access (one infer at a time).
     """
 
     def __init__(
@@ -29,12 +32,15 @@ class WebsocketPolicyServer:
         self._host = host
         self._port = port
         self._metadata = metadata or {}
+        self._infer_lock = None  # created inside event loop
+        self._session_counter = itertools.count()
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
         asyncio.run(self.run())
 
     async def run(self):
+        self._infer_lock = asyncio.Lock()
         async with _server.serve(
                 self._handler,
                 self._host,
@@ -48,7 +54,8 @@ class WebsocketPolicyServer:
             await server.serve_forever()
 
     async def _handler(self, websocket: _server.ServerConnection):
-        logger.info(f"Connection from {websocket.remote_address} opened")
+        session_id = f"session_{next(self._session_counter)}"
+        logger.info(f"Connection from {websocket.remote_address} opened (session={session_id})")
         packer = Packer()
 
         await websocket.send(packer.pack(self._metadata))
@@ -59,15 +66,19 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 obs = unpackb(await websocket.recv())
 
-                infer_time = time.monotonic()
-                action = self._policy.infer(obs)
-                infer_time = time.monotonic() - infer_time
+                # Inject session_id for per-session KV cache management
+                obs['_session_id'] = session_id
+
+                # Serialize GPU access across all connections
+                async with self._infer_lock:
+                    infer_time = time.monotonic()
+                    action = self._policy.infer(obs)
+                    infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }
                 if prev_total_time is not None:
-                    # We can only record the last total time since we also want to include the send time.
                     action["server_timing"][
                         "prev_total_ms"] = prev_total_time * 1000
 
@@ -76,7 +87,13 @@ class WebsocketPolicyServer:
 
             except websockets.ConnectionClosed:
                 logger.info(
-                    f"Connection from {websocket.remote_address} closed")
+                    f"Connection from {websocket.remote_address} closed (session={session_id})")
+                # Notify policy to free this session's resources
+                try:
+                    if hasattr(self._policy, 'on_session_closed'):
+                        self._policy.on_session_closed(session_id)
+                except Exception:
+                    pass
                 break
             except Exception:
                 await websocket.send(traceback.format_exc())
@@ -92,5 +109,4 @@ def _health_check(connection: _server.ServerConnection,
                   request: _server.Request) -> _server.Response | None:
     if request.path == "/healthz":
         return connection.respond(http.HTTPStatus.OK, "OK\n")
-    # Continue with the normal request handling.
     return None

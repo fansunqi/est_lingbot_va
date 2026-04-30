@@ -18,6 +18,11 @@ class DistributedModelWrapper:
     def infer(self, obs):
         return distributed_infer(self.model, obs, self.local_rank)
 
+    def on_session_closed(self, session_id):
+        """Forward session cleanup to the underlying model."""
+        if hasattr(self.model, 'on_session_closed'):
+            self.model.on_session_closed(session_id)
+
 
 def distributed_infer(model, obs, local_rank):
     """

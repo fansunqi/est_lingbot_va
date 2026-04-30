@@ -53,6 +53,12 @@ class VA_Server:
         # the same value as enable_offload to preserve previous behavior.
         self.vae_offload = getattr(job_config, 'vae_offload', self.enable_offload)
 
+        # ---- Multi-session state ----
+        # CPU-side storage for inactive sessions' KV caches + metadata
+        self._session_store = {}   # session_id -> {kv_cache: [...], metadata: {...}}
+        self._active_session_id = None  # which session currently occupies GPU cache
+        self._swap_stream = None  # lazily initialized CUDA stream for async copies
+
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
                                             extra_one_step=True)
@@ -631,23 +637,134 @@ class VA_Server:
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
 
+    # ==================== Multi-Session KV Cache Swap ====================
+
+    def _get_swap_stream(self):
+        if self._swap_stream is None:
+            self._swap_stream = torch.cuda.Stream(device=self.device)
+        return self._swap_stream
+
+    def _swap_out(self, session_id):
+        """Move current GPU KV cache + session metadata to CPU (pinned)."""
+        if session_id is None:
+            return
+        stream = self._get_swap_stream()
+        # Collect KV cache tensors from all transformer blocks
+        cpu_kv = []
+        with torch.cuda.stream(stream):
+            for block in self.transformer.blocks:
+                cache = block.attn1.attn_caches.get(self.cache_name)
+                if cache is not None:
+                    cpu_cache = {}
+                    for key, val in cache.items():
+                        if isinstance(val, torch.Tensor):
+                            # pin_memory for faster swap-in later
+                            cpu_cache[key] = val.to('cpu', non_blocking=True).pin_memory()
+                        else:
+                            cpu_cache[key] = val
+                    cpu_kv.append(cpu_cache)
+                else:
+                    cpu_kv.append(None)
+        stream.synchronize()
+
+        # Save per-session metadata
+        self._session_store[session_id] = {
+            'kv_cache': cpu_kv,
+            'frame_st_id': self.frame_st_id,
+            'init_latent': self.init_latent.cpu().pin_memory() if self.init_latent is not None else None,
+            'prompt_embeds': self.prompt_embeds.cpu().pin_memory() if self.prompt_embeds is not None else None,
+            'negative_prompt_embeds': self.negative_prompt_embeds.cpu().pin_memory() if self.negative_prompt_embeds is not None else None,
+            'use_cfg': self.use_cfg,
+            'exp_name': getattr(self, 'exp_name', None),
+            'exp_save_root': getattr(self, 'exp_save_root', None),
+        }
+        logger.info(f"Swapped out session '{session_id}' to CPU")
+
+    def _swap_in(self, session_id):
+        """Restore a session's KV cache from CPU pinned memory to GPU."""
+        state = self._session_store.get(session_id)
+        if state is None:
+            return False
+
+        stream = self._get_swap_stream()
+        with torch.cuda.stream(stream):
+            for block, cpu_cache in zip(self.transformer.blocks, state['kv_cache']):
+                if cpu_cache is not None:
+                    gpu_cache = {}
+                    for key, val in cpu_cache.items():
+                        if isinstance(val, torch.Tensor):
+                            gpu_cache[key] = val.to(self.device, non_blocking=True)
+                        else:
+                            gpu_cache[key] = val
+                    block.attn1.attn_caches[self.cache_name] = gpu_cache
+                else:
+                    block.attn1.attn_caches[self.cache_name] = None
+        stream.synchronize()
+
+        # Restore metadata
+        self.frame_st_id = state['frame_st_id']
+        self.init_latent = state['init_latent'].to(self.device) if state['init_latent'] is not None else None
+        self.prompt_embeds = state['prompt_embeds'].to(self.device) if state['prompt_embeds'] is not None else None
+        self.negative_prompt_embeds = state['negative_prompt_embeds'].to(self.device) if state['negative_prompt_embeds'] is not None else None
+        self.use_cfg = state['use_cfg']
+        if state['exp_name'] is not None:
+            self.exp_name = state['exp_name']
+        if state['exp_save_root'] is not None:
+            self.exp_save_root = state['exp_save_root']
+
+        logger.info(f"Swapped in session '{session_id}' to GPU (frame_st_id={self.frame_st_id})")
+        return True
+
+    def _switch_to_session(self, session_id):
+        """Ensure the given session's KV cache is on GPU. Swap if necessary."""
+        if session_id == self._active_session_id:
+            return  # already active, no swap needed
+        # Swap out current
+        self._swap_out(self._active_session_id)
+        # Swap in target
+        if session_id in self._session_store:
+            self._swap_in(session_id)
+        self._active_session_id = session_id
+
+    def on_session_closed(self, session_id):
+        """Free resources when a client disconnects."""
+        if session_id in self._session_store:
+            del self._session_store[session_id]
+            logger.info(f"Freed session '{session_id}' from CPU store")
+        if self._active_session_id == session_id:
+            self._active_session_id = None
+            # Clear GPU cache
+            self.transformer.clear_cache(self.cache_name)
+
+    # ===================================================================
+
     @torch.no_grad()
     def infer(self, obs):
+        session_id = obs.pop('_session_id', None)
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
 
         if reset:
-            logger.info(f"******************* Reset server ******************")
+            # New episode for this session: swap out current, clear, reset
+            if self._active_session_id is not None and self._active_session_id != session_id:
+                self._swap_out(self._active_session_id)
+            # Discard old cache for this session
+            if session_id in self._session_store:
+                del self._session_store[session_id]
+            self._active_session_id = session_id
+            logger.info(f"******************* Reset server (session='{session_id}') ******************")
             self._reset(prompt=prompt)
             return dict()
         elif compute_kv_cache:
+            self._switch_to_session(session_id)
             logger.info(
-                f"################# Compute KV Cache #################")
+                f"##### Compute KV Cache (session='{session_id}') #####")
             self._compute_kv_cache(obs)
             return dict()
         else:
-            logger.info(f"################# Infer One Chunk #################")
+            self._switch_to_session(session_id)
+            logger.info(f"##### Infer One Chunk (session='{session_id}') #####")
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     

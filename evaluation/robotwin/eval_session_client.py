@@ -286,6 +286,10 @@ def main():
                         help="Server websocket port")
     parser.add_argument("--save_root", type=str, default="./results",
                         help="Root directory for saving results")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Seed multiplier (for stseed folder naming)")
+    parser.add_argument("--client_id", type=int, default=0,
+                        help="Client ID (for per-client metrics file naming)")
     parser.add_argument("--task_config", type=str, default="demo_clean",
                         help="Task config name")
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
@@ -325,18 +329,21 @@ def main():
     model = WebsocketClientPolicy(port=args.port)
     print(f"\033[32mConnected to server on port {args.port}\033[0m")
 
+    # All outputs go under save_root/stseed-{st_seed}/
+    st_seed = 10000 * (1 + args.seed)
+    run_dir = Path(args.save_root) / f"stseed-{st_seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
     # Execute assignment
-    results = defaultdict(lambda: {"succ": 0, "total": 0})
-    episode_counters = defaultdict(int)
+    results = defaultdict(lambda: {"succ": 0, "total": 0, "episodes": []})
 
     for idx, item in enumerate(assignment):
         task_name = item["task"]
         seed = item["seed"]
+        episode_idx = item["episode_idx"]
 
         TASK_ENV = task_envs[task_name]
         task_args = task_args_cache[task_name]
-        episode_idx = episode_counters[task_name]
-        episode_counters[task_name] += 1
 
         print(f"\n\033[33m[{idx+1}/{len(assignment)}] "
               f"task={task_name}, seed={seed}, episode={episode_idx}\033[0m")
@@ -347,7 +354,7 @@ def main():
                 model=model,
                 seed=seed,
                 args=task_args,
-                save_root=args.save_root,
+                save_root=str(run_dir),
                 video_guidance_scale=args.video_guidance_scale,
                 action_guidance_scale=args.action_guidance_scale,
                 save_visualization=True,
@@ -356,27 +363,34 @@ def main():
             results[task_name]["total"] += 1
             if succ:
                 results[task_name]["succ"] += 1
+            results[task_name]["episodes"].append({
+                "seed": seed, "episode_idx": episode_idx, "success": succ
+            })
         except Exception as e:
             print(f"\033[91mError in {task_name} seed={seed}: {e}\033[0m")
             traceback.print_exc()
             results[task_name]["total"] += 1
+            results[task_name]["episodes"].append({
+                "seed": seed, "episode_idx": episode_idx, "success": False, "error": str(e)
+            })
             # Try to close env gracefully
             try:
                 TASK_ENV.close_env()
             except Exception:
                 pass
 
-        # Save intermediate results
-        metrics_dir = Path(args.save_root) / 'metrics'
-        metrics_dir.mkdir(parents=True, exist_ok=True)
+        # Save intermediate per-client metrics
+        client_metrics_file = run_dir / "metrics" / f"client_{args.client_id}.json"
+        client_metrics_file.parent.mkdir(parents=True, exist_ok=True)
+        client_results = {}
         for tname, res in results.items():
-            task_metrics_dir = metrics_dir / tname
-            task_metrics_dir.mkdir(parents=True, exist_ok=True)
-            write_json({
-                "succ_num": float(res["succ"]),
-                "total_num": float(res["total"]),
-                "succ_rate": float(res["succ"] / res["total"]) if res["total"] > 0 else 0.0,
-            }, task_metrics_dir / "res.json")
+            client_results[tname] = {
+                "succ_num": res["succ"],
+                "total_num": res["total"],
+                "succ_rate": res["succ"] / res["total"] if res["total"] > 0 else 0.0,
+                "episodes": res["episodes"],
+            }
+        write_json(client_results, client_metrics_file)
 
         # Print progress
         print(f"  \033[96mProgress: {task_name} "
@@ -401,5 +415,69 @@ def main():
               f"= {total_succ/total_episodes*100:.1f}%")
 
 
+def merge_metrics():
+    """Merge per-client metrics into final per-task results."""
+    parser = argparse.ArgumentParser(description="Merge client metrics")
+    parser.add_argument("--metrics_dir", type=str, required=True,
+                        help="Directory containing client_*.json files")
+    args = parser.parse_args()
+
+    metrics_dir = Path(args.metrics_dir)
+    client_files = sorted(metrics_dir.glob("client_*.json"))
+
+    if not client_files:
+        print(f"No client metrics files in {metrics_dir}")
+        sys.exit(1)
+
+    print(f"Found {len(client_files)} client metrics files")
+
+    # Merge all client results by task
+    merged = defaultdict(lambda: {"succ": 0, "total": 0, "episodes": []})
+    for cf in client_files:
+        with open(cf, "r") as f:
+            data = json.load(f)
+        for task_name, res in data.items():
+            merged[task_name]["succ"] += res["succ_num"]
+            merged[task_name]["total"] += res["total_num"]
+            merged[task_name]["episodes"].extend(res.get("episodes", []))
+
+    # Write per-task final results
+    print(f"\n{'Task':<35} {'Succ':<10} {'Rate':<10}")
+    print("-" * 55)
+    total_succ = 0
+    total_episodes = 0
+    for task_name in sorted(merged.keys()):
+        res = merged[task_name]
+        rate = res["succ"] / res["total"] if res["total"] > 0 else 0.0
+        print(f"  {task_name:<35} {int(res['succ']):>3}/{int(res['total']):<3}   {rate*100:.1f}%")
+        total_succ += res["succ"]
+        total_episodes += res["total"]
+
+        # Write per-task result file
+        task_dir = metrics_dir / task_name
+        task_dir.mkdir(parents=True, exist_ok=True)
+        write_json({
+            "succ_num": float(res["succ"]),
+            "total_num": float(res["total"]),
+            "succ_rate": float(rate),
+            "episodes": res["episodes"],
+        }, task_dir / "res.json")
+
+    # Write overall summary
+    overall_rate = total_succ / total_episodes if total_episodes > 0 else 0.0
+    print(f"\n  {'OVERALL':<35} {int(total_succ):>3}/{int(total_episodes):<3}   {overall_rate*100:.1f}%")
+    write_json({
+        "total_succ": float(total_succ),
+        "total_episodes": float(total_episodes),
+        "overall_succ_rate": float(overall_rate),
+    }, metrics_dir / "overall.json")
+
+    print(f"\n\033[32mMerged results saved to {metrics_dir}/\033[0m")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "merge":
+        sys.argv.pop(1)
+        merge_metrics()
+    else:
+        main()
