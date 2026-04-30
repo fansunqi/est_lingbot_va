@@ -5,3 +5,5 @@
 visualization/
 logs/
 pids.txt
+pids_session.txt
+results/
