@@ -197,24 +197,27 @@ def main():
 
     st_seed = 10000 * (1 + args.seed)
 
+    # Resolve output path to absolute BEFORE os.chdir in Sapien_TEST/class_decorator
+    # (the script does os.chdir(robowin_root) at import time)
+    output_path = Path(args.output).resolve()
+
     # Initialize renderer
     Sapien_TEST()
 
     # Load existing results if resuming
     existing = {}
-    if args.resume and os.path.exists(args.output):
-        with open(args.output, "r") as f:
+    if args.resume and output_path.exists():
+        with open(output_path, "r") as f:
             existing = json.load(f)
-        print(f"Resuming: loaded {len(existing)} tasks from {args.output}")
+        print(f"Resuming: loaded {len(existing)} tasks from {output_path}")
 
     results = dict(existing)
 
     # When using multiple workers, each writes to its own shard file
     if args.num_workers > 1:
-        output_path = Path(args.output)
         shard_path = output_path.parent / f"{output_path.stem}_worker{args.worker_id}{output_path.suffix}"
     else:
-        shard_path = Path(args.output)
+        shard_path = output_path
 
     for task_name in tasks:
         if task_name in results and len(results[task_name]) >= args.test_num:
@@ -241,7 +244,7 @@ def main():
 
 
 def merge_shards():
-    """Merge worker shard files into a single valid_seeds.json."""
+    """Merge worker shard files into a single valid_seeds.json, then delete shards."""
     parser = argparse.ArgumentParser(description="Merge seed collection shards")
     parser.add_argument("--output", type=str, required=True,
                         help="Final merged output file path")
@@ -249,8 +252,8 @@ def merge_shards():
                         help="Directory containing shard files (default: same dir as output)")
     args = parser.parse_args()
 
-    output_path = Path(args.output)
-    shards_dir = Path(args.shards_dir) if args.shards_dir else output_path.parent
+    output_path = Path(args.output).resolve()
+    shards_dir = Path(args.shards_dir).resolve() if args.shards_dir else output_path.parent
 
     # Find all shard files
     pattern = f"{output_path.stem}_worker*{output_path.suffix}"
@@ -271,6 +274,11 @@ def merge_shards():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(merged, f, indent=2)
+
+    # Delete shard files after successful merge
+    for sf in shard_files:
+        sf.unlink()
+        print(f"  Deleted: {sf}")
 
     print(f"\n\033[32mMerged {len(merged)} tasks into {output_path}\033[0m")
     total_seeds = sum(len(v) for v in merged.values())

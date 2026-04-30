@@ -56,9 +56,12 @@ else
     TASKS_ARG=""
 fi
 
-# Paths
-SEEDS_FILE="${save_root}/valid_seeds.json"
-ASSIGNMENT_DIR="${save_root}/task_assignments"
+# Paths (include seed in filename so different seeds don't conflict)
+# Use absolute paths to avoid issues with os.chdir in Python scripts
+mkdir -p "${save_root}"
+save_root=$(realpath "${save_root}")
+SEEDS_FILE="${save_root}/valid_seeds_seed${seed}.json"
+ASSIGNMENT_DIR="${save_root}/task_assignments_seed${seed}"
 
 policy_name=ACT
 log_dir="./logs"
