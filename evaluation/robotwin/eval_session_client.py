@@ -28,6 +28,7 @@ from envs import CONFIGS_PATH
 from envs.utils.create_actor import UnStableError
 
 import numpy as np
+import torch
 from collections import defaultdict
 import traceback
 import yaml
@@ -306,24 +307,14 @@ def main():
 
     print(f"\033[32mLoaded assignment: {len(assignment)} episodes\033[0m")
 
-    # Determine which tasks are in this assignment
-    task_names = sorted(set(item["task"] for item in assignment))
-    print(f"\033[32mTasks involved: {task_names}\033[0m")
+    # Group assignment by task (they should already be sorted by task from balance_sessions)
+    from itertools import groupby
+    task_groups = []
+    for task_name, group in groupby(assignment, key=lambda x: x["task"]):
+        task_groups.append((task_name, list(group)))
 
-    # Preload all task environments
-    print("\033[34mPreloading task environments...\033[0m")
-    task_envs = {}
-    for task_name in task_names:
-        print(f"  Loading: {task_name}")
-        task_envs[task_name] = class_decorator(task_name)
-    print(f"\033[32mAll {len(task_envs)} environments loaded.\033[0m")
-
-    # Build args for each task
-    task_args_cache = {}
-    for task_name in task_names:
-        task_args_cache[task_name] = build_task_args(task_name, args.task_config)
-        task_args_cache[task_name]["policy_name"] = args.policy_name
-        task_args_cache[task_name]["save_root"] = args.save_root
+    print(f"\033[32mTasks involved ({len(task_groups)}): "
+          f"{[f'{name}({len(eps)})' for name, eps in task_groups]}\033[0m")
 
     # Connect to server
     model = WebsocketClientPolicy(port=args.port)
@@ -334,68 +325,89 @@ def main():
     run_dir = Path(args.save_root) / f"stseed-{st_seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Execute assignment
+    # Execute assignment task-by-task: load env → run all episodes → unload env
     results = defaultdict(lambda: {"succ": 0, "total": 0, "episodes": []})
+    global_idx = 0
+    total_episodes = sum(len(eps) for _, eps in task_groups)
 
-    for idx, item in enumerate(assignment):
-        task_name = item["task"]
-        seed = item["seed"]
-        episode_idx = item["episode_idx"]
+    for task_name, episodes in task_groups:
+        print(f"\n\033[34m{'='*60}\033[0m")
+        print(f"\033[34mLoading task environment: {task_name} ({len(episodes)} episodes)\033[0m")
 
-        TASK_ENV = task_envs[task_name]
-        task_args = task_args_cache[task_name]
+        # Load environment and config for this task
+        TASK_ENV = class_decorator(task_name)
+        task_args = build_task_args(task_name, args.task_config)
+        task_args["policy_name"] = args.policy_name
+        task_args["save_root"] = args.save_root
 
-        print(f"\n\033[33m[{idx+1}/{len(assignment)}] "
-              f"task={task_name}, seed={seed}, episode={episode_idx}\033[0m")
+        for item in episodes:
+            seed = item["seed"]
+            episode_idx = item["episode_idx"]
+            global_idx += 1
 
-        try:
-            succ = run_one_episode(
-                TASK_ENV=TASK_ENV,
-                model=model,
-                seed=seed,
-                args=task_args,
-                save_root=str(run_dir),
-                video_guidance_scale=args.video_guidance_scale,
-                action_guidance_scale=args.action_guidance_scale,
-                save_visualization=True,
-                episode_idx=episode_idx,
-            )
-            results[task_name]["total"] += 1
-            if succ:
-                results[task_name]["succ"] += 1
-            results[task_name]["episodes"].append({
-                "seed": seed, "episode_idx": episode_idx, "success": succ
-            })
-        except Exception as e:
-            print(f"\033[91mError in {task_name} seed={seed}: {e}\033[0m")
-            traceback.print_exc()
-            results[task_name]["total"] += 1
-            results[task_name]["episodes"].append({
-                "seed": seed, "episode_idx": episode_idx, "success": False, "error": str(e)
-            })
-            # Try to close env gracefully
+            print(f"\n\033[33m[{global_idx}/{total_episodes}] "
+                  f"task={task_name}, seed={seed}, episode={episode_idx}\033[0m")
+
             try:
-                TASK_ENV.close_env()
-            except Exception:
-                pass
+                succ = run_one_episode(
+                    TASK_ENV=TASK_ENV,
+                    model=model,
+                    seed=seed,
+                    args=task_args,
+                    save_root=str(run_dir),
+                    video_guidance_scale=args.video_guidance_scale,
+                    action_guidance_scale=args.action_guidance_scale,
+                    save_visualization=True,
+                    episode_idx=episode_idx,
+                )
+                results[task_name]["total"] += 1
+                if succ:
+                    results[task_name]["succ"] += 1
+                results[task_name]["episodes"].append({
+                    "seed": seed, "episode_idx": episode_idx, "success": succ
+                })
+            except Exception as e:
+                print(f"\033[91mError in {task_name} seed={seed}: {e}\033[0m")
+                traceback.print_exc()
+                results[task_name]["total"] += 1
+                results[task_name]["episodes"].append({
+                    "seed": seed, "episode_idx": episode_idx, "success": False, "error": str(e)
+                })
+                # Try to close env gracefully
+                try:
+                    TASK_ENV.close_env()
+                except Exception:
+                    pass
 
-        # Save intermediate per-client metrics
-        client_metrics_file = run_dir / "metrics" / f"client_{args.client_id}.json"
-        client_metrics_file.parent.mkdir(parents=True, exist_ok=True)
-        client_results = {}
-        for tname, res in results.items():
-            client_results[tname] = {
-                "succ_num": res["succ"],
-                "total_num": res["total"],
-                "succ_rate": res["succ"] / res["total"] if res["total"] > 0 else 0.0,
-                "episodes": res["episodes"],
-            }
-        write_json(client_results, client_metrics_file)
+            # Save intermediate per-client metrics
+            client_metrics_file = run_dir / "metrics" / f"client_{args.client_id}.json"
+            client_metrics_file.parent.mkdir(parents=True, exist_ok=True)
+            client_results = {}
+            for tname, res in results.items():
+                client_results[tname] = {
+                    "succ_num": res["succ"],
+                    "total_num": res["total"],
+                    "succ_rate": res["succ"] / res["total"] if res["total"] > 0 else 0.0,
+                    "episodes": res["episodes"],
+                }
+            write_json(client_results, client_metrics_file)
 
-        # Print progress
-        print(f"  \033[96mProgress: {task_name} "
-              f"{results[task_name]['succ']}/{results[task_name]['total']} "
-              f"({results[task_name]['succ']/results[task_name]['total']*100:.1f}%)\033[0m")
+            # Print progress
+            print(f"  \033[96mProgress: {task_name} "
+                  f"{results[task_name]['succ']}/{results[task_name]['total']} "
+                  f"({results[task_name]['succ']/results[task_name]['total']*100:.1f}%)\033[0m")
+
+        # Unload this task's environment to free GPU memory
+        print(f"\033[34mUnloading task environment: {task_name}\033[0m")
+        try:
+            TASK_ENV.close_env()
+        except Exception:
+            pass
+        del TASK_ENV
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"\033[34mGPU memory freed after {task_name}\033[0m")
 
     # Final summary
     print("\n" + "=" * 60)
