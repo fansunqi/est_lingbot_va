@@ -645,7 +645,7 @@ class VA_Server:
         return self._swap_stream
 
     def _swap_out(self, session_id):
-        """Move current GPU KV cache + session metadata to CPU (pinned)."""
+        """Move current GPU KV cache + VAE feat_cache + metadata to CPU."""
         if session_id is None:
             return
         stream = self._get_swap_stream()
@@ -658,7 +658,6 @@ class VA_Server:
                     cpu_cache = {}
                     for key, val in cache.items():
                         if isinstance(val, torch.Tensor):
-                            # pin_memory for faster swap-in later
                             cpu_cache[key] = val.to('cpu', non_blocking=True).pin_memory()
                         else:
                             cpu_cache[key] = val
@@ -667,9 +666,26 @@ class VA_Server:
                     cpu_kv.append(None)
         stream.synchronize()
 
+        # Save VAE streaming feat_cache (list of tensors or Nones)
+        def _save_feat_cache(feat_cache):
+            saved = []
+            for item in feat_cache:
+                if item is not None and isinstance(item, torch.Tensor):
+                    saved.append(item.cpu().pin_memory())
+                else:
+                    saved.append(item)
+            return saved
+
+        vae_feat_cache = _save_feat_cache(self.streaming_vae.feat_cache)
+        vae_half_feat_cache = None
+        if self.streaming_vae_half is not None:
+            vae_half_feat_cache = _save_feat_cache(self.streaming_vae_half.feat_cache)
+
         # Save per-session metadata
         self._session_store[session_id] = {
             'kv_cache': cpu_kv,
+            'vae_feat_cache': vae_feat_cache,
+            'vae_half_feat_cache': vae_half_feat_cache,
             'frame_st_id': self.frame_st_id,
             'init_latent': self.init_latent.cpu().pin_memory() if self.init_latent is not None else None,
             'prompt_embeds': self.prompt_embeds.cpu().pin_memory() if self.prompt_embeds is not None else None,
@@ -681,7 +697,7 @@ class VA_Server:
         logger.info(f"Swapped out session '{session_id}' to CPU")
 
     def _swap_in(self, session_id):
-        """Restore a session's KV cache from CPU pinned memory to GPU."""
+        """Restore a session's KV cache + VAE feat_cache from CPU to GPU."""
         state = self._session_store.get(session_id)
         if state is None:
             return False
@@ -700,6 +716,20 @@ class VA_Server:
                 else:
                     block.attn1.attn_caches[self.cache_name] = None
         stream.synchronize()
+
+        # Restore VAE streaming feat_cache
+        def _restore_feat_cache(saved):
+            restored = []
+            for item in saved:
+                if item is not None and isinstance(item, torch.Tensor):
+                    restored.append(item.to(self.device))
+                else:
+                    restored.append(item)
+            return restored
+
+        self.streaming_vae.feat_cache = _restore_feat_cache(state['vae_feat_cache'])
+        if self.streaming_vae_half is not None and state['vae_half_feat_cache'] is not None:
+            self.streaming_vae_half.feat_cache = _restore_feat_cache(state['vae_half_feat_cache'])
 
         # Restore metadata
         self.frame_st_id = state['frame_st_id']
