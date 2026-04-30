@@ -1,0 +1,405 @@
+"""
+Session-level evaluation client for RoboTwin.
+
+Unlike eval_polict_client_openpi.py (one client per task), this client
+reads a work assignment JSON file containing multiple (task, seed) pairs
+and executes them sequentially. This enables session-level load balancing.
+
+Usage:
+    python -m evaluation.robotwin.eval_session_client \
+        --config policy/ACT/deploy_policy.yml \
+        --assignment task_assignments/client_0.json \
+        --port 29556 \
+        --save_root ./results \
+        --task_config demo_clean
+"""
+
+import sys
+import os
+import subprocess
+from pathlib import Path
+
+robowin_root = Path("/home/cxy/WAM/RoboTwin")
+if str(robowin_root) not in sys.path:
+    sys.path.insert(0, str(robowin_root))
+os.chdir(robowin_root)
+
+from envs import CONFIGS_PATH
+from envs.utils.create_actor import UnStableError
+
+import numpy as np
+from collections import defaultdict
+import traceback
+import yaml
+from datetime import datetime
+import importlib
+import argparse
+import json
+
+from evaluation.robotwin.geometry import euler2quat
+from scipy.spatial.transform import Rotation as R
+from description.utils.generate_episode_instructions import *
+
+import imageio
+
+from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
+from evaluation.robotwin.test_render import Sapien_TEST
+
+
+def write_json(data: dict, fpath: Path) -> None:
+    fpath = Path(fpath)
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    with open(fpath, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def class_decorator(task_name):
+    envs_module = importlib.import_module(f"envs.{task_name}")
+    try:
+        env_class = getattr(envs_module, task_name)
+        env_instance = env_class()
+    except Exception:
+        raise SystemExit(f"Failed to create env for task: {task_name}")
+    return env_instance
+
+
+def get_embodiment_file(embodiment_type, _embodiment_types):
+    robot_file = _embodiment_types[embodiment_type]["file_path"]
+    if robot_file is None:
+        raise RuntimeError("No embodiment files")
+    return robot_file
+
+
+def get_embodiment_config(robot_file):
+    robot_config_file = os.path.join(robot_file, "config.yml")
+    with open(robot_config_file, "r", encoding="utf-8") as f:
+        return yaml.load(f.read(), Loader=yaml.FullLoader)
+
+
+def format_obs(observation, prompt):
+    return {
+        "observation.images.cam_high": observation["observation"]["head_camera"]["rgb"],
+        "observation.images.cam_left_wrist": observation["observation"]["left_camera"]["rgb"],
+        "observation.images.cam_right_wrist": observation["observation"]["right_camera"]["rgb"],
+        "observation.state": observation["joint_action"]["vector"],
+        "task": prompt,
+    }
+
+
+def add_eef_pose(new_pose, init_pose):
+    new_pose_R = R.from_quat(new_pose[3:7][None])
+    init_pose_R = R.from_quat(init_pose[3:7][None])
+    out_rot = (init_pose_R * new_pose_R).as_quat().reshape(-1)
+    out_trans = new_pose[:3] + init_pose[:3]
+    return np.concatenate([out_trans, out_rot, new_pose[7:8]])
+
+
+def add_init_pose(new_pose, init_pose):
+    left_pose = add_eef_pose(new_pose[:8], init_pose[:8])
+    right_pose = add_eef_pose(new_pose[8:], init_pose[8:])
+    return np.concatenate([left_pose, right_pose])
+
+
+def build_task_args(task_name, task_config):
+    """Build the args dict for a given task (config loading)."""
+    with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
+        args = yaml.load(f.read(), Loader=yaml.FullLoader)
+
+    args['task_name'] = task_name
+    args["task_config"] = task_config
+    args["eval_mode"] = True
+
+    embodiment_type = args.get("embodiment")
+    embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
+    with open(embodiment_config_path, "r", encoding="utf-8") as f:
+        _embodiment_types = yaml.load(f.read(), Loader=yaml.FullLoader)
+
+    if len(embodiment_type) == 1:
+        args["left_robot_file"] = get_embodiment_file(embodiment_type[0], _embodiment_types)
+        args["right_robot_file"] = get_embodiment_file(embodiment_type[0], _embodiment_types)
+        args["dual_arm_embodied"] = True
+    elif len(embodiment_type) == 3:
+        args["left_robot_file"] = get_embodiment_file(embodiment_type[0], _embodiment_types)
+        args["right_robot_file"] = get_embodiment_file(embodiment_type[1], _embodiment_types)
+        args["embodiment_dis"] = embodiment_type[2]
+        args["dual_arm_embodied"] = False
+    else:
+        raise RuntimeError("embodiment items should be 1 or 3")
+
+    args["left_embodiment_config"] = get_embodiment_config(args["left_robot_file"])
+    args["right_embodiment_config"] = get_embodiment_config(args["right_robot_file"])
+
+    with open(CONFIGS_PATH + "_camera_config.yml", "r", encoding="utf-8") as f:
+        _camera_config = yaml.load(f.read(), Loader=yaml.FullLoader)
+    head_camera_type = args["camera"]["head_camera_type"]
+    args["head_camera_h"] = _camera_config[head_camera_type]["h"]
+    args["head_camera_w"] = _camera_config[head_camera_type]["w"]
+
+    return args
+
+
+def run_one_episode(TASK_ENV, model, seed, args, save_root,
+                    video_guidance_scale=5.0, action_guidance_scale=5.0,
+                    save_visualization=True, episode_idx=0):
+    """
+    Run a single evaluation episode for a given (task, seed).
+
+    Returns:
+        bool: whether the episode was successful
+    """
+    task_name = args['task_name']
+    render_freq = args.get("render_freq", 0)
+    instruction_type = 'seen'
+
+    # Setup the episode (no expert check - seeds are pre-validated)
+    TASK_ENV.setup_demo(now_ep_num=0, seed=seed, is_test=True, **args)
+
+    # Get instruction by running expert once for episode info
+    episode_info = TASK_ENV.play_once()
+    TASK_ENV.close_env()
+
+    # Re-setup with render
+    args["render_freq"] = render_freq
+    TASK_ENV.setup_demo(now_ep_num=0, seed=seed, is_test=True, **args)
+    episode_info_list = [episode_info["info"]]
+    results = generate_episode_descriptions(task_name, episode_info_list, 1)
+    instruction = np.random.choice(results[0][instruction_type])
+    TASK_ENV.set_instruction(instruction=instruction)
+
+    succ = False
+    prompt = TASK_ENV.get_instruction()
+    ret = model.infer(dict(reset=True, prompt=prompt, save_visualization=save_visualization))
+
+    first = True
+    full_obs_list = []
+    gen_video_list = []
+    full_action_history = []
+
+    initial_obs = TASK_ENV.get_obs()
+    inint_eef_pose = (initial_obs['endpose']['left_endpose'] +
+                      [initial_obs['endpose']['left_gripper']] +
+                      initial_obs['endpose']['right_endpose'] +
+                      [initial_obs['endpose']['right_gripper']])
+    inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
+    initial_formatted_obs = format_obs(initial_obs, prompt)
+    full_obs_list.append(initial_formatted_obs)
+    first_obs = None
+
+    while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
+        if first:
+            observation = TASK_ENV.get_obs()
+            first_obs = format_obs(observation, prompt)
+
+        ret = model.infer(dict(
+            obs=first_obs, prompt=prompt,
+            save_visualization=save_visualization,
+            video_guidance_scale=video_guidance_scale,
+            action_guidance_scale=action_guidance_scale
+        ))
+        action = ret['action']
+        if 'video' in ret:
+            gen_video_list.append(ret['video'])
+        key_frame_list = []
+
+        assert action.shape[2] % 4 == 0
+        action_per_frame = action.shape[2] // 4
+
+        start_idx = 1 if first else 0
+        for i in range(start_idx, action.shape[1]):
+            for j in range(action.shape[2]):
+                raw_action_step = action[:, i, j].flatten()
+                full_action_history.append(raw_action_step)
+
+                ee_action = action[:, i, j]
+                if action.shape[0] == 14:
+                    ee_action = np.concatenate([
+                        ee_action[:3],
+                        euler2quat(ee_action[3], ee_action[4], ee_action[5]),
+                        ee_action[6:10],
+                        euler2quat(ee_action[10], ee_action[11], ee_action[12]),
+                        ee_action[13:14]
+                    ])
+                elif action.shape[0] == 16:
+                    ee_action = add_init_pose(ee_action, inint_eef_pose)
+                    ee_action = np.concatenate([
+                        ee_action[:3],
+                        ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
+                        ee_action[7:11],
+                        ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
+                        ee_action[15:16]
+                    ])
+                else:
+                    raise NotImplementedError
+                TASK_ENV.take_action(ee_action, action_type='ee')
+
+                if (j + 1) % action_per_frame == 0:
+                    obs = format_obs(TASK_ENV.get_obs(), prompt)
+                    full_obs_list.append(obs)
+                    key_frame_list.append(obs)
+
+        first = False
+        model.infer(dict(
+            obs=key_frame_list, compute_kv_cache=True,
+            imagine=False, save_visualization=save_visualization,
+            state=action
+        ))
+
+        if TASK_ENV.eval_success:
+            succ = True
+            break
+
+    # Save visualization video
+    vis_dir = Path(save_root) / 'visualization' / task_name
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    video_name = f"{episode_idx}_{prompt.replace(' ', '_')}_{succ}.mp4"
+    out_img_file = vis_dir / video_name
+
+    from evaluation.robotwin.eval_polict_client_openpi import save_comparison_video
+    save_comparison_video(
+        real_obs_list=full_obs_list,
+        imagined_video=None,
+        action_history=full_action_history,
+        save_path=str(out_img_file),
+        fps=15
+    )
+
+    TASK_ENV.close_env()
+
+    if TASK_ENV.render_freq:
+        TASK_ENV.viewer.close()
+
+    if succ:
+        print(f"\033[92m[{task_name} seed={seed}] Success!\033[0m")
+    else:
+        print(f"\033[91m[{task_name} seed={seed}] Fail!\033[0m")
+
+    return succ
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Session-level eval client")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Policy config YAML path")
+    parser.add_argument("--assignment", type=str, required=True,
+                        help="Path to client assignment JSON file")
+    parser.add_argument("--port", type=int, default=29556,
+                        help="Server websocket port")
+    parser.add_argument("--save_root", type=str, default="./results",
+                        help="Root directory for saving results")
+    parser.add_argument("--task_config", type=str, default="demo_clean",
+                        help="Task config name")
+    parser.add_argument("--video_guidance_scale", type=float, default=5.0)
+    parser.add_argument("--action_guidance_scale", type=float, default=5.0)
+    parser.add_argument("--policy_name", type=str, default="ACT")
+    args = parser.parse_args()
+
+    # Initialize renderer
+    Sapien_TEST()
+
+    # Load assignment
+    with open(args.assignment, "r") as f:
+        assignment = json.load(f)
+
+    print(f"\033[32mLoaded assignment: {len(assignment)} episodes\033[0m")
+
+    # Determine which tasks are in this assignment
+    task_names = sorted(set(item["task"] for item in assignment))
+    print(f"\033[32mTasks involved: {task_names}\033[0m")
+
+    # Preload all task environments
+    print("\033[34mPreloading task environments...\033[0m")
+    task_envs = {}
+    for task_name in task_names:
+        print(f"  Loading: {task_name}")
+        task_envs[task_name] = class_decorator(task_name)
+    print(f"\033[32mAll {len(task_envs)} environments loaded.\033[0m")
+
+    # Build args for each task
+    task_args_cache = {}
+    for task_name in task_names:
+        task_args_cache[task_name] = build_task_args(task_name, args.task_config)
+        task_args_cache[task_name]["policy_name"] = args.policy_name
+        task_args_cache[task_name]["save_root"] = args.save_root
+
+    # Connect to server
+    model = WebsocketClientPolicy(port=args.port)
+    print(f"\033[32mConnected to server on port {args.port}\033[0m")
+
+    # Execute assignment
+    results = defaultdict(lambda: {"succ": 0, "total": 0})
+    episode_counters = defaultdict(int)
+
+    for idx, item in enumerate(assignment):
+        task_name = item["task"]
+        seed = item["seed"]
+
+        TASK_ENV = task_envs[task_name]
+        task_args = task_args_cache[task_name]
+        episode_idx = episode_counters[task_name]
+        episode_counters[task_name] += 1
+
+        print(f"\n\033[33m[{idx+1}/{len(assignment)}] "
+              f"task={task_name}, seed={seed}, episode={episode_idx}\033[0m")
+
+        try:
+            succ = run_one_episode(
+                TASK_ENV=TASK_ENV,
+                model=model,
+                seed=seed,
+                args=task_args,
+                save_root=args.save_root,
+                video_guidance_scale=args.video_guidance_scale,
+                action_guidance_scale=args.action_guidance_scale,
+                save_visualization=True,
+                episode_idx=episode_idx,
+            )
+            results[task_name]["total"] += 1
+            if succ:
+                results[task_name]["succ"] += 1
+        except Exception as e:
+            print(f"\033[91mError in {task_name} seed={seed}: {e}\033[0m")
+            traceback.print_exc()
+            results[task_name]["total"] += 1
+            # Try to close env gracefully
+            try:
+                TASK_ENV.close_env()
+            except Exception:
+                pass
+
+        # Save intermediate results
+        metrics_dir = Path(args.save_root) / 'metrics'
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        for tname, res in results.items():
+            task_metrics_dir = metrics_dir / tname
+            task_metrics_dir.mkdir(parents=True, exist_ok=True)
+            write_json({
+                "succ_num": float(res["succ"]),
+                "total_num": float(res["total"]),
+                "succ_rate": float(res["succ"] / res["total"]) if res["total"] > 0 else 0.0,
+            }, task_metrics_dir / "res.json")
+
+        # Print progress
+        print(f"  \033[96mProgress: {task_name} "
+              f"{results[task_name]['succ']}/{results[task_name]['total']} "
+              f"({results[task_name]['succ']/results[task_name]['total']*100:.1f}%)\033[0m")
+
+    # Final summary
+    print("\n" + "=" * 60)
+    print("\033[32mEvaluation Complete!\033[0m")
+    print("=" * 60)
+    total_succ = 0
+    total_episodes = 0
+    for task_name in sorted(results.keys()):
+        res = results[task_name]
+        rate = res["succ"] / res["total"] * 100 if res["total"] > 0 else 0
+        print(f"  {task_name:<35} {res['succ']:>3}/{res['total']:<3} = {rate:.1f}%")
+        total_succ += res["succ"]
+        total_episodes += res["total"]
+
+    if total_episodes > 0:
+        print(f"\n  {'OVERALL':<35} {total_succ:>3}/{total_episodes:<3} "
+              f"= {total_succ/total_episodes*100:.1f}%")
+
+
+if __name__ == "__main__":
+    main()

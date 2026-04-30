@@ -16,15 +16,9 @@ num_gpus=8
 
 task_list_id=${2:-0}
 
-task_groups=(
-  "stack_bowls_three handover_block hanging_mug scan_object lift_pot put_object_cabinet stack_blocks_three place_shoe"
-  "adjust_bottle place_mouse_pad dump_bin_bigbin move_pillbottle_pad pick_dual_bottles shake_bottle place_fan turn_switch"
-  "shake_bottle_horizontally place_container_plate rotate_qrcode place_object_stand put_bottles_dustbin move_stapler_pad place_burger_fries place_bread_basket"
-  "pick_diverse_bottles open_microwave beat_block_hammer press_stapler click_bell move_playingcard_away open_laptop move_can_pot"
-  "stack_bowls_two place_a2b_right stamp_seal place_object_basket handover_mic place_bread_skillet stack_blocks_two place_cans_plasticbox"
-  "click_alarmclock blocks_ranking_size place_phone_stand place_can_basket place_object_scale place_a2b_left grab_roller place_dual_shoes"
-  "place_empty_cup blocks_ranking_rgb place_empty_cup blocks_ranking_rgb place_empty_cup blocks_ranking_rgb place_empty_cup blocks_ranking_rgb"
-)
+# Use load-balanced task assignment (groups balanced by step_lim)
+NUM_GROUPS=${NUM_GROUPS:-7}
+mapfile -t task_groups < <(python -m evaluation.robotwin.balance_tasks --num_clients ${NUM_GROUPS} --verbose)
 
 if (( task_list_id < 0 || task_list_id >= ${#task_groups[@]} )); then
   echo "task_list_id out of range: $task_list_id (0..$(( ${#task_groups[@]} - 1 )))" >&2
