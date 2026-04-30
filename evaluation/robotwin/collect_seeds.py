@@ -141,9 +141,12 @@ def collect_valid_seeds_for_task(task_name, task_config, test_num, st_seed, max_
 
         except UnStableError:
             TASK_ENV.close_env()
+        except (IndexError, ValueError, RuntimeError) as e:
+            # Known env issues: some seeds produce invalid expert plans
+            TASK_ENV.close_env()
         except Exception as e:
             TASK_ENV.close_env()
-            print(f"  Error at seed {now_seed}: {e}")
+            print(f"  Unexpected error at seed {now_seed}: {e}")
             traceback.print_exc()
 
         now_seed += 1
@@ -174,12 +177,23 @@ def main():
                         help="Max attempts per task = test_num * ratio")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from existing output file (skip already collected tasks)")
+    # Parallel worker args
+    parser.add_argument("--worker_id", type=int, default=0,
+                        help="Worker index for parallel collection (0-indexed)")
+    parser.add_argument("--num_workers", type=int, default=1,
+                        help="Total number of parallel workers")
     args = parser.parse_args()
 
     if args.tasks:
         tasks = args.tasks.split()
     else:
         tasks = ALL_TASKS
+
+    # Shard tasks across workers
+    if args.num_workers > 1:
+        tasks = [t for i, t in enumerate(tasks) if i % args.num_workers == args.worker_id]
+        print(f"\033[36mWorker {args.worker_id}/{args.num_workers}: "
+              f"handling {len(tasks)} tasks\033[0m")
 
     st_seed = 10000 * (1 + args.seed)
 
@@ -194,6 +208,13 @@ def main():
         print(f"Resuming: loaded {len(existing)} tasks from {args.output}")
 
     results = dict(existing)
+
+    # When using multiple workers, each writes to its own shard file
+    if args.num_workers > 1:
+        output_path = Path(args.output)
+        shard_path = output_path.parent / f"{output_path.stem}_worker{args.worker_id}{output_path.suffix}"
+    else:
+        shard_path = Path(args.output)
 
     for task_name in tasks:
         if task_name in results and len(results[task_name]) >= args.test_num:
@@ -210,15 +231,56 @@ def main():
         results[task_name] = valid_seeds
 
         # Save incrementally (in case of crash)
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w") as f:
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(shard_path, "w") as f:
             json.dump(results, f, indent=2)
 
-    print(f"\n\033[32mDone! Saved valid seeds for {len(results)} tasks to {args.output}\033[0m")
+    print(f"\n\033[32mDone! Saved valid seeds for {len(results)} tasks to {shard_path}\033[0m")
     total_seeds = sum(len(v) for v in results.values())
     print(f"Total valid seeds: {total_seeds}")
 
 
+def merge_shards():
+    """Merge worker shard files into a single valid_seeds.json."""
+    parser = argparse.ArgumentParser(description="Merge seed collection shards")
+    parser.add_argument("--output", type=str, required=True,
+                        help="Final merged output file path")
+    parser.add_argument("--shards_dir", type=str, default=None,
+                        help="Directory containing shard files (default: same dir as output)")
+    args = parser.parse_args()
+
+    output_path = Path(args.output)
+    shards_dir = Path(args.shards_dir) if args.shards_dir else output_path.parent
+
+    # Find all shard files
+    pattern = f"{output_path.stem}_worker*{output_path.suffix}"
+    shard_files = sorted(shards_dir.glob(pattern))
+
+    if not shard_files:
+        print(f"No shard files matching '{pattern}' in {shards_dir}")
+        sys.exit(1)
+
+    print(f"Found {len(shard_files)} shard files:")
+    merged = {}
+    for sf in shard_files:
+        print(f"  {sf}")
+        with open(sf, "r") as f:
+            data = json.load(f)
+        merged.update(data)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(merged, f, indent=2)
+
+    print(f"\n\033[32mMerged {len(merged)} tasks into {output_path}\033[0m")
+    total_seeds = sum(len(v) for v in merged.values())
+    print(f"Total valid seeds: {total_seeds}")
+
+
 if __name__ == "__main__":
-    main()
+    # Support subcommand: python -m evaluation.robotwin.collect_seeds merge --output ...
+    if len(sys.argv) > 1 and sys.argv[1] == "merge":
+        sys.argv.pop(1)  # remove 'merge' so argparse works
+        merge_shards()
+    else:
+        main()

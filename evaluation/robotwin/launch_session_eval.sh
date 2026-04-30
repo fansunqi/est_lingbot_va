@@ -61,6 +61,8 @@ SEEDS_FILE="${save_root}/valid_seeds.json"
 ASSIGNMENT_DIR="${save_root}/task_assignments"
 
 policy_name=ACT
+log_dir="./logs"
+mkdir -p "$log_dir"
 
 echo -e "\033[32m============================================\033[0m"
 echo -e "\033[32m  Session-Level Balanced Evaluation\033[0m"
@@ -81,30 +83,55 @@ fi
 echo ""
 
 # ============================================================
-# Phase 1: Collect valid seeds
+# Phase 1: Collect valid seeds (parallel across GPUs)
 # ============================================================
 if [ "${SKIP_COLLECT}" -eq 0 ]; then
-    echo -e "\033[34m[Phase 1] Collecting valid seeds...\033[0m"
+    # Number of parallel workers for seed collection
+    COLLECT_WORKERS=${COLLECT_WORKERS:-${#CLIENT_GPUS[@]}}
+    COLLECT_GPUS=(${COLLECT_GPUS:-${CLIENT_GPUS[*]}})
+
+    echo -e "\033[34m[Phase 1] Collecting valid seeds (${COLLECT_WORKERS} workers)...\033[0m"
     echo "  Output: ${SEEDS_FILE}"
     echo ""
 
-    # Use first available GPU for seed collection
-    COLLECT_GPU=${COLLECT_GPU:-${CLIENT_GPUS[0]}}
+    collect_pids=()
+    for w in $(seq 0 $(( COLLECT_WORKERS - 1 ))); do
+        gpu_id="${COLLECT_GPUS[$(( w % ${#COLLECT_GPUS[@]} ))]}"
+        log_file="${log_dir}/collect_worker_${w}.log"
 
-    collect_cmd="python -m evaluation.robotwin.collect_seeds \
-        --test_num ${test_num} \
-        --seed ${seed} \
-        --task_config ${task_config} \
-        --output ${SEEDS_FILE} \
-        --resume"
+        collect_cmd="python -m evaluation.robotwin.collect_seeds \
+            --test_num ${test_num} \
+            --seed ${seed} \
+            --task_config ${task_config} \
+            --output ${SEEDS_FILE} \
+            --max_attempts_ratio 3 \
+            --resume \
+            --worker_id ${w} \
+            --num_workers ${COLLECT_WORKERS}"
 
-    if [ -n "${TASKS}" ]; then
-        collect_cmd="${collect_cmd} --tasks \"${TASKS}\""
-    fi
+        if [ -n "${TASKS}" ]; then
+            collect_cmd="${collect_cmd} --tasks \"${TASKS}\""
+        fi
 
-    CUDA_VISIBLE_DEVICES=${COLLECT_GPU} \
-    PYTHONWARNINGS=ignore::UserWarning \
-    eval ${collect_cmd}
+        echo -e "\033[33m  [Worker $w] GPU=${gpu_id} LOG=${log_file}\033[0m"
+
+        CUDA_VISIBLE_DEVICES=${gpu_id} \
+        PYTHONWARNINGS=ignore::UserWarning \
+        eval ${collect_cmd} > "${log_file}" 2>&1 &
+
+        collect_pids+=($!)
+    done
+
+    # Wait for all workers to finish
+    echo ""
+    echo -e "\033[34m  Waiting for ${COLLECT_WORKERS} workers to finish...\033[0m"
+    for pid in "${collect_pids[@]}"; do
+        wait $pid
+    done
+
+    # Merge shards
+    echo -e "\033[34m  Merging shard files...\033[0m"
+    python -m evaluation.robotwin.collect_seeds merge --output "${SEEDS_FILE}"
 
     echo -e "\033[32m[Phase 1] Done.\033[0m"
     echo ""
@@ -143,8 +170,6 @@ echo ""
 # ============================================================
 echo -e "\033[34m[Phase 3] Launching ${num_clients} eval clients...\033[0m"
 
-log_dir="./logs"
-mkdir -p "$log_dir"
 pid_file="pids_session.txt"
 : > "$pid_file"
 
