@@ -1,0 +1,66 @@
+[
+  {
+    "task": "beat_block_hammer",
+    "seed": 10009
+  },
+  {
+    "task": "beat_block_hammer",
+    "seed": 10021
+  },
+  {
+    "task": "move_pillbottle_pad",
+    "seed": 10007
+  },
+  {
+    "task": "move_pillbottle_pad",
+    "seed": 10020
+  },
+  {
+    "task": "place_can_basket",
+    "seed": 10005
+  },
+  {
+    "task": "place_can_basket",
+    "seed": 10014
+  },
+  {
+    "task": "place_can_basket",
+    "seed": 10021
+  },
+  {
+    "task": "place_dual_shoes",
+    "seed": 10015
+  },
+  {
+    "task": "place_dual_shoes",
+    "seed": 10033
+  },
+  {
+    "task": "place_fan",
+    "seed": 10003
+  },
+  {
+    "task": "place_fan",
+    "seed": 10014
+  },
+  {
+    "task": "put_bottles_dustbin",
+    "seed": 10007
+  },
+  {
+    "task": "put_bottles_dustbin",
+    "seed": 10020
+  },
+  {
+    "task": "stamp_seal",
+    "seed": 10002
+  },
+  {
+    "task": "stamp_seal",
+    "seed": 10019
+  },
+  {
+    "task": "stamp_seal",
+    "seed": 10029
+  }
+]
