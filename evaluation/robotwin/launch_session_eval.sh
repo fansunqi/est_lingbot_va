@@ -88,7 +88,7 @@ echo ""
 # ============================================================
 # Phase 1: Collect valid seeds (parallel across GPUs)
 # ============================================================
-if [ "${SKIP_COLLECT}" -eq 0 ]; then
+if [ "${SKIP_COLLECT}" -eq 0 ] && [ ! -f "${SEEDS_FILE}" ]; then
     # Number of parallel workers for seed collection
     COLLECT_WORKERS=${COLLECT_WORKERS:-${#CLIENT_GPUS[@]}}
     COLLECT_GPUS=(${COLLECT_GPUS:-${CLIENT_GPUS[*]}})
@@ -139,7 +139,11 @@ if [ "${SKIP_COLLECT}" -eq 0 ]; then
     echo -e "\033[32m[Phase 1] Done.\033[0m"
     echo ""
 else
-    echo -e "\033[33m[Phase 1] Skipped (SKIP_COLLECT=1). Using existing: ${SEEDS_FILE}\033[0m"
+    if [ -f "${SEEDS_FILE}" ]; then
+        echo -e "\033[33m[Phase 1] Skipped (${SEEDS_FILE} already exists).\033[0m"
+    else
+        echo -e "\033[33m[Phase 1] Skipped (SKIP_COLLECT=1). Using existing: ${SEEDS_FILE}\033[0m"
+    fi
     if [ ! -f "${SEEDS_FILE}" ]; then
         echo -e "\033[31mError: ${SEEDS_FILE} not found!\033[0m"
         exit 1
