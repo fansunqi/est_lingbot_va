@@ -7,16 +7,20 @@
 #   Phase 3: Launch all eval clients
 #
 # Usage:
-#   bash evaluation/robotwin/launch_session_eval.sh [save_root] [test_num] [seed] [num_clients]
+#   bash evaluation/robotwin/launch_session_eval.sh [save_root] [test_num] [seed] [num_clients] [group_id]
 #
 # Example:
-#   # Full pipeline (9 clients across 3 GPUs):
+#   # Full pipeline - all 50 tasks (9 clients across 3 GPUs):
 #   CLIENT_GPUS="5 6 7 5 6 7 5 6 7" \
 #     bash evaluation/robotwin/launch_session_eval.sh ./results 100 0 9
 #
+#   # Only eval tasks in group 2 (use NUM_GROUPS to control how many groups):
+#   NUM_GROUPS=7 CLIENT_GPUS="5 6 7 5 6 7 5 6 7" \
+#     bash evaluation/robotwin/launch_session_eval.sh ./results 100 0 9 2
+#
 #   # Skip seed collection (reuse existing valid_seeds.json):
 #   SKIP_COLLECT=1 CLIENT_GPUS="5 6 7 5 6 7 5 6 7" \
-#     bash evaluation/robotwin/launch_session_eval.sh ./results 100 0 9
+#     bash evaluation/robotwin/launch_session_eval.sh ./results 100 0 9 2
 
 set -e
 
@@ -30,11 +34,27 @@ save_root=${1:-'./results'}
 test_num=${2:-100}
 seed=${3:-0}
 num_clients=${4:-9}
+group_id=${5:-""}  # empty = all tasks; otherwise select a task group
 task_config=${TASK_CONFIG:-demo_clean}
+NUM_GROUPS=${NUM_GROUPS:-7}
 
 START_PORT=${START_PORT:-29556}
 CLIENT_GPUS=(${CLIENT_GPUS:-5 6 7 5 6 7 5 6 7})
 SKIP_COLLECT=${SKIP_COLLECT:-0}
+
+# Determine which tasks to evaluate
+if [ -n "${group_id}" ]; then
+    # Get task list for this group from balance_tasks (task-level grouping)
+    TASKS=$(python -m evaluation.robotwin.balance_tasks --mode task --num_clients ${NUM_GROUPS} --group_id ${group_id})
+    if [ $? -ne 0 ]; then
+        echo -e "\033[31mError: failed to get tasks for group ${group_id}\033[0m"
+        exit 1
+    fi
+    TASKS_ARG="--tasks \"${TASKS}\""
+else
+    TASKS=""
+    TASKS_ARG=""
+fi
 
 # Paths
 SEEDS_FILE="${save_root}/valid_seeds.json"
@@ -52,6 +72,12 @@ echo "  num_clients:  ${num_clients}"
 echo "  task_config:  ${task_config}"
 echo "  client_gpus:  ${CLIENT_GPUS[*]}"
 echo "  start_port:   ${START_PORT}"
+if [ -n "${group_id}" ]; then
+    echo "  group_id:     ${group_id} (of ${NUM_GROUPS} groups)"
+    echo "  tasks:        ${TASKS}"
+else
+    echo "  group_id:     (all tasks)"
+fi
 echo ""
 
 # ============================================================
@@ -65,14 +91,20 @@ if [ "${SKIP_COLLECT}" -eq 0 ]; then
     # Use first available GPU for seed collection
     COLLECT_GPU=${COLLECT_GPU:-${CLIENT_GPUS[0]}}
 
-    CUDA_VISIBLE_DEVICES=${COLLECT_GPU} \
-    PYTHONWARNINGS=ignore::UserWarning \
-    python -m evaluation.robotwin.collect_seeds \
+    collect_cmd="python -m evaluation.robotwin.collect_seeds \
         --test_num ${test_num} \
         --seed ${seed} \
         --task_config ${task_config} \
-        --output "${SEEDS_FILE}" \
-        --resume
+        --output ${SEEDS_FILE} \
+        --resume"
+
+    if [ -n "${TASKS}" ]; then
+        collect_cmd="${collect_cmd} --tasks \"${TASKS}\""
+    fi
+
+    CUDA_VISIBLE_DEVICES=${COLLECT_GPU} \
+    PYTHONWARNINGS=ignore::UserWarning \
+    eval ${collect_cmd}
 
     echo -e "\033[32m[Phase 1] Done.\033[0m"
     echo ""
@@ -90,12 +122,18 @@ fi
 # ============================================================
 echo -e "\033[34m[Phase 2] Balancing task assignments across ${num_clients} clients...\033[0m"
 
-python -m evaluation.robotwin.balance_tasks \
+balance_cmd="python -m evaluation.robotwin.balance_tasks \
     --mode session \
-    --valid_seeds "${SEEDS_FILE}" \
+    --valid_seeds ${SEEDS_FILE} \
     --num_clients ${num_clients} \
-    --output_dir "${ASSIGNMENT_DIR}" \
-    --verbose
+    --output_dir ${ASSIGNMENT_DIR} \
+    --verbose"
+
+if [ -n "${TASKS}" ]; then
+    balance_cmd="${balance_cmd} --tasks \"${TASKS}\""
+fi
+
+eval ${balance_cmd}
 
 echo -e "\033[32m[Phase 2] Done. Assignments saved to ${ASSIGNMENT_DIR}/\033[0m"
 echo ""

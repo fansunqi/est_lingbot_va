@@ -199,6 +199,11 @@ def main():
         with open(args.valid_seeds, "r") as f:
             valid_seeds = json.load(f)
 
+        # Filter to only specified tasks if --tasks is given
+        if args.tasks:
+            filter_tasks = set(args.tasks.split())
+            valid_seeds = {k: v for k, v in valid_seeds.items() if k in filter_tasks}
+
         bins = balance_sessions(valid_seeds, args.num_clients)
 
         # Output assignment files
