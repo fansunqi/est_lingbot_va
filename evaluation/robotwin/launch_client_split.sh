@@ -14,6 +14,7 @@ seed=${3:-0}
 test_num=${4:-100}
 
 START_PORT=${START_PORT:-29556}
+NUM_SERVERS=${NUM_SERVERS:-5}  # Number of available servers (clients round-robin across them)
 # GPU assignment for each client (must match number of clients we launch)
 CLIENT_GPUS=(${CLIENT_GPUS:-6 7 6 7 6 7})
 NUM_CLIENTS=${#CLIENT_GPUS[@]}
@@ -52,7 +53,7 @@ batch_time=$(date +%Y%m%d_%H%M%S)
 for i in "${!task_names[@]}"; do
     task_name="${task_names[$i]}"
     gpu_id="${CLIENT_GPUS[$(( i % NUM_CLIENTS ))]}"
-    port=$(( START_PORT + i ))
+    port=$(( START_PORT + (i % NUM_SERVERS) ))
     log_file="${log_dir}/${task_name}_${batch_time}.log"
 
     echo -e "\033[33m[Client $i] task=${task_name} GPU=${gpu_id} PORT=${port} LOG=${log_file}\033[0m"
