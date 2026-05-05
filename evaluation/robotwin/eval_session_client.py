@@ -36,6 +36,7 @@ from datetime import datetime
 import importlib
 import argparse
 import json
+import gc
 
 from evaluation.robotwin.geometry import euler2quat
 from scipy.spatial.transform import Rotation as R
@@ -47,11 +48,88 @@ from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 from evaluation.robotwin.test_render import Sapien_TEST
 
 
+def cleanup_env_resources(task_env, clear_cache=True):
+    """Best-effort cleanup for SAPIEN scene/renderer resources after an episode."""
+    if task_env is None:
+        return
+    try:
+        task_env.close_env(clear_cache=clear_cache)
+    except TypeError:
+        try:
+            task_env.close_env()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    viewer = getattr(task_env, "viewer", None)
+    if viewer is not None:
+        try:
+            viewer.close()
+        except Exception:
+            pass
+
+    for attr in (
+        "scene", "renderer", "engine", "viewer", "robot",
+        "head_camera", "left_camera", "right_camera",
+        "eval_video_ffmpeg",
+    ):
+        if hasattr(task_env, attr):
+            try:
+                setattr(task_env, attr, None)
+            except Exception:
+                pass
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def write_json(data: dict, fpath: Path) -> None:
     fpath = Path(fpath)
     fpath.parent.mkdir(parents=True, exist_ok=True)
     with open(fpath, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def group_assignment_by_task(assignment):
+    """Group assignment entries by task while preserving first-seen task order."""
+    grouped = {}
+    for item in assignment:
+        grouped.setdefault(item["task"], []).append(item)
+    return list(grouped.items())
+
+
+def client_metrics_path(run_dir: Path, client_id: int) -> Path:
+    return Path(run_dir) / "metrics" / f"client_{client_id}.json"
+
+
+def load_client_results(run_dir: Path, client_id: int):
+    results = defaultdict(lambda: {"succ": 0, "total": 0, "episodes": []})
+    metrics_file = client_metrics_path(run_dir, client_id)
+    if not metrics_file.is_file():
+        return results
+
+    with open(metrics_file, "r") as f:
+        data = json.load(f)
+
+    for task_name, res in data.items():
+        results[task_name]["succ"] = int(res.get("succ_num", 0))
+        results[task_name]["total"] = int(res.get("total_num", 0))
+        results[task_name]["episodes"] = list(res.get("episodes", []))
+    return results
+
+
+def save_client_results(run_dir: Path, client_id: int, results) -> None:
+    client_results = {}
+    for tname, res in results.items():
+        client_results[tname] = {
+            "succ_num": res["succ"],
+            "total_num": res["total"],
+            "succ_rate": res["succ"] / res["total"] if res["total"] > 0 else 0.0,
+            "episodes": res["episodes"],
+        }
+    write_json(client_results, client_metrics_path(run_dir, client_id))
 
 
 def class_decorator(task_name):
@@ -139,7 +217,7 @@ def build_task_args(task_name, task_config):
     return args
 
 
-def run_one_episode(TASK_ENV, model, seed, args, save_root,
+def run_one_episode(TASK_ENV, model, seed, args, save_root, episode_info,
                     video_guidance_scale=5.0, action_guidance_scale=5.0,
                     save_visualization=True, episode_idx=0):
     """
@@ -149,20 +227,19 @@ def run_one_episode(TASK_ENV, model, seed, args, save_root,
         bool: whether the episode was successful
     """
     task_name = args['task_name']
-    render_freq = args.get("render_freq", 0)
     instruction_type = 'seen'
 
-    # Setup the episode (no expert check - seeds are pre-validated)
-    TASK_ENV.setup_demo(now_ep_num=0, seed=seed, is_test=True, **args)
+    if episode_info is None:
+        raise RuntimeError(
+            "Missing cached episode_info in assignment. Regenerate valid_seeds.json "
+            "with evaluation.robotwin.collect_seeds before running session eval."
+        )
 
-    # Get instruction by running expert once for episode info
-    episode_info = TASK_ENV.play_once()
-    TASK_ENV.close_env()
+    if isinstance(episode_info, dict) and "info" in episode_info:
+        episode_info = episode_info["info"]
 
-    # Re-setup with render
-    args["render_freq"] = render_freq
     TASK_ENV.setup_demo(now_ep_num=0, seed=seed, is_test=True, **args)
-    episode_info_list = [episode_info["info"]]
+    episode_info_list = [episode_info]
     results = generate_episode_descriptions(task_name, episode_info_list, 1)
     instruction = np.random.choice(results[0][instruction_type])
     TASK_ENV.set_instruction(instruction=instruction)
@@ -264,10 +341,9 @@ def run_one_episode(TASK_ENV, model, seed, args, save_root,
         fps=15
     )
 
-    TASK_ENV.close_env()
-
-    if TASK_ENV.render_freq:
-        TASK_ENV.viewer.close()
+    cleanup_env_resources(TASK_ENV, clear_cache=True)
+    del full_obs_list, gen_video_list, full_action_history
+    del initial_obs, initial_formatted_obs, first_obs
 
     if succ:
         print(f"\033[92m[{task_name} seed={seed}] Success!\033[0m")
@@ -275,6 +351,54 @@ def run_one_episode(TASK_ENV, model, seed, args, save_root,
         print(f"\033[91m[{task_name} seed={seed}] Fail!\033[0m")
 
     return succ
+
+
+def run_task_subprocesses(args, task_groups, run_dir: Path) -> None:
+    """Run each task group in a fresh Python process to release SAPIEN resources."""
+    lingbot_root = Path(__file__).resolve().parents[2]
+    split_dir = run_dir / "task_assignments_by_task" / f"client_{args.client_id}"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    metrics_file = client_metrics_path(run_dir, args.client_id)
+    if not args.resume_metrics and metrics_file.exists():
+        metrics_file.unlink()
+
+    total_episodes = sum(len(episodes) for _, episodes in task_groups)
+    print(f"\033[34mRestart-per-task mode enabled: {len(task_groups)} task processes, "
+          f"{total_episodes} episodes total\033[0m")
+
+    for task_idx, (task_name, episodes) in enumerate(task_groups):
+        task_assignment = split_dir / f"{task_idx:03d}_{task_name}.json"
+        write_json(episodes, task_assignment)
+
+        cmd = [
+            sys.executable, "-u", "-m", "evaluation.robotwin.eval_session_client",
+            "--config", args.config,
+            "--assignment", str(task_assignment),
+            "--port", str(args.port),
+            "--save_root", args.save_root,
+            "--run_dir", str(run_dir),
+            "--seed", str(args.seed),
+            "--client_id", str(args.client_id),
+            "--task_config", args.task_config,
+            "--video_guidance_scale", str(args.video_guidance_scale),
+            "--action_guidance_scale", str(args.action_guidance_scale),
+            "--policy_name", args.policy_name,
+            "--resume_metrics",
+        ]
+
+        print(f"\n\033[34m[{task_idx + 1}/{len(task_groups)}] "
+              f"Starting fresh process for {task_name} ({len(episodes)} episodes)\033[0m")
+        completed = subprocess.run(cmd, cwd=str(lingbot_root), env=os.environ.copy())
+        if completed.returncode != 0:
+            raise SystemExit(
+                f"Task subprocess failed for {task_name} with exit code {completed.returncode}"
+            )
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    print("\n\033[32mAll task subprocesses completed.\033[0m")
 
 
 def main():
@@ -287,6 +411,8 @@ def main():
                         help="Server websocket port")
     parser.add_argument("--save_root", type=str, default="./results",
                         help="Root directory for saving results")
+    parser.add_argument("--run_dir", type=str, default=None,
+                        help="Exact run directory for metrics and visualization")
     parser.add_argument("--seed", type=int, default=0,
                         help="Seed multiplier (for stseed folder naming)")
     parser.add_argument("--client_id", type=int, default=0,
@@ -296,10 +422,11 @@ def main():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--policy_name", type=str, default="ACT")
+    parser.add_argument("--restart_per_task", action="store_true",
+                        help="Run each task group in a fresh child process")
+    parser.add_argument("--resume_metrics", action="store_true",
+                        help="Load and append to metrics/client_<id>.json before running")
     args = parser.parse_args()
-
-    # Initialize renderer
-    Sapien_TEST()
 
     # Load assignment
     with open(args.assignment, "r") as f:
@@ -307,26 +434,39 @@ def main():
 
     print(f"\033[32mLoaded assignment: {len(assignment)} episodes\033[0m")
 
-    # Group assignment by task (they should already be sorted by task from balance_sessions)
-    from itertools import groupby
-    task_groups = []
-    for task_name, group in groupby(assignment, key=lambda x: x["task"]):
-        task_groups.append((task_name, list(group)))
+    # Group assignment by task.
+    task_groups = group_assignment_by_task(assignment)
 
     print(f"\033[32mTasks involved ({len(task_groups)}): "
           f"{[f'{name}({len(eps)})' for name, eps in task_groups]}\033[0m")
 
-    # Connect to server
+    # All outputs go under run_dir when provided, otherwise save_root/stseed-{st_seed}/.
+    st_seed = 10000 * (1 + args.seed)
+    run_dir = Path(args.run_dir) if args.run_dir else Path(args.save_root) / f"stseed-{st_seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.restart_per_task:
+        run_task_subprocesses(args, task_groups, run_dir)
+        return
+
+    # Initialize renderer
+    Sapien_TEST()
+
+    # Connect to server. The server assigns this websocket connection a session_id.
+    # In restart-per-task mode each child process gets a new session, and process
+    # exit closes the connection so the server can free that session's KV cache.
     model = WebsocketClientPolicy(port=args.port)
     print(f"\033[32mConnected to server on port {args.port}\033[0m")
 
-    # All outputs go under save_root/stseed-{st_seed}/
-    st_seed = 10000 * (1 + args.seed)
-    run_dir = Path(args.save_root) / f"stseed-{st_seed}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
     # Execute assignment task-by-task: load env → run all episodes → unload env
-    results = defaultdict(lambda: {"succ": 0, "total": 0, "episodes": []})
+    results = load_client_results(run_dir, args.client_id) if args.resume_metrics else defaultdict(
+        lambda: {"succ": 0, "total": 0, "episodes": []}
+    )
+    if args.resume_metrics:
+        resumed_total = sum(res["total"] for res in results.values())
+        print(f"\033[32mResumed metrics for client {args.client_id}: "
+              f"{resumed_total} previous episodes\033[0m")
+
     global_idx = 0
     total_episodes = sum(len(eps) for _, eps in task_groups)
 
@@ -334,13 +474,12 @@ def main():
         print(f"\n\033[34m{'='*60}\033[0m")
         print(f"\033[34mLoading task environment: {task_name} ({len(episodes)} episodes)\033[0m")
 
-        # Load environment and config for this task
-        TASK_ENV = class_decorator(task_name)
         task_args = build_task_args(task_name, args.task_config)
         task_args["policy_name"] = args.policy_name
         task_args["save_root"] = args.save_root
 
         for item in episodes:
+            TASK_ENV = None
             seed = item["seed"]
             episode_idx = item["episode_idx"]
             global_idx += 1
@@ -349,12 +488,14 @@ def main():
                   f"task={task_name}, seed={seed}, episode={episode_idx}\033[0m")
 
             try:
+                TASK_ENV = class_decorator(task_name)
                 succ = run_one_episode(
                     TASK_ENV=TASK_ENV,
                     model=model,
                     seed=seed,
                     args=task_args,
                     save_root=str(run_dir),
+                    episode_info=item.get("episode_info"),
                     video_guidance_scale=args.video_guidance_scale,
                     action_guidance_scale=args.action_guidance_scale,
                     save_visualization=True,
@@ -373,24 +514,14 @@ def main():
                 results[task_name]["episodes"].append({
                     "seed": seed, "episode_idx": episode_idx, "success": False, "error": str(e)
                 })
-                # Try to close env gracefully
-                try:
-                    TASK_ENV.close_env()
-                except Exception:
-                    pass
+                cleanup_env_resources(TASK_ENV, clear_cache=True)
+            finally:
+                if TASK_ENV is not None:
+                    cleanup_env_resources(TASK_ENV, clear_cache=True)
+                    del TASK_ENV
 
             # Save intermediate per-client metrics
-            client_metrics_file = run_dir / "metrics" / f"client_{args.client_id}.json"
-            client_metrics_file.parent.mkdir(parents=True, exist_ok=True)
-            client_results = {}
-            for tname, res in results.items():
-                client_results[tname] = {
-                    "succ_num": res["succ"],
-                    "total_num": res["total"],
-                    "succ_rate": res["succ"] / res["total"] if res["total"] > 0 else 0.0,
-                    "episodes": res["episodes"],
-                }
-            write_json(client_results, client_metrics_file)
+            save_client_results(run_dir, args.client_id, results)
 
             # Print progress
             print(f"  \033[96mProgress: {task_name} "
@@ -399,12 +530,6 @@ def main():
 
         # Unload this task's environment to free GPU memory
         print(f"\033[34mUnloading task environment: {task_name}\033[0m")
-        try:
-            TASK_ENV.close_env()
-        except Exception:
-            pass
-        del TASK_ENV
-        import gc
         gc.collect()
         torch.cuda.empty_cache()
         print(f"\033[34mGPU memory freed after {task_name}\033[0m")
@@ -425,6 +550,8 @@ def main():
     if total_episodes > 0:
         print(f"\n  {'OVERALL':<35} {total_succ:>3}/{total_episodes:<3} "
               f"= {total_succ/total_episodes*100:.1f}%")
+
+    model.close()
 
 
 def merge_metrics():

@@ -72,6 +72,12 @@ class WebsocketClientPolicy:
     def reset(self) -> None:
         pass
 
+    def close(self) -> None:
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+
 if __name__ == "__main__":
     policy_on_device = WebsocketClientPolicy(port=8000)
     import torch

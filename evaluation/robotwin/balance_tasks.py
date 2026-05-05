@@ -86,6 +86,28 @@ STEP_LIMITS = {
 }
 
 
+def normalize_seed_entry(task_name: str, entry, episode_idx: int) -> dict:
+    if isinstance(entry, int):
+        raise ValueError(
+            f"{task_name} seed {entry} is using the legacy valid_seeds format "
+            "without episode_info. Regenerate valid_seeds.json with collect_seeds.py."
+        )
+    if isinstance(entry, dict) and "seed" in entry:
+        if "episode_info" not in entry:
+            raise ValueError(
+                f"{task_name} seed {entry['seed']} is missing cached episode_info. "
+                "Regenerate valid_seeds.json with collect_seeds.py."
+            )
+        item = {
+            "task": task_name,
+            "seed": entry["seed"],
+            "episode_idx": entry.get("episode_idx", episode_idx),
+            "episode_info": entry["episode_info"],
+        }
+        return item
+    raise ValueError(f"Invalid seed entry for {task_name}: {entry!r}")
+
+
 def balance_tasks(tasks: list[str], num_groups: int) -> list[list[str]]:
     """
     Distribute tasks into num_groups groups for parallel execution.
@@ -122,7 +144,7 @@ def balance_tasks(tasks: list[str], num_groups: int) -> list[list[str]]:
     return bins
 
 
-def balance_sessions(valid_seeds: dict, num_clients: int) -> list[list[dict]]:
+def balance_sessions(valid_seeds: dict, num_clients: int, test_num: int | None = None) -> list[list[dict]]:
     """
     Distribute (task, seed) pairs across num_clients bins by step_lim.
 
@@ -133,20 +155,26 @@ def balance_sessions(valid_seeds: dict, num_clients: int) -> list[list[dict]]:
     episodes together (reduces environment switching overhead).
 
     Args:
-        valid_seeds: dict mapping task_name -> list of valid seeds
+        valid_seeds: dict mapping task_name -> list of cached valid seed entries.
+            Each entry must include seed and episode_info.
         num_clients: number of client bins
+        test_num: optional max number of seeds to use per task. When a
+            valid_seeds.json was collected for a larger eval, only the first
+            test_num seeds are assigned.
 
     Returns:
         List of num_clients lists. Each inner list contains dicts:
         [{"task": "lift_pot", "seed": 10000}, ...]
     """
-    # Build all work units: (step_lim, task_name, seed, episode_idx)
+    # Build all work units: (step_lim, assignment_item)
     # episode_idx is the global index of this seed within its task
     work_units = []
-    for task_name, seeds in valid_seeds.items():
+    for task_name, seed_entries in valid_seeds.items():
         step_lim = STEP_LIMITS.get(task_name, 1000)
-        for idx, seed in enumerate(seeds):
-            work_units.append((step_lim, task_name, seed, idx))
+        if test_num is not None:
+            seed_entries = seed_entries[:test_num]
+        for idx, entry in enumerate(seed_entries):
+            work_units.append((step_lim, normalize_seed_entry(task_name, entry, idx)))
 
     # Sort by step_lim descending (LPT)
     work_units.sort(key=lambda x: x[0], reverse=True)
@@ -157,9 +185,9 @@ def balance_sessions(valid_seeds: dict, num_clients: int) -> list[list[dict]]:
 
     bins: list[list[dict]] = [[] for _ in range(num_clients)]
 
-    for step_lim, task_name, seed, episode_idx in work_units:
+    for step_lim, item in work_units:
         load, idx = heapq.heappop(heap)
-        bins[idx].append({"task": task_name, "seed": seed, "episode_idx": episode_idx})
+        bins[idx].append(item)
         heapq.heappush(heap, (load + step_lim, idx))
 
     # Sort each bin by task name to group same-task episodes together
@@ -189,6 +217,8 @@ def main():
                         help="[session mode] Path to valid_seeds.json")
     parser.add_argument("--output_dir", type=str, default="./task_assignments",
                         help="[session mode] Output directory for client assignment files")
+    parser.add_argument("--test_num", type=int, default=None,
+                        help="[session mode] Use only the first N valid seeds per task")
     args = parser.parse_args()
 
     if args.mode == "session":
@@ -205,7 +235,21 @@ def main():
             filter_tasks = set(args.tasks.split())
             valid_seeds = {k: v for k, v in valid_seeds.items() if k in filter_tasks}
 
-        bins = balance_sessions(valid_seeds, args.num_clients)
+        if args.test_num is not None:
+            too_short = {
+                task_name: len(seed_entries)
+                for task_name, seed_entries in valid_seeds.items()
+                if len(seed_entries) < args.test_num
+            }
+            if too_short:
+                details = ", ".join(f"{task}={count}" for task, count in sorted(too_short.items()))
+                print(
+                    f"Error: valid_seeds has fewer than --test_num={args.test_num} entries for: {details}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        bins = balance_sessions(valid_seeds, args.num_clients, args.test_num)
 
         # Output assignment files
         from pathlib import Path

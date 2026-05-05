@@ -41,6 +41,26 @@ import yaml
 from evaluation.robotwin.test_render import Sapien_TEST
 from evaluation.robotwin.balance_tasks import ALL_TASKS
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+
+def seed_entry_has_episode_info(entry):
+    return isinstance(entry, dict) and "seed" in entry and "episode_info" in entry
+
+
+def count_seed_entries(task_entries):
+    return len(task_entries) if isinstance(task_entries, list) else 0
+
+
+def task_entries_have_episode_info(task_entries):
+    return (
+        isinstance(task_entries, list)
+        and all(seed_entry_has_episode_info(entry) for entry in task_entries)
+    )
+
 
 def class_decorator(task_name):
     """Create a task environment instance by importing the task module."""
@@ -53,7 +73,74 @@ def class_decorator(task_name):
     return env_instance
 
 
-def collect_valid_seeds_for_task(task_name, task_config, test_num, st_seed, max_attempts_ratio=3):
+def close_env_safely(task_env):
+    try:
+        task_env.close_env()
+    except Exception:
+        pass
+
+
+def progress_write(message):
+    if tqdm is not None:
+        tqdm.write(message)
+    else:
+        print(message)
+
+
+def write_collect_progress(progress_path, task_name, test_num, valid_count, attempts,
+                           max_attempts, current_seed, status, skipped):
+    if progress_path is None:
+        return
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "task": task_name,
+        "total": test_num,
+        "valid": valid_count,
+        "attempts": attempts,
+        "max_attempts": max_attempts,
+        "current_seed": current_seed,
+        "status": status,
+        "skipped": skipped,
+    }
+    tmp_path = progress_path.with_suffix(progress_path.suffix + ".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(data, f)
+    tmp_path.replace(progress_path)
+
+
+def validate_seed_replays(task_name, args, seed, replay_count):
+    """Rebuild the env for the same seed to catch non-reproducible unstable setups."""
+    for replay_idx in range(1, replay_count):
+        task_env = class_decorator(task_name)
+        try:
+            task_env.setup_demo(now_ep_num=0, seed=seed, is_test=True, **args)
+        except UnStableError:
+            close_env_safely(task_env)
+            progress_write(f"  Seed {seed} failed replay validation ({replay_idx + 1}/{replay_count}); skip")
+            return False
+        except (IndexError, ValueError, RuntimeError) as e:
+            close_env_safely(task_env)
+            progress_write(f"  Seed {seed} failed replay validation ({replay_idx + 1}/{replay_count}): {e}; skip")
+            return False
+        except Exception as e:
+            close_env_safely(task_env)
+            progress_write(f"  Seed {seed} unexpected replay validation error ({replay_idx + 1}/{replay_count}): {e}; skip")
+            traceback.print_exc()
+            return False
+        close_env_safely(task_env)
+    return True
+
+
+def update_seed_progress(progress_bar, now_seed, attempts, max_attempts, skipped):
+    if progress_bar is None:
+        return
+    progress_bar.set_postfix_str(
+        f"attempts={attempts}/{max_attempts}"
+    )
+
+
+def collect_valid_seeds_for_task(task_name, task_config, test_num, st_seed, max_attempts_ratio=3,
+                                 validation_replays=1, progress_path=None):
     """
     Collect valid seeds for a single task by running expert_check.
 
@@ -65,7 +152,8 @@ def collect_valid_seeds_for_task(task_name, task_config, test_num, st_seed, max_
         max_attempts_ratio: Max attempts = test_num * ratio (to avoid infinite loop)
 
     Returns:
-        List of valid seeds
+        List of valid seed records. Each record contains the seed and the
+        cached episode_info needed to build eval-time language instructions.
     """
     # Load task config
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
@@ -119,46 +207,105 @@ def collect_valid_seeds_for_task(task_name, task_config, test_num, st_seed, max_
     # Create environment
     TASK_ENV = class_decorator(task_name)
 
-    valid_seeds = []
+    valid_seed_records = []
     now_seed = st_seed
     max_attempts = test_num * max_attempts_ratio
     attempts = 0
+    skipped = {
+        "unstable": 0,
+        "expert": 0,
+        "known": 0,
+        "replay": 0,
+        "unexpected": 0,
+    }
 
-    print(f"\n\033[34mCollecting seeds for: {task_name} (need {test_num})\033[0m")
+    progress_write(f"\n\033[34mCollecting seeds for: {task_name} (need {test_num})\033[0m")
+    if validation_replays > 1:
+        progress_write(f"  Replay validation: {validation_replays} setup(s) per accepted seed")
+    write_collect_progress(
+        progress_path, task_name, test_num, len(valid_seed_records),
+        attempts, max_attempts, now_seed, "running", skipped
+    )
 
-    while len(valid_seeds) < test_num and attempts < max_attempts:
-        attempts += 1
-        try:
-            TASK_ENV.setup_demo(now_ep_num=0, seed=now_seed, is_test=True, **args)
-            episode_info = TASK_ENV.play_once()
-            TASK_ENV.close_env()
+    progress_bar = None
+    if tqdm is not None:
+        progress_bar = tqdm(
+            total=test_num,
+            desc=f"{task_name}",
+            unit="seed",
+            dynamic_ncols=True,
+            leave=True,
+        )
 
-            if TASK_ENV.plan_success and TASK_ENV.check_success():
-                valid_seeds.append(now_seed)
-                print(f"  [{len(valid_seeds)}/{test_num}] seed={now_seed} ✓", end="\r")
-            else:
-                pass  # expert failed, skip this seed
+    try:
+        while len(valid_seed_records) < test_num and attempts < max_attempts:
+            attempts += 1
+            try:
+                TASK_ENV.setup_demo(now_ep_num=0, seed=now_seed, is_test=True, **args)
+                episode_info = TASK_ENV.play_once()
+                close_env_safely(TASK_ENV)
 
-        except UnStableError:
-            TASK_ENV.close_env()
-        except (IndexError, ValueError, RuntimeError) as e:
-            # Known env issues: some seeds produce invalid expert plans
-            TASK_ENV.close_env()
-        except Exception as e:
-            TASK_ENV.close_env()
-            print(f"  Unexpected error at seed {now_seed}: {e}")
-            traceback.print_exc()
+                if TASK_ENV.plan_success and TASK_ENV.check_success():
+                    if not validate_seed_replays(task_name, args, now_seed, validation_replays):
+                        skipped["replay"] += 1
+                        update_seed_progress(progress_bar, now_seed, attempts, max_attempts, skipped)
+                        write_collect_progress(
+                            progress_path, task_name, test_num, len(valid_seed_records),
+                            attempts, max_attempts, now_seed, "running", skipped
+                        )
+                        now_seed += 1
+                        continue
+                    valid_seed_records.append({
+                        "seed": now_seed,
+                        "episode_info": episode_info["info"],
+                    })
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                    else:
+                        print(f"  [{len(valid_seed_records)}/{test_num}] seed={now_seed} ✓", end="\r")
+                else:
+                    skipped["expert"] += 1
 
-        now_seed += 1
+            except UnStableError:
+                skipped["unstable"] += 1
+                close_env_safely(TASK_ENV)
+            except (IndexError, ValueError, RuntimeError) as e:
+                # Known env issues: some seeds produce invalid expert plans
+                skipped["known"] += 1
+                close_env_safely(TASK_ENV)
+            except Exception as e:
+                skipped["unexpected"] += 1
+                close_env_safely(TASK_ENV)
+                progress_write(f"  Unexpected error at seed {now_seed}: {e}")
+                traceback.print_exc()
 
-    print(f"\n  \033[32mCollected {len(valid_seeds)} valid seeds "
-          f"(tried {attempts} seeds, fail rate: {1 - len(valid_seeds)/attempts:.1%})\033[0m")
+            update_seed_progress(progress_bar, now_seed, attempts, max_attempts, skipped)
+            write_collect_progress(
+                progress_path, task_name, test_num, len(valid_seed_records),
+                attempts, max_attempts, now_seed, "running", skipped
+            )
+            now_seed += 1
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
 
-    if len(valid_seeds) < test_num:
-        print(f"  \033[33mWarning: only got {len(valid_seeds)}/{test_num} valid seeds "
+    print(f"\n  \033[32mCollected {len(valid_seed_records)} valid seeds "
+          f"(tried {attempts} seeds, fail rate: {1 - len(valid_seed_records)/attempts:.1%})\033[0m")
+    print("  Skipped seeds: "
+          f"unstable={skipped['unstable']}, expert={skipped['expert']}, "
+          f"known={skipped['known']}, replay={skipped['replay']}, "
+          f"unexpected={skipped['unexpected']}")
+    final_status = "done" if len(valid_seed_records) >= test_num else "incomplete"
+    write_collect_progress(
+        progress_path, task_name, test_num, len(valid_seed_records),
+        attempts, max_attempts, now_seed - 1, final_status, skipped
+    )
+
+    if len(valid_seed_records) < test_num:
+        print(f"  \033[33mWarning: only got {len(valid_seed_records)}/{test_num} valid seeds "
               f"after {max_attempts} attempts\033[0m")
 
-    return valid_seeds
+    return valid_seed_records
 
 
 def main():
@@ -175,6 +322,10 @@ def main():
                         help="Output JSON file path")
     parser.add_argument("--max_attempts_ratio", type=int, default=3,
                         help="Max attempts per task = test_num * ratio")
+    parser.add_argument("--validation_replays", type=int, default=1,
+                        help="Number of env setup replays required before accepting a seed")
+    parser.add_argument("--progress_dir", type=str, default=None,
+                        help="Optional directory for per-task JSON progress files")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from existing output file (skip already collected tasks)")
     # Parallel worker args
@@ -211,27 +362,49 @@ def main():
             existing = json.load(f)
         print(f"Resuming: loaded {len(existing)} tasks from {output_path}")
 
-    results = dict(existing)
-
     # When using multiple workers, each writes to its own shard file
     if args.num_workers > 1:
         shard_path = output_path.parent / f"{output_path.stem}_worker{args.worker_id}{output_path.suffix}"
+        results = {}
     else:
         shard_path = output_path
+        results = dict(existing)
+
+    progress_dir = Path(args.progress_dir).resolve() if args.progress_dir else None
 
     for task_name in tasks:
-        if task_name in results and len(results[task_name]) >= args.test_num:
-            print(f"Skipping {task_name} (already have {len(results[task_name])} seeds)")
+        existing_entries = existing.get(task_name)
+        if (count_seed_entries(existing_entries) >= args.test_num
+                and task_entries_have_episode_info(existing_entries)):
+            print(f"Skipping {task_name} (already have {len(existing_entries)} cached seeds)")
+            if progress_dir is not None:
+                write_collect_progress(
+                    progress_dir / f"worker_{args.worker_id}_{task_name}.json",
+                    task_name,
+                    args.test_num,
+                    count_seed_entries(existing_entries),
+                    0,
+                    args.test_num * args.max_attempts_ratio,
+                    st_seed,
+                    "cached",
+                    {"unstable": 0, "expert": 0, "known": 0, "replay": 0, "unexpected": 0},
+                )
+            results[task_name] = existing_entries
             continue
+        if task_name in existing:
+            print(f"Re-collecting {task_name}: cached seeds are missing episode_info")
 
-        valid_seeds = collect_valid_seeds_for_task(
+        valid_seed_records = collect_valid_seeds_for_task(
             task_name=task_name,
             task_config=args.task_config,
             test_num=args.test_num,
             st_seed=st_seed,
             max_attempts_ratio=args.max_attempts_ratio,
+            validation_replays=args.validation_replays,
+            progress_path=(progress_dir / f"worker_{args.worker_id}_{task_name}.json"
+                           if progress_dir is not None else None),
         )
-        results[task_name] = valid_seeds
+        results[task_name] = valid_seed_records
 
         # Save incrementally (in case of crash)
         shard_path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,7 +412,7 @@ def main():
             json.dump(results, f, indent=2)
 
     print(f"\n\033[32mDone! Saved valid seeds for {len(results)} tasks to {shard_path}\033[0m")
-    total_seeds = sum(len(v) for v in results.values())
+    total_seeds = sum(count_seed_entries(v) for v in results.values())
     print(f"Total valid seeds: {total_seeds}")
 
 
@@ -281,7 +454,7 @@ def merge_shards():
         print(f"  Deleted: {sf}")
 
     print(f"\n\033[32mMerged {len(merged)} tasks into {output_path}\033[0m")
-    total_seeds = sum(len(v) for v in merged.values())
+    total_seeds = sum(count_seed_entries(v) for v in merged.values())
     print(f"Total valid seeds: {total_seeds}")
 
 

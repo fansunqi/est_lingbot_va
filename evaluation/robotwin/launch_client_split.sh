@@ -20,9 +20,11 @@ CLIENT_GPUS=(${CLIENT_GPUS:-6 7 6 7 6 7})
 NUM_CLIENTS=${#CLIENT_GPUS[@]}
 
 policy_name=ACT
-task_config=demo_clean
+task_config=${TASK_CONFIG:-demo_randomized}
 train_config_name=0
 model_name=0
+save_root="${save_root}/${task_config}"
+mkdir -p "${save_root}"
 
 # Use load-balanced task assignment based on step limits.
 # The balance_tasks.py script distributes all tasks across NUM_CLIENTS groups
@@ -42,6 +44,8 @@ read -r -a task_names <<< "${task_groups[$task_list_id]}"
 echo -e "\033[32mtask_list_id=${task_list_id}, tasks in this group: ${#task_names[@]}\033[0m"
 printf 'task_names (%d): %s\n' "${#task_names[@]}" "${task_names[*]}"
 printf 'client_gpus: %s\n' "${CLIENT_GPUS[*]}"
+printf 'task_config: %s\n' "${task_config}"
+printf 'save_root: %s\n' "${save_root}"
 
 log_dir="./logs"
 mkdir -p "$log_dir"

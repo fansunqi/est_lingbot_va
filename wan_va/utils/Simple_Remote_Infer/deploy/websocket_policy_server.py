@@ -57,6 +57,18 @@ class WebsocketPolicyServer:
         session_id = f"session_{next(self._session_counter)}"
         logger.info(f"Connection from {websocket.remote_address} opened (session={session_id})")
         packer = Packer()
+        session_cleaned = False
+
+        def cleanup_session():
+            nonlocal session_cleaned
+            if session_cleaned:
+                return
+            session_cleaned = True
+            try:
+                if hasattr(self._policy, 'on_session_closed'):
+                    self._policy.on_session_closed(session_id)
+            except Exception:
+                logger.exception(f"Failed to cleanup session '{session_id}'")
 
         await websocket.send(packer.pack(self._metadata))
 
@@ -88,20 +100,19 @@ class WebsocketPolicyServer:
             except websockets.ConnectionClosed:
                 logger.info(
                     f"Connection from {websocket.remote_address} closed (session={session_id})")
-                # Notify policy to free this session's resources
-                try:
-                    if hasattr(self._policy, 'on_session_closed'):
-                        self._policy.on_session_closed(session_id)
-                except Exception:
-                    pass
+                cleanup_session()
                 break
             except Exception:
-                await websocket.send(traceback.format_exc())
-                await websocket.close(
-                    code=websockets.frames.CloseCode.INTERNAL_ERROR,
-                    reason=
-                    "Internal server error. Traceback included in previous frame.",
-                )
+                cleanup_session()
+                try:
+                    await websocket.send(traceback.format_exc())
+                    await websocket.close(
+                        code=websockets.frames.CloseCode.INTERNAL_ERROR,
+                        reason=
+                        "Internal server error. Traceback included in previous frame.",
+                    )
+                except Exception:
+                    pass
                 raise
 
 

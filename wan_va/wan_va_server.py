@@ -38,6 +38,12 @@ from utils import (
 )
 
 
+def _show_denoise_progress():
+    return os.environ.get("WAN_VA_SHOW_DENOISE_PROGRESS", "").lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
 class VA_Server:
 
     def __init__(self, job_config):
@@ -520,7 +526,9 @@ class VA_Server:
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
-            for i, t in enumerate(tqdm(timesteps)):
+            for i, t in enumerate(tqdm(
+                    timesteps,
+                    disable=not _show_denoise_progress())):
                 last_step = i == len(timesteps) - 1
                 latent_cond = init_latent[:, :, 0:1].to(
                     self.dtype) if frame_st_id == 0 else None
@@ -555,7 +563,9 @@ class VA_Server:
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
-            for i, t in enumerate(tqdm(action_timesteps)):
+            for i, t in enumerate(tqdm(
+                    action_timesteps,
+                    disable=not _show_denoise_progress())):
                 last_step = i == len(action_timesteps) - 1
                 action_cond = torch.zeros(
                     [
@@ -763,8 +773,12 @@ class VA_Server:
             logger.info(f"Freed session '{session_id}' from CPU store")
         if self._active_session_id == session_id:
             self._active_session_id = None
-            # Clear GPU cache
+            # Clear active-session GPU caches.
             self.transformer.clear_cache(self.cache_name)
+            self.streaming_vae.clear_cache()
+            if self.streaming_vae_half is not None:
+                self.streaming_vae_half.clear_cache()
+            torch.cuda.empty_cache()
 
     # ===================================================================
 
