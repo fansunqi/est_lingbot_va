@@ -1,0 +1,24 @@
+# Shared WAN video-action transformer architecture + flow-matching scheduler.
+# All training tasks point at this; per-task overrides go in configs/tasks/.
+type: wan_va
+
+network:
+  param_dtype: bfloat16          # parsed by src.utils.dtype_from_str
+  patch_size: [1, 2, 2]
+  flex_attn_backend: triton       # 'triton' (universal) or 'flash' (FA4 on Hopper/Blackwell)
+  flex_attn_compile_mode: max-autotune-no-cudagraphs
+                                  # 15-16% step-time win measured on 8×H200, 5.1B model,
+                                  # max_tokens=64000 (10653 → 9014 ms). Same peak memory.
+                                  # 'default' is the only other safe option — 'max-autotune' and
+                                  # 'reduce-overhead' break with FSDP2 + flex_attention's per-step
+                                  # dynamic shapes (cudagraph re-records every iter, see
+                                  # https://github.com/pytorch/pytorch/issues/171672).
+  attn_seq_align: 8192           # set 128 to disable; required > 128 for FA4 + multi-rank
+  compile_model: false           # Net loss once flex_attn is autotuned. With flex_attn_compile_mode=
+                                 # max-autotune-no-cudagraphs, the inner attention is no longer the
+                                 # bottleneck; outer torch.compile(model, dynamic=True) only sees rope/
+                                 # norms/projections (graph-broken at FlexAttnFunc.forward), and its
+                                 # per-step guard checks + inductor cache cost ~1% step time and
+                                 # +3.5 GB reserved memory. Also: pairs poorly with FA4.
+  snr_shift: 5.0                 # latent FlowMatchScheduler shift
+  action_snr_shift: 1.0          # action FlowMatchScheduler shift

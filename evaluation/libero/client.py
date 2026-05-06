@@ -1,5 +1,5 @@
 import numpy as np
-from wan_va.utils.Simple_Remote_Infer.deploy.websocket_client_policy import WebsocketClientPolicy
+from src.utils.Simple_Remote_Infer.deploy.websocket_client_policy import WebsocketClientPolicy
 import argparse
 from libero.libero import benchmark
 import time

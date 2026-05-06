@@ -1,0 +1,8 @@
+# i2va overlay on top of test.yaml. The server merges _base over the
+# top-level keys so this file only contains the i2va-specific deltas.
+_base: !inc inference/test.yaml
+
+mode: i2va
+input_img_path: example/robotwin
+num_chunks_to_infer: 10
+prompt: 'Grab the medium-sized white mug, rotate it, place it on the table, and hook it onto the smooth dark gray rack.'

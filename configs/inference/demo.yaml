@@ -1,0 +1,96 @@
+mode: server
+
+model_name_or_path: /path/to/pretrained/model
+param_dtype: bfloat16
+patch_size: [1, 2, 2]
+enable_offload: false
+
+host: 0.0.0.0
+port: 29536
+
+snr_shift: 5.0
+action_snr_shift: 1.0
+
+attn_window: 30
+frame_chunk_size: 4
+env_type: none
+height: 256
+width: 256
+action_dim: 30
+action_per_frame: 8
+guidance_scale: 5
+action_guidance_scale: 1
+num_inference_steps: 5
+video_exec_step: -1
+action_num_inference_steps: 10
+
+obs_cam_keys:
+  - observation.images.top
+  - observation.images.wrist
+
+used_action_channel_ids: [0, 1, 2, 3, 4, 28]
+
+action_norm_method: quantiles
+norm_stat:
+  q01:
+    - -90.60303497314453
+    - -98.73043060302734
+    - -79.9008560180664
+    - 48.95470428466797
+    - -32.794578552246094
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.8250824809074402
+    - 0
+  q99:
+    - 71.735107421875
+    - 65.89081573486328
+    - 92.87967681884766
+    - 100.0
+    - 22.784151077270508
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 100.0
+    - 0

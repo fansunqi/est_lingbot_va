@@ -1,0 +1,85 @@
+mode: train
+experiment_name: &experiment_name wan_va_test_adamw
+
+system: src.system.flow_match_va.FlowMatchVASystem
+components:
+  model: !inc model/wan_va_default.yaml
+  data: !inc data/test_lerobot.yaml
+
+# Task-level
+model_name_or_path: /mnt/ocean/ShareStroage/models/lingbot-va-base
+resume_from: null
+save_root: ./experiments
+
+# Loss weighting (latent + action are summed)
+loss:
+  latent_loss: 1.0
+  action_loss: 1.0
+
+# Noisy-condition CFG dropout probability for the latent stream
+noisy_cond_prob: 0.5
+
+optimizer:
+  __target__: AdamW
+  learning_rate: 5.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  fused: false
+  warmup_steps: 20
+  lr_schedule: warmup_linear
+  min_lr_ratio: 0.2            # 1e-4 -> 1e-5 over trainer.max_steps
+
+# optimizer:
+#   __target__: Muon
+#   # AdamW path (used for 1-D params: norm scales, biases) keeps the original lr.
+#   learning_rate: 4.0e-5
+#   betas: [0.9, 0.95]
+#   eps: 1.0e-8
+#   weight_decay: 0.1
+#   warmup_steps: 100
+#   lr_schedule: warmup_constant
+#   # Muon path (ndim>=2 weights): 10x AdamW lr per request.
+#   muon_lr: 4.0e-4
+#   muon_momentum: 0.95
+#   muon_rms_scale: true
+#   muon_nesterov: true
+#   muon_ns_steps: 5
+
+trainer:
+  max_steps: 50000
+  precision: bf16-mixed
+  gradient_clip_val: 2.0
+  accumulate_grad_batches: 1
+  accelerator: gpu
+  devices: auto                  # all visible GPUs; override with --devices N
+  num_nodes: 1                   # for multi-node, scripts/run_va_posttrain_multinode.sh sets this
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  fsdp:
+    # Defaults picked from scripts/sweep_fsdp.sh on 8×H200 single node, AC=all,
+    # max_tokens=64000. Winner: reshard=False + block_only=False, 2-4% faster
+    # than the FULL_SHARD baseline at +13% memory (71 GB → still <50% of 144 GB).
+    # AC is fixed at 'all' because every_2/every_4 OOM at this max_tokens
+    # (30 blocks × 1.75 GB FFN bf16 activation → unchecked footprint > 144 GB).
+    ac_granularity: all          # 'none' | 'every_4' | 'every_2' | 'all'
+    reshard_after_forward: false # ≈ SHARD_GRAD_OP — params kept post-forward
+    block_only: false            # legacy 4-way per-block sharding (slightly faster on H200)
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    save_distributed_checkpoint: true
+
+callbacks:
+  gc_interval: 50
+
+wandb:
+  mode: online                   # online | offline | disabled — override with --wandb-mode
+  name: *experiment_name
+  project: lingbot-new
+  entity: Robotics-FiT
+
+checkpoint:
+  every_n_train_steps: 1000
+  save_top_k: -1
+  save_last: true
+  full_ckpt_every_n_steps: 5000  # rank-0 gather → single .pt for sample.py / inference

@@ -19,10 +19,10 @@ UV_PROJECT_ENVIRONMENT=/home/uv_env/lingbot-va uv sync
 
 ## 2. VAE Latent 预处理
 
-每个数据集在训练前都需要单独提取 VAE latent。配置方式详见 [`wan_va/dataset/README.md`](wan_va/dataset/README.md)。
+每个数据集在训练前都需要单独提取 VAE latent。配置方式详见 [`src/data/README.md`](src/data/README.md)。
 
 ```bash
-python -m wan_va.dataset.extract_latents \
+python -m src.data.extract_latents \
     --dataset-root /path/to/your_dataset \
     --model-path   /apdcephfs_gy5/share_303588738/leoyizhang/model/wan-base \
     --num-gpus 6
@@ -51,27 +51,27 @@ export LD_LIBRARY_PATH="$FFMPEG_ENV/lib:${LD_LIBRARY_PATH:-}"
 
 ## 3. 训练
 
-训练配置说明详见 [`wan_va/configs/README.md`](wan_va/configs/README.md)。
+训练入口为 `src/run.py`，配置由 `configs/tasks/*.yaml` 通过 `!inc` 组合 `model/` + `data/` 子配置。每份 task YAML 定义 system 类、超参、Trainer/Strategy/checkpoint 设置。
 
 ```bash
 # 1. 先修改 wandb 配置
-vim script/run_va_posttrain.sh   # 填写 WANDB_API_KEY 等
+vim scripts/run_va_posttrain.sh   # 填写 WANDB_API_KEY 等
 
 # 2. 单机多卡
-NGPU=8 CONFIG_NAME='test_train' bash script/run_va_posttrain.sh
+NGPU=8 TASK=configs/tasks/train_test.yaml bash scripts/run_va_posttrain.sh
 # 可选：SAVE_ROOT=/path/to/save WANDB_NAME=my-run-name
 
 # 3. 多机多卡（登录节点一条命令拉起所有节点）
 #    默认用 $NODE_IP_LIST；指定子集用 IP_LIST 覆盖（避免集群 hook 重写 NODE_IP_LIST）。
 VENV_PATH=/home/uv_env/lingbot-va \
-    CONFIG_NAME='test_train' \
-    bash script/run_va_posttrain_multinode.sh
+    TASK=configs/tasks/train_test.yaml \
+    bash scripts/run_va_posttrain_multinode.sh
 
 # 指定子集
 IP_LIST="ip1:8,ip2:8" \
     VENV_PATH=/home/uv_env/lingbot-va \
-    CONFIG_NAME='test_train' \
-    bash script/run_va_posttrain_multinode.sh
+    TASK=configs/tasks/train_test.yaml \
+    bash scripts/run_va_posttrain_multinode.sh
 
 # 可选变量（详见脚本头注释）：
 #   MASTER_PORT / LOG_DIR / SAVE_ROOT / WANDB_NAME / NIC_OVERRIDE
@@ -79,7 +79,7 @@ IP_LIST="ip1:8,ip2:8" \
 # 多机连通性测试（换新机器时用）
 MODE=nccl GPUS_PER_NODE=1 \
     VENV_PATH=/home/uv_env/lingbot-va \
-    bash script/nccl_sanity_multinode.sh
+    bash scripts/nccl_sanity_multinode.sh
 ```
 
 ---
@@ -311,7 +311,7 @@ bash evaluation/libero/launch_client.sh
 We also provide a script for image to video-action generation:
 
 ```bash
-NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
+NGPU=1 CONFIG=configs/inference/robotwin_i2va.yaml bash scripts/run_launch_va_server_sync.sh
 ```
 
 > **GPU Memory Requirements**: Approximately **18GB VRAM** for single-GPU i2av inference with offload mode enabled (VAE and text_encoder offloaded to CPU).
@@ -452,10 +452,10 @@ The latent file naming convention `episode_{index}_{start_frame}_{end_frame}.pth
 
 ```bash
 # RoboTwin
-NGPU=8 CONFIG_NAME='robotwin_train' bash script/run_va_posttrain.sh
+NGPU=8 TASK=configs/tasks/train_robotwin.yaml bash scripts/run_va_posttrain.sh
 
 # LIBERO
-NGPU=8 CONFIG_NAME='libero_train' bash script/run_va_posttrain.sh
+NGPU=8 TASK=configs/tasks/train_libero.yaml bash scripts/run_va_posttrain.sh
 ```
 
 For better training performance, use a larger global batch size (e.g., 32, 64). If you have limited GPU resources, you can increase `gradient_accumulation_steps` to achieve a larger effective batch size.

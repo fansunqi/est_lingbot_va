@@ -1,0 +1,6 @@
+_base: !inc inference/libero.yaml
+
+mode: i2va
+input_img_path: example/libero
+num_chunks_to_infer: 10
+prompt: 'put both the alphabet soup and the tomato sauce in the basket'

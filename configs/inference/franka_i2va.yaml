@@ -1,0 +1,6 @@
+_base: !inc inference/franka.yaml
+
+mode: i2va
+input_img_path: example/franka
+num_chunks_to_infer: 10
+prompt: 'pick bunk'

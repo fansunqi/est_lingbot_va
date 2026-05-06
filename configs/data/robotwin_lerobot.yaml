@@ -1,0 +1,14 @@
+module: src.data.packed_lerobot.PackedLatentLeRobotDataModule
+
+dataset_path: /mnt/ocean/ShareStroage/datasets/robotwin
+action_dim: 30
+max_tokens: 128000
+max_episodes_per_bin: 128
+cfg_prob: 0.1
+load_worker: 16
+seed: 42
+
+train_dataloader:
+  batch_size: 1
+  persistent_workers: true
+  pin_memory: true

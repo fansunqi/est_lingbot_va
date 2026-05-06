@@ -1,0 +1,17 @@
+module: src.data.packed_lerobot.PackedLatentLeRobotDataModule
+
+dataset_path: /mnt/ocean/ShareStroage/datasets/robotwin
+action_dim: 30                   # consumed by MultiLatentLeRobotDataset
+max_tokens: 128000              # ≤ 125440 on H20; must be a multiple of 128.
+                                # H200 (144 GB) measured peak 99 GB / reserved 131 GB at this size
+                                # with the current FSDP + flex_attn-autotune config — 9 GB headroom
+                                # left for FA4 cold compile when the backend is enabled.
+max_episodes_per_bin: 128        # must equal --probe-n-episodes from find_max_seq_len
+cfg_prob: 0.1                    # text-emb dropout for classifier-free guidance
+load_worker: 16
+seed: 42
+
+train_dataloader:
+  batch_size: 1                  # PackingDataset already groups by token budget
+  persistent_workers: true
+  pin_memory: true

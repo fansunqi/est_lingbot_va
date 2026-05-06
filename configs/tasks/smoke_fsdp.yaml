@@ -1,0 +1,65 @@
+mode: train
+experiment_name: &experiment_name smoke_fsdp
+
+system: src.system.flow_match_va.FlowMatchVASystem
+components:
+  model: !inc model/wan_va_default.yaml
+  data: !inc data/smoke_lerobot.yaml
+
+# Task-level
+model_name_or_path: /mnt/ocean/ShareStroage/models/lingbot-va-base
+resume_from: null
+save_root: ./experiments/smoke
+
+# Loss weighting (latent + action are summed)
+loss:
+  latent_loss: 1.0
+  action_loss: 1.0
+
+noisy_cond_prob: 0.5
+
+optimizer:
+  __target__: AdamW
+  learning_rate: 4.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  fused: false
+  warmup_steps: 2
+  lr_schedule: warmup_constant
+
+trainer:
+  max_steps: 35
+  precision: bf16-mixed
+  gradient_clip_val: 2.0
+  accumulate_grad_batches: 1
+  accelerator: gpu
+  devices: auto
+  num_nodes: 1
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  fsdp:
+    ac_granularity: every_2
+    reshard_after_forward: true
+    block_only: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    save_distributed_checkpoint: true
+
+callbacks:
+  gc_interval: 50
+  fsdp_metrics: true              # turn on FSDPMetricsCallback
+  fsdp_metrics_warmup: 25         # flex-attn max-autotune autotunes per shape; ignore the
+                                  # warmup window where each unique shape gets first-time autotuned
+
+wandb:
+  mode: disabled
+  name: *experiment_name
+  project: lingbot-new
+  entity: Robotics-FiT
+
+checkpoint:
+  every_n_train_steps: 100000     # disable sharded ckpt during smoke
+  save_top_k: 0
+  save_last: false
+  full_ckpt_every_n_steps: 0      # disable full-gather ckpt during smoke
