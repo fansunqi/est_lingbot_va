@@ -1,3 +1,89 @@
+# Internal Quick Start
+
+> **Maintainer note** (mzh) — 以下为内部使用指南，与上游原版 README 无关。
+
+## 1. 环境配置
+
+```bash
+# 单机开发：在仓库根目录
+uv sync                          # 创建 .venv 并安装依赖
+source .venv/bin/activate
+
+# 多机训练：每台节点各自建 venv 到相同路径（/home 是本地盘，import 快）
+cd /apdcephfs_private/<your_dir>/lingbot-va   # 共享盘上的仓库
+UV_PROJECT_ENVIRONMENT=/home/uv_env/lingbot-va uv sync
+```
+
+> venv 建议放 `/home`（本地盘），仓库放共享盘。共享盘上的 venv 每次 `import` 都会慢十几秒。
+> 训练脚本默认使用仓库内 `.venv`；多机训练时通过 `VENV_PATH=/home/uv_env/lingbot-va` 指定每台机器上都存在的同路径环境。
+
+## 2. VAE Latent 预处理
+
+每个数据集在训练前都需要单独提取 VAE latent。配置方式详见 [`src/data/README.md`](src/data/README.md)。
+
+```bash
+python -m src.data.extract_latents \
+    --dataset-root /path/to/your_dataset \
+    --model-path   /apdcephfs_gy5/share_303588738/leoyizhang/model/wan-base \
+    --num-gpus 6
+```
+
+- `--num-gpus 6`：公司机器上建议限制为 6。开得过大时，容易出现数据读取阻塞，CPU 占用率突增到 100%，但整体吞吐反而变差。
+- 脚本支持断点续跑；如果中途中断或遇到异常，直接重新执行即可。
+- 遇到已知的视频坏帧解码错误时，脚本会跳过对应 segment，并记录到元数据；后续训练会自动排除这些 segment。
+
+<details>
+<summary><b>FAQ: 找不到 ffmpeg</b></summary>
+
+```bash
+conda create -n ffmpeg python -y
+conda install -n ffmpeg -c conda-forge ffmpeg -y
+
+# 注意：不要激活 conda 环境，仅借用其 ffmpeg 二进制
+source .venv/bin/activate
+export FFMPEG_ENV="$(conda env list | awk '$1=="ffmpeg" {print $NF}')"
+export PATH="$FFMPEG_ENV/bin:$PATH"
+export LD_LIBRARY_PATH="$FFMPEG_ENV/lib:${LD_LIBRARY_PATH:-}"
+```
+
+设置后直接重新运行提取脚本即可。
+</details>
+
+## 3. 训练
+
+训练入口为 `src/run.py`，配置由 `configs/tasks/*.yaml` 通过 `!inc` 组合 `model/` + `data/` 子配置。每份 task YAML 定义 system 类、超参、Trainer/Strategy/checkpoint 设置。
+
+```bash
+# 1. 先修改 wandb 配置
+vim scripts/run_va_posttrain.sh   # 填写 WANDB_API_KEY 等
+
+# 2. 单机多卡
+NGPU=8 TASK=configs/tasks/train_test.yaml bash scripts/run_va_posttrain.sh
+# 可选：SAVE_ROOT=/path/to/save WANDB_NAME=my-run-name
+
+# 3. 多机多卡（登录节点一条命令拉起所有节点）
+#    默认用 $NODE_IP_LIST；指定子集用 IP_LIST 覆盖（避免集群 hook 重写 NODE_IP_LIST）。
+VENV_PATH=/home/uv_env/lingbot-va \
+    TASK=configs/tasks/train_test.yaml \
+    bash scripts/run_va_posttrain_multinode.sh
+
+# 指定子集
+IP_LIST="ip1:8,ip2:8" \
+    VENV_PATH=/home/uv_env/lingbot-va \
+    TASK=configs/tasks/train_test.yaml \
+    bash scripts/run_va_posttrain_multinode.sh
+
+# 可选变量（详见脚本头注释）：
+#   MASTER_PORT / LOG_DIR / SAVE_ROOT / WANDB_NAME / NIC_OVERRIDE
+
+# 多机连通性测试（换新机器时用）
+MODE=nccl GPUS_PER_NODE=1 \
+    VENV_PATH=/home/uv_env/lingbot-va \
+    bash scripts/nccl_sanity_multinode.sh
+```
+
+---
+
 <h1 align="center">LingBot-VA: Causal World Modeling for Robot Control</h1>
 
 <p align="center">
@@ -120,7 +206,7 @@ This processes the example data from `examples/0/` and saves visualizations to `
 
 **Preparing the Environment**
 
-You can follow the official instructions from the original RoboTwin-2.0 repository:  
+You can follow the official instructions from the original RoboTwin-2.0 repository:
 [https://robotwin-platform.github.io/doc/usage/robotwin-install.html](https://robotwin-platform.github.io/doc/usage/robotwin-install.html)
 
 
@@ -225,7 +311,7 @@ bash evaluation/libero/launch_client.sh
 We also provide a script for image to video-action generation:
 
 ```bash
-NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
+NGPU=1 CONFIG=configs/inference/robotwin_i2va.yaml bash scripts/run_launch_va_server_sync.sh
 ```
 
 > **GPU Memory Requirements**: Approximately **18GB VRAM** for single-GPU i2av inference with offload mode enabled (VAE and text_encoder offloaded to CPU).
@@ -366,10 +452,10 @@ The latent file naming convention `episode_{index}_{start_frame}_{end_frame}.pth
 
 ```bash
 # RoboTwin
-NGPU=8 CONFIG_NAME='robotwin_train' bash script/run_va_posttrain.sh
+NGPU=8 TASK=configs/tasks/train_robotwin.yaml bash scripts/run_va_posttrain.sh
 
 # LIBERO
-NGPU=8 CONFIG_NAME='libero_train' bash script/run_va_posttrain.sh
+NGPU=8 TASK=configs/tasks/train_libero.yaml bash scripts/run_va_posttrain.sh
 ```
 
 For better training performance, use a larger global batch size (e.g., 32, 64). If you have limited GPU resources, you can increase `gradient_accumulation_steps` to achieve a larger effective batch size.
@@ -497,7 +583,7 @@ manipulation (Fold Clothes, Fold Pants). Our method achieves state-of-the-art pe
 <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;">
   <!-- 指标说明 -->
   <p style="font-size: 12px; color: #666; margin-bottom: 5px;">* All metrics are reported in percentage (%). Higher values are <b>bolded</b>.</p>
-  
+
   <table style="border-collapse: collapse; width: auto; font-size: 13px; line-height: 1.2;">
     <thead>
       <tr style="border-top: 2px solid black;">
@@ -576,4 +662,4 @@ This work builds upon several excellent open-source projects:
 For questions, discussions, or collaborations:
 
 - **Issues**: Open an [issue](https://github.com/robbyant/lingbot-va/issues) on GitHub
-- **Email**: Contact Dr. [Qihang Zhang](https://zqh0253.github.io/) (liuhuan.zqh@antgroup.com) or Dr. [Lin Li](https://lilin-hitcrt.github.io/) (fengchang.ll@antgroup.com) 
+- **Email**: Contact Dr. [Qihang Zhang](https://zqh0253.github.io/) (liuhuan.zqh@antgroup.com) or Dr. [Lin Li](https://lilin-hitcrt.github.io/) (fengchang.ll@antgroup.com)

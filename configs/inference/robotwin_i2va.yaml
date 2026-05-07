@@ -1,0 +1,6 @@
+_base: !inc inference/robotwin.yaml
+
+mode: i2va
+input_img_path: example/robotwin
+num_chunks_to_infer: 10
+prompt: 'Grab the medium-sized white mug, rotate it, place it on the table, and hook it onto the smooth dark gray rack.'

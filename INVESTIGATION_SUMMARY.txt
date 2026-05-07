@@ -167,10 +167,10 @@ Single GPU Launch: evaluation/robotwin/launch_server.sh
   python -m torch.distributed.run \
     --nproc_per_node 1 \
     --master_port 29061 \
-    wan_va/wan_va_server.py \
-    --config-name robotwin \
+    -m src.inference.server \
+    --config configs/inference/robotwin.yaml \
     --port 29056 \
-    --save_root visualization/
+    --save-root visualization/
 
 Multi-GPU Launch: evaluation/robotwin/launch_server_multigpus.sh
   
@@ -179,10 +179,10 @@ Multi-GPU Launch: evaluation/robotwin/launch_server_multigpus.sh
     python -m torch.distributed.run \
       --nproc_per_node 1 \
       --master_port $((29661 + i)) \
-      wan_va/wan_va_server.py \
-      --config-name robotwin \
+      -m src.inference.server \
+      --config configs/inference/robotwin.yaml \
       --port $((29556 + i)) \
-      --save_root visualization/ \
+      --save-root visualization/ \
       > logs/server_${i}_${timestamp}.log 2>&1 &
     sleep 2
   
@@ -345,13 +345,13 @@ Sizing:
 ================================================================================
 
 Core Server:
-  ✓ wan_va/utils/Simple_Remote_Infer/deploy/websocket_policy_server.py
-  ✓ wan_va/utils/sever_utils.py (DistributedModelWrapper, worker_loop)
-  ✓ wan_va/wan_va_server.py (VA_Server model wrapper)
-  ✓ wan_va/modules/model.py (KV cache implementation)
+  ✓ src/utils/Simple_Remote_Infer/deploy/websocket_policy_server.py
+  ✓ src/utils/server_utils.py (DistributedModelWrapper, worker_loop)
+  ✓ src/inference/server.py (VA_Server model wrapper)
+  ✓ src/model/modules.py (KV cache implementation)
 
 Client:
-  ✓ wan_va/utils/Simple_Remote_Infer/deploy/websocket_client_policy.py
+  ✓ src/utils/Simple_Remote_Infer/deploy/websocket_client_policy.py
   ✓ evaluation/robotwin/websocket_client_policy.py (client-side)
   ✓ evaluation/libero/client.py (libero environment client)
 
@@ -363,7 +363,7 @@ Launch Scripts:
   ✓ evaluation/robotwin/launch_session_eval.sh (full pipeline)
 
 Config:
-  ✓ wan_va/configs/shared_config.py (default settings)
+  ✓ configs/inference/robotwin.yaml (server inference settings)
 
 Utilities:
   ✓ evaluation/robotwin/balance_tasks.py (load balancing)

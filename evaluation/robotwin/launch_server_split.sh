@@ -31,9 +31,9 @@ for i in $(seq 0 $((NUM_SERVERS - 1))); do
     nohup python -u -m torch.distributed.run \
         --nproc_per_node 1 \
         --master_port $CURRENT_MASTER_PORT \
-        wan_va/wan_va_server.py \
-        --config-name robotwin \
-        --save_root "$save_root" \
+        -m src.inference.server \
+        --config configs/inference/robotwin.yaml \
+        --save-root "$save_root" \
         --port $CURRENT_PORT > "$LOG_FILE" 2>&1 &
     sleep 2
 done

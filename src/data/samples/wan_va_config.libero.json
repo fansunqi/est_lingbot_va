@@ -1,0 +1,15 @@
+{
+  "preprocess": {
+    "obs_cam_keys": ["observation.images.cam_high", "observation.images.cam_low"],
+    "frame_stride": 1,
+    "camera_preset": "one_primary_one_wrist_128"
+  },
+  "training": {
+    "latent_layout": "horizontal_concat",
+    "action_transform": "identity",
+    "action_dim": 30,
+    "action_keys": ["action"],
+    "used_action_channel_ids": [[0, 1, 2, 3, 4, 5, 28]],
+    "action_norm_method": "quantiles"
+  }
+}

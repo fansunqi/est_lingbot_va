@@ -1,0 +1,17 @@
+module: src.data.packed_lerobot.PackedLatentLeRobotDataModule
+
+dataset_path: /mnt/ocean/ShareStroage/datasets/robotwin
+action_dim: 30
+# Match production max_tokens=64000. Lower-AC variants OOM at this size
+# (FFN bf16 activations alone are 30 × 1.75 GB = 52 GB unchecked), so the
+# sweep keeps ac=all fixed and varies only reshard_after_forward + block_only.
+max_tokens: 64000
+max_episodes_per_bin: 128
+cfg_prob: 0.1
+load_worker: 8
+seed: 42
+
+train_dataloader:
+  batch_size: 1
+  persistent_workers: true
+  pin_memory: true

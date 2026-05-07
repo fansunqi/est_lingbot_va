@@ -1,0 +1,6 @@
+_base: !inc inference/demo.yaml
+
+mode: i2va
+input_img_path: example/demo
+num_chunks_to_infer: 10
+prompt: 'Pick the green cube and place it inside the blue box'

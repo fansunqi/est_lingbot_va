@@ -27,10 +27,10 @@ cd /workspace/lingbot-va && \
 /workspace/lingbot-va/.venv-docker/bin/python -m torch.distributed.run \
     --nproc_per_node 1 \
     --master_port 29061 \
-    wan_va/wan_va_server.py \
-    --config-name robotwin \
+    -m src.inference.server \
+    --config configs/inference/robotwin.yaml \
     --port 29056 \
-    --save_root visualization/
+    --save-root visualization/
 "
 
 echo "  Server starting in tmux session 'lb_server'..."

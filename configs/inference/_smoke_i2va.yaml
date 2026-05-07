@@ -1,0 +1,11 @@
+# Smoke i2va run pointing at the step-4000 diffusers export. Temporary —
+# delete after test.
+_base: !inc inference/test.yaml
+
+mode: i2va
+input_img_path: example/robotwin
+num_chunks_to_infer: 1
+prompt: 'Grab the medium-sized white mug, rotate it, place it on the table, and hook it onto the smooth dark gray rack.'
+
+model_name_or_path: /home/mzh/Code/lingbot-va/experiments/wan_va_test_adamw/exported_step4000
+save_root: /tmp/_smoke_i2va_out

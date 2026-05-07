@@ -69,7 +69,7 @@ docker exec -it lingbot-eval bash
 ```bash
 # 在容器内
 sed -i 's|/home/cxy/ocean/models/lingbot-va-posttrain-robotwin/|/workspace/models/lingbot-va-posttrain-robotwin/|' \
-    /workspace/lingbot-va/wan_va/configs/va_robotwin_cfg.py
+    /workspace/lingbot-va/configs/inference/robotwin.yaml
 ```
 
 ### 6. 运行 Evaluation
@@ -87,8 +87,8 @@ bash /workspace/lingbot-va/docker/launch_eval.sh adjust_bottle
 cd /workspace/lingbot-va
 .venv-docker/bin/python -m torch.distributed.run \
     --nproc_per_node 1 --master_port 29061 \
-    wan_va/wan_va_server.py --config-name robotwin \
-    --port 29056 --save_root visualization/
+    -m src.inference.server --config configs/inference/robotwin.yaml \
+    --port 29056 --save-root visualization/
 ```
 
 终端 2 - Client (RoboTwin):

@@ -1,9 +1,24 @@
 *.pyc
-.venv
-
 .codex
+.venv
 visualization/
 logs/
 pids.txt
 pids_session.txt
 results/
+wandb*/
+experiments/
+experiments
+experiments_smoke_resume/
+experiments_smoke/
+__pycache__/
+
+# checkpoints / large training artifacts (must not be committed)
+*.ckpt
+*.ckpt/
+*.distcp
+*.safetensors
+*.bin
+*.pt
+*.pth
+outputs/
