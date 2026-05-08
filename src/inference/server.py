@@ -9,6 +9,7 @@ from diffusers.utils import export_to_video
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange
@@ -43,6 +44,18 @@ def _show_denoise_progress():
     return os.environ.get("WAN_VA_SHOW_DENOISE_PROGRESS", "").lower() in (
         "1", "true", "yes", "on"
     )
+
+
+def _dist_world_size():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def _dist_rank():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +119,12 @@ class VA_Server:
         self.save_root = job_config.save_root
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
+        self.rank = int(getattr(job_config, 'rank', _dist_rank()))
+        self.world_size = int(getattr(job_config, 'world_size', _dist_world_size()))
+        self.fsdp_enabled = dist.is_initialized() and self.world_size > 1
+        fsdp_cfg = getattr(job_config, 'fsdp', {}) or {}
+        self.fsdp_rank0_aux_only = bool(fsdp_cfg.get('rank0_aux_only', self.fsdp_enabled))
+        self._has_aux_models = (not self.fsdp_rank0_aux_only) or self.rank == 0
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
         # When vae_offload=False, the VAE stays on GPU so we skip the
         # transformer<->vae swap in every _encode_obs call. This saves a few
@@ -129,33 +148,59 @@ class VA_Server:
         self.scheduler.set_timesteps(1000, training=True)
         self.action_scheduler.set_timesteps(1000, training=True)
 
-        self.vae = load_vae(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'vae'),
-            torch_dtype=self.dtype,
-            torch_device='cpu' if self.vae_offload else self.device,
-        )
-        self.streaming_vae = WanVAEStreamingWrapper(self.vae)
+        if self.fsdp_enabled and self.enable_offload:
+            logger.warning(
+                "FSDP server is running with enable_offload=True. The transformer "
+                "will stay sharded on GPU; only auxiliary VAE/text_encoder moves."
+            )
 
-        self.tokenizer = load_tokenizer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'tokenizer'), )
+        if self._has_aux_models:
+            self.vae = load_vae(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'vae'),
+                torch_dtype=self.dtype,
+                torch_device='cpu' if self.vae_offload else self.device,
+            )
+            self.streaming_vae = WanVAEStreamingWrapper(self.vae)
+        else:
+            self.vae = None
+            self.streaming_vae = None
 
-        self.text_encoder = load_text_encoder(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'text_encoder'),
-            torch_dtype=self.dtype,
-            torch_device='cpu' if self.enable_offload else self.device,
-        )
+        if self._has_aux_models:
+            self.tokenizer = load_tokenizer(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'tokenizer'), )
+        else:
+            self.tokenizer = None
 
+        if self._has_aux_models:
+            self.text_encoder = load_text_encoder(
+                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                             'text_encoder'),
+                torch_dtype=self.dtype,
+                torch_device='cpu' if self.enable_offload else self.device,
+            )
+        else:
+            self.text_encoder = None
+
+        transformer_load_device = self.device
+        if self.fsdp_enabled and bool(fsdp_cfg.get('load_transformer_on_cpu', True)):
+            transformer_load_device = 'cpu'
         self.transformer = load_transformer(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'transformer'),
             torch_dtype=self.dtype,
-            torch_device=self.device,
+            torch_device=transformer_load_device,
             attn_mode="torch"
         )
-        shard_fn = shard_model
+        reduce_dtype = dtype_from_str(fsdp_cfg.get('reduce_dtype', 'float32'))
+        shard_fn = partial(
+            shard_model,
+            param_dtype=self.dtype,
+            reduce_dtype=reduce_dtype,
+            reshard_after_forward=bool(fsdp_cfg.get('reshard_after_forward', True)),
+            block_only=bool(fsdp_cfg.get('block_only', False)),
+        )
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
                                             param_dtype=self.dtype,
@@ -165,13 +210,55 @@ class VA_Server:
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
-        if self.env_type == 'robotwin_tshape':
+        if self.env_type == 'robotwin_tshape' and self._has_aux_models:
             # Share the same AutoencoderKLWan module between the two streaming
             # wrappers. Each wrapper still owns its own feat_cache (see
             # WanVAEStreamingWrapper.__init__), so encoding high-res and
             # left+right-res branches remains independent. This avoids
             # loading a duplicate 2.7 GB copy of the VAE weights.
             self.streaming_vae_half = WanVAEStreamingWrapper(self.vae)
+
+        if self.fsdp_enabled:
+            logger.info(
+                "FSDP server initialized: rank=%s world_size=%s "
+                "rank0_aux_only=%s transformer_load_device=%s",
+                self.rank,
+                self.world_size,
+                self.fsdp_rank0_aux_only,
+                transformer_load_device,
+            )
+
+    def _dist_active(self):
+        return dist.is_available() and dist.is_initialized() and self.world_size > 1
+
+    def _is_rank0(self):
+        return self.rank == 0
+
+    def _broadcast_optional_tensor_from_rank0(self, tensor):
+        if not self._dist_active():
+            return tensor
+
+        has_tensor = torch.tensor(
+            [1 if tensor is not None else 0],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        dist.broadcast(has_tensor, src=0)
+        if has_tensor.item() == 0:
+            return None
+
+        meta = [None]
+        if self._is_rank0():
+            tensor = tensor.to(self.device)
+            meta[0] = (tuple(tensor.shape), str(tensor.dtype).replace('torch.', ''))
+        dist.broadcast_object_list(meta, src=0)
+        shape, dtype_name = meta[0]
+        if not self._is_rank0():
+            tensor = torch.empty(shape,
+                                 dtype=getattr(torch, dtype_name),
+                                 device=self.device)
+        dist.broadcast(tensor, src=0)
+        return tensor
 
     def _get_t5_prompt_embeds(
         self,
@@ -183,6 +270,9 @@ class VA_Server:
     ):
         device = device or self.device
         dtype = dtype or self.dtype
+
+        if self.fsdp_rank0_aux_only and not self._is_rank0():
+            return self._broadcast_optional_tensor_from_rank0(None)
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
         prompt = [prompt_clean(u) for u in prompt]
@@ -200,9 +290,10 @@ class VA_Server:
         text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
-        if self.enable_offload:
+        if self.enable_offload and not self.fsdp_enabled:
             self.transformer.to('cpu')
             torch.cuda.empty_cache()
+        if self.enable_offload:
             self.text_encoder.to(self.device)
         text_encoder_device = next(self.text_encoder.parameters()).device
         prompt_embeds = self.text_encoder(text_input_ids.to(text_encoder_device),
@@ -210,6 +301,7 @@ class VA_Server:
         if self.enable_offload:
             self.text_encoder.to('cpu')
             torch.cuda.empty_cache()
+        if self.enable_offload and not self.fsdp_enabled:
             self.transformer.to(self.device)
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
@@ -226,7 +318,8 @@ class VA_Server:
         prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt,
                                            seq_len, -1)
 
-        return prompt_embeds.to(device)
+        prompt_embeds = prompt_embeds.to(device)
+        return self._broadcast_optional_tensor_from_rank0(prompt_embeds)
 
     def encode_prompt(
         self,
@@ -349,7 +442,8 @@ class VA_Server:
                               action_cond=None,
                               frame_st_id=0,
                               patch_size=(1, 2, 2)):
-        logger.info(f"FRAME START ID: {frame_st_id}")
+        if self._is_rank0():
+            logger.info(f"FRAME START ID: {frame_st_id}")
         input_dict = dict()
         if latent_model_input is not None:
             input_dict['latent_res_lst'] = {
@@ -401,11 +495,14 @@ class VA_Server:
         return input_dict
 
     def _encode_obs(self, obs):
+        if self.fsdp_rank0_aux_only and not self._is_rank0():
+            return self._broadcast_optional_tensor_from_rank0(None)
+
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
         if len(images) < 1:
-            return None
+            return self._broadcast_optional_tensor_from_rank0(None)
         videos = []
         for k_i, k in enumerate(self.job_config.obs_cam_keys):
             if self.env_type == 'robotwin_tshape':
@@ -426,7 +523,7 @@ class VA_Server:
             videos.append(history_video_k)
 
         if self.vae_offload:
-            if self.enable_offload:
+            if self.enable_offload and not self.fsdp_enabled:
                 self.transformer.to('cpu')
                 torch.cuda.empty_cache()
             self.vae.to(self.device)
@@ -458,7 +555,7 @@ class VA_Server:
             if self.streaming_vae_half is not None and self.streaming_vae_half.vae is not self.vae:
                 self.streaming_vae_half.vae.to('cpu')
             torch.cuda.empty_cache()
-            if self.enable_offload:
+            if self.enable_offload and not self.fsdp_enabled:
                 self.transformer.to(self.device)
 
         mu, logvar = torch.chunk(enc_out, 2, dim=1)
@@ -466,7 +563,8 @@ class VA_Server:
         latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
         mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
-        return video_latent.to(self.device)
+        video_latent = video_latent.to(self.device)
+        return self._broadcast_optional_tensor_from_rank0(video_latent)
 
     def _reset(self, prompt=None):
         logger.info('Reset.')
@@ -476,7 +574,8 @@ class VA_Server:
         self.init_latent = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
-        self.streaming_vae.clear_cache()
+        if self.streaming_vae is not None:
+            self.streaming_vae.clear_cache()
 
         self.action_per_frame = self.job_config.action_per_frame
         self.height, self.width = self.job_config.height, self.job_config.width
@@ -484,7 +583,8 @@ class VA_Server:
         if self.env_type == 'robotwin_tshape':
             self.latent_height, self.latent_width = (
                 (self.height // 16) * 3) // 2, self.width // 16
-            self.streaming_vae_half.clear_cache()
+            if self.streaming_vae_half is not None:
+                self.streaming_vae_half.clear_cache()
         else:
             self.latent_height, self.latent_width = self.height // 16, self.width // 16 * len(
                 self.job_config.obs_cam_keys)
@@ -535,6 +635,7 @@ class VA_Server:
         torch.cuda.empty_cache()
 
     def _infer(self, obs, frame_st_id=0):
+        infer_start_time = time.monotonic()
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
@@ -575,6 +676,13 @@ class VA_Server:
              1),  # pad 1 element at the end (right side) of the last dimension
             mode='constant',
             value=0)
+        if self._is_rank0():
+            logger.info(
+                "Infer loop start: frame_st_id=%s video_steps=%s action_steps=%s",
+                frame_st_id,
+                len(timesteps),
+                len(action_timesteps),
+            )
 
         with (
                 torch.no_grad(),
@@ -660,17 +768,25 @@ class VA_Server:
 
         actions[:, ~self.action_mask] *= 0
 
-        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
-        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+        if self._is_rank0():
+            save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+            save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
+        if self._is_rank0():
+            logger.info(
+                "Infer loop done: frame_st_id=%s elapsed_ms=%.1f",
+                frame_st_id,
+                (time.monotonic() - infer_start_time) * 1000,
+            )
         return actions, latents
 
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        if self._is_rank0():
+            save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
@@ -740,7 +856,10 @@ class VA_Server:
                     saved.append(item)
             return saved
 
-        vae_feat_cache = _save_feat_cache(self.streaming_vae.feat_cache)
+        vae_feat_cache = (
+            _save_feat_cache(self.streaming_vae.feat_cache)
+            if self.streaming_vae is not None else None
+        )
         vae_half_feat_cache = None
         if self.streaming_vae_half is not None:
             vae_half_feat_cache = _save_feat_cache(self.streaming_vae_half.feat_cache)
@@ -791,7 +910,8 @@ class VA_Server:
                     restored.append(item)
             return restored
 
-        self.streaming_vae.feat_cache = _restore_feat_cache(state['vae_feat_cache'])
+        if self.streaming_vae is not None and state['vae_feat_cache'] is not None:
+            self.streaming_vae.feat_cache = _restore_feat_cache(state['vae_feat_cache'])
         if self.streaming_vae_half is not None and state['vae_half_feat_cache'] is not None:
             self.streaming_vae_half.feat_cache = _restore_feat_cache(state['vae_half_feat_cache'])
 
@@ -829,7 +949,8 @@ class VA_Server:
             self._active_session_id = None
             # Clear active-session GPU caches.
             self.transformer.clear_cache(self.cache_name)
-            self.streaming_vae.clear_cache()
+            if self.streaming_vae is not None:
+                self.streaming_vae.clear_cache()
             if self.streaming_vae_half is not None:
                 self.streaming_vae_half.clear_cache()
             torch.cuda.empty_cache()
@@ -909,6 +1030,9 @@ class VA_Server:
         del self.streaming_vae_half
         del self.text_encoder
         torch.cuda.empty_cache()
+
+        if not self._is_rank0():
+            return
         
         # Move VAE to GPU for decoding
         if self.enable_offload:

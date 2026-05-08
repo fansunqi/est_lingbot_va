@@ -1,0 +1,16 @@
+_base: !inc inference/robotwin.yaml
+
+# Single logical eval server sharded over multiple GPUs with FSDP2.
+# Launch with evaluation/robotwin/launch_server_fsdp.sh.
+
+# Keep auxiliary modules on GPU on rank 0 for speed. Non-zero ranks do not load
+# VAE/text_encoder when fsdp.rank0_aux_only is true.
+enable_offload: false
+vae_offload: false
+
+fsdp:
+  load_transformer_on_cpu: true
+  rank0_aux_only: true
+  block_only: true
+  reshard_after_forward: true
+  reduce_dtype: float32

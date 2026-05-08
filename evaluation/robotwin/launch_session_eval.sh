@@ -57,15 +57,23 @@ RESTART_PER_TASK=${RESTART_PER_TASK:-1}
 
 cleanup_eval_clients() {
     local exit_code=${1:-130}
+    local pids_file=${pid_file:-pids_session.txt}
+    local pid
     trap - INT TERM
     echo ""
-    echo -e "\033[33mInterrupted. Terminating eval clients from pids_session.txt...\033[0m"
-    if [ -f "pids_session.txt" ]; then
+    echo -e "\033[33mInterrupted. Terminating eval client process groups from ${pids_file}...\033[0m"
+    if [ -f "${pids_file}" ]; then
         while read -r pid; do
-            if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-                kill "${pid}" 2>/dev/null || true
+            if [ -n "${pid}" ]; then
+                kill -- "-${pid}" 2>/dev/null || kill "${pid}" 2>/dev/null || true
             fi
-        done < "pids_session.txt"
+        done < "${pids_file}"
+        sleep 2
+        while read -r pid; do
+            if [ -n "${pid}" ] && kill -0 -- "-${pid}" 2>/dev/null; then
+                kill -9 -- "-${pid}" 2>/dev/null || true
+            fi
+        done < "${pids_file}"
     fi
     exit "${exit_code}"
 }
@@ -475,7 +483,7 @@ for i in $(seq 0 $(( num_clients - 1 ))); do
     CUDA_VISIBLE_DEVICES=${gpu_id} \
     PYTHONUNBUFFERED=1 \
     PYTHONWARNINGS=ignore::UserWarning \
-    nohup python -u -m evaluation.robotwin.eval_session_client \
+    setsid nohup python -u -m evaluation.robotwin.eval_session_client \
         --config policy/${policy_name}/deploy_policy.yml \
         --assignment "${assignment_file}" \
         --port ${port} \
@@ -495,7 +503,7 @@ done
 
 echo ""
 echo -e "\033[32mAll ${num_clients} clients launched. PIDs in ${pid_file}.\033[0m"
-echo -e "\033[36mTo terminate all: kill \$(cat ${pid_file})\033[0m"
+echo -e "\033[36mTo terminate all process groups: while read -r pid; do kill -- -\${pid}; done < ${pid_file}\033[0m"
 echo -e "\033[36mTo monitor: tail -f logs/session_client_*_${batch_time}.log\033[0m"
 echo ""
 echo -e "\033[36mAfter all clients finish, merge metrics with:\033[0m"

@@ -11,37 +11,52 @@ class DistributedModelWrapper:
     TODO
     """
 
-    def __init__(self, model, local_rank):
+    def __init__(self, model, source_rank=0):
         self.model = model
-        self.local_rank = local_rank
+        self.source_rank = source_rank
 
     def infer(self, obs):
-        return distributed_infer(self.model, obs, self.local_rank)
+        return distributed_infer(self.model, obs, self.source_rank)
 
     def on_session_closed(self, session_id):
         """Forward session cleanup to the underlying model."""
-        if hasattr(self.model, 'on_session_closed'):
-            self.model.on_session_closed(session_id)
+        distributed_session_closed(self.model, session_id, self.source_rank)
 
 
-def distributed_infer(model, obs, local_rank):
+def distributed_infer(model, obs, source_rank):
     """
     TODO
     """
     rank = dist.get_rank()
-    assert rank == local_rank, "distributed_infer can only run at（rank 0)"
+    assert rank == source_rank, "distributed_infer can only run on the source rank"
 
     cmd = torch.tensor(1,
                        dtype=torch.int64,
                        device='cuda' if torch.cuda.is_available() else 'cpu')
-    dist.broadcast(cmd, src=0)
+    dist.broadcast(cmd, src=source_rank)
 
     obj_list = [obs]
-    dist.broadcast_object_list(obj_list, src=0)
+    dist.broadcast_object_list(obj_list, src=source_rank)
 
     result = model.infer(obs)
 
     return result
+
+
+def distributed_session_closed(model, session_id, source_rank):
+    rank = dist.get_rank()
+    assert rank == source_rank, "distributed_session_closed can only run on the source rank"
+
+    cmd = torch.tensor(2,
+                       dtype=torch.int64,
+                       device='cuda' if torch.cuda.is_available() else 'cpu')
+    dist.broadcast(cmd, src=source_rank)
+
+    obj_list = [session_id]
+    dist.broadcast_object_list(obj_list, src=source_rank)
+
+    if hasattr(model, 'on_session_closed'):
+        model.on_session_closed(session_id)
 
 
 def worker_loop(model, local_rank):
@@ -63,6 +78,12 @@ def worker_loop(model, local_rank):
             dist.broadcast_object_list(obj_list, src=0)
             obs = obj_list[0]
             _ = model.infer(obs)
+        elif cmd_val == 2:
+            obj_list = [None]
+            dist.broadcast_object_list(obj_list, src=0)
+            session_id = obj_list[0]
+            if hasattr(model, 'on_session_closed'):
+                model.on_session_closed(session_id)
         else:
             pass
 
@@ -71,8 +92,9 @@ def worker_loop(model, local_rank):
 
 def run_async_server_mode(model, local_rank, host, port):
     logger.info("Running in ASYNC SERVER mode")
-    if local_rank == 0:
-        dist_model = DistributedModelWrapper(model, local_rank=local_rank)
+    rank = dist.get_rank()
+    if rank == 0:
+        dist_model = DistributedModelWrapper(model, source_rank=0)
         model_server = WebsocketPolicyServer(dist_model, host=host, port=port)
         model_server.serve_forever()
 
