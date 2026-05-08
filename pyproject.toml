@@ -3,7 +3,7 @@ name = "LingBot_VA"
 version = "0.0.0"
 description = "LingBot-VA: A Pragmatic VA Foundation Model"
 readme = "README.md"
-requires-python = ">=3.12, <4.0"
+requires-python = ">=3.12, <3.14"
 dependencies = [
     "torch==2.10.0",
     "torchvision==0.25.0",
@@ -14,9 +14,8 @@ dependencies = [
     "accelerate",
     "einops",
     "easydict",
-    "flash-attn",
     "lightning>=2.4",
-    "pyyaml-include>=2.0",
+    "pyyaml-include>=1.4,<2",
     "pyyaml",
     "numpy",
     "tqdm",
@@ -40,7 +39,6 @@ build-backend = "hatchling.build"
 packages = ["src"]
 
 [tool.uv]
-no-build-isolation-package = ["flash-attn"]
 override-dependencies = [
     "torchcodec==0.10.*", # latest for PyTorch 2.10
 ]

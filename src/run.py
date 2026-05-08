@@ -27,7 +27,7 @@ import importlib
 from pathlib import Path
 
 import yaml
-import yaml_include
+import yamlinclude
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
@@ -49,7 +49,11 @@ def load_config(config_path: str | Path) -> dict:
     """Load a YAML config, resolving ``!inc`` relative to ``configs/``."""
     config_path = Path(config_path)
     config_root = config_path.parent.parent  # configs/tasks/foo.yaml -> configs/
-    yaml.add_constructor('!inc', yaml_include.Constructor(base_dir=str(config_root)))
+    yaml.add_constructor(
+        '!inc',
+        yamlinclude.YamlIncludeConstructor(base_dir=str(config_root)),
+        Loader=yaml.FullLoader,
+    )
     with open(config_path, 'r') as f:
         return yaml.full_load(f)
 

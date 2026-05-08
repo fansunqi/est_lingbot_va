@@ -15,7 +15,7 @@ from einops import rearrange
 from tqdm import tqdm
 
 import yaml
-import yaml_include
+import yamlinclude
 from easydict import EasyDict
 
 from src.distributed.fsdp import shard_model
@@ -60,7 +60,11 @@ def load_inference_config(config_path):
 
     config_path = Path(config_path)
     config_root = config_path.parent.parent  # configs/inference/foo.yaml -> configs/
-    yaml.add_constructor('!inc', yaml_include.Constructor(base_dir=str(config_root)))
+    yaml.add_constructor(
+        '!inc',
+        yamlinclude.YamlIncludeConstructor(base_dir=str(config_root)),
+        Loader=yaml.FullLoader,
+    )
     with open(config_path, 'r') as f:
         raw = yaml.full_load(f)
 
