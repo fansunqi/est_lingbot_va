@@ -19,7 +19,7 @@ import yaml
 import yamlinclude
 from easydict import EasyDict
 
-from src.distributed.fsdp import shard_model
+from src.distributed.fsdp import apply_ac, shard_model
 from src.distributed.util import _configure_model, init_distributed
 from src.model.loaders import (
     WanVAEStreamingWrapper,
@@ -193,6 +193,9 @@ class VA_Server:
             torch_device=transformer_load_device,
             attn_mode="torch"
         )
+        if self.fsdp_enabled:
+            ac_granularity = fsdp_cfg.get('ac_granularity', 'none')
+            self.transformer = apply_ac(self.transformer, granularity=ac_granularity)
         reduce_dtype = dtype_from_str(fsdp_cfg.get('reduce_dtype', 'float32'))
         shard_fn = partial(
             shard_model,
@@ -293,12 +296,20 @@ class VA_Server:
         if self.enable_offload and not self.fsdp_enabled:
             self.transformer.to('cpu')
             torch.cuda.empty_cache()
-        if self.enable_offload:
+        text_encoder_on_cpu = (
+            self.enable_offload
+            and self.fsdp_enabled
+            and bool(getattr(self.job_config, "text_encoder_cpu_offload", True))
+        )
+        keep_text_encoder_loaded = bool(getattr(self, "_keep_text_encoder_loaded", False))
+        if self.enable_offload and not text_encoder_on_cpu:
             self.text_encoder.to(self.device)
+        elif text_encoder_on_cpu:
+            self.text_encoder.to("cpu")
         text_encoder_device = next(self.text_encoder.parameters()).device
         prompt_embeds = self.text_encoder(text_input_ids.to(text_encoder_device),
                                           mask.to(text_encoder_device)).last_hidden_state
-        if self.enable_offload:
+        if self.enable_offload and not text_encoder_on_cpu and not keep_text_encoder_loaded:
             self.text_encoder.to('cpu')
             torch.cuda.empty_cache()
         if self.enable_offload and not self.fsdp_enabled:
@@ -345,38 +356,58 @@ class VA_Server:
         else:
             batch_size = prompt_embeds.shape[0]
 
-        if prompt_embeds is None:
-            prompt_embeds = self._get_t5_prompt_embeds(
-                prompt=prompt,
-                num_videos_per_prompt=num_videos_per_prompt,
-                max_sequence_length=max_sequence_length,
-                device=device,
-                dtype=dtype,
+        keep_text_encoder_loaded = (
+            self.enable_offload
+            and not (
+                self.fsdp_enabled
+                and bool(getattr(self.job_config, "text_encoder_cpu_offload", True))
             )
+            and prompt_embeds is None
+            and do_classifier_free_guidance
+            and negative_prompt_embeds is None
+            and self.text_encoder is not None
+        )
+        if keep_text_encoder_loaded:
+            self._keep_text_encoder_loaded = True
+        try:
+            if prompt_embeds is None:
+                prompt_embeds = self._get_t5_prompt_embeds(
+                    prompt=prompt,
+                    num_videos_per_prompt=num_videos_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                    device=device,
+                    dtype=dtype,
+                )
 
-        if do_classifier_free_guidance and negative_prompt_embeds is None:
-            negative_prompt = negative_prompt or ""
-            negative_prompt = batch_size * [negative_prompt] if isinstance(
-                negative_prompt, str) else negative_prompt
+            if do_classifier_free_guidance and negative_prompt_embeds is None:
+                negative_prompt = negative_prompt or ""
+                negative_prompt = batch_size * [negative_prompt] if isinstance(
+                    negative_prompt, str) else negative_prompt
 
-            if prompt is not None and type(prompt) is not type(
-                    negative_prompt):
-                raise TypeError(
-                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-                    f" {type(prompt)}.")
-            elif batch_size != len(negative_prompt):
-                raise ValueError(
-                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-                    " the batch size of `prompt`.")
+                if prompt is not None and type(prompt) is not type(
+                        negative_prompt):
+                    raise TypeError(
+                        f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                        f" {type(prompt)}.")
+                elif batch_size != len(negative_prompt):
+                    raise ValueError(
+                        f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                        f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                        " the batch size of `prompt`.")
 
-            negative_prompt_embeds = self._get_t5_prompt_embeds(
-                prompt=negative_prompt,
-                num_videos_per_prompt=num_videos_per_prompt,
-                max_sequence_length=max_sequence_length,
-                device=device,
-                dtype=dtype,
-            )
+                negative_prompt_embeds = self._get_t5_prompt_embeds(
+                    prompt=negative_prompt,
+                    num_videos_per_prompt=num_videos_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                    device=device,
+                    dtype=dtype,
+                )
+        finally:
+            if keep_text_encoder_loaded:
+                self._keep_text_encoder_loaded = False
+                if self.text_encoder is not None:
+                    self.text_encoder.to('cpu')
+                torch.cuda.empty_cache()
         return prompt_embeds, negative_prompt_embeds
 
     def normalize_latents(
@@ -572,10 +603,12 @@ class VA_Server:
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        self._transformer_cache_ready = False
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         if self.streaming_vae is not None:
             self.streaming_vae.clear_cache()
+        torch.cuda.empty_cache()
 
         self.action_per_frame = self.job_config.action_per_frame
         self.height, self.width = self.job_config.height, self.job_config.width
@@ -589,30 +622,6 @@ class VA_Server:
             self.latent_height, self.latent_width = self.height // 16, self.width // 16 * len(
                 self.job_config.obs_cam_keys)
 
-        patch_size = self.job_config.patch_size
-        latent_token_per_chunk = (self.job_config.frame_chunk_size *
-                                  self.latent_height * self.latent_width) // (
-                                      patch_size[0] * patch_size[1] *
-                                      patch_size[2])
-        action_token_per_chunk = self.job_config.frame_chunk_size * self.action_per_frame
-        self.transformer.create_empty_cache(self.cache_name,
-                                            self.job_config.attn_window,
-                                            latent_token_per_chunk,
-                                            action_token_per_chunk,
-                                            dtype=self.dtype,
-                                            device=self.device,
-                                            batch_size = 2 if self.use_cfg else 1
-                                            )
-
-        self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
-        self.action_mask[self.job_config.used_action_channel_ids] = True
-
-        self.actions_q01 = torch.tensor(self.job_config.norm_stat['q01'],
-                                        dtype=torch.float32).reshape(-1, 1, 1)
-        self.actions_q99 = torch.tensor(self.job_config.norm_stat['q99'],
-                                        dtype=torch.float32).reshape(-1, 1, 1)
-        self.action_norm_method = self.job_config.action_norm_method
-
         ##### get prompt
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
@@ -624,15 +633,45 @@ class VA_Server:
                 num_videos_per_prompt=1,
                 prompt_embeds=None,
                 negative_prompt_embeds=None,
-                max_sequence_length=512,
+                max_sequence_length=int(getattr(self.job_config, "prompt_max_sequence_length", 512)),
                 device=self.device,
                 dtype=self.dtype,
             )
+
+        patch_size = self.job_config.patch_size
+        latent_token_per_chunk = (self.job_config.frame_chunk_size *
+                                  self.latent_height * self.latent_width) // (
+                                      patch_size[0] * patch_size[1] *
+                                      patch_size[2])
+        action_token_per_chunk = self.job_config.frame_chunk_size * self.action_per_frame
+        self._cache_latent_token_per_chunk = latent_token_per_chunk
+        self._cache_action_token_per_chunk = action_token_per_chunk
+
+        self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
+        self.action_mask[self.job_config.used_action_channel_ids] = True
+
+        self.actions_q01 = torch.tensor(self.job_config.norm_stat['q01'],
+                                        dtype=torch.float32).reshape(-1, 1, 1)
+        self.actions_q99 = torch.tensor(self.job_config.norm_stat['q99'],
+                                        dtype=torch.float32).reshape(-1, 1, 1)
+        self.action_norm_method = self.job_config.action_norm_method
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
+
+    def _ensure_transformer_cache(self):
+        if getattr(self, "_transformer_cache_ready", False):
+            return
+        self.transformer.create_empty_cache(self.cache_name,
+                                            self.job_config.attn_window,
+                                            self._cache_latent_token_per_chunk,
+                                            self._cache_action_token_per_chunk,
+                                            dtype=self.dtype,
+                                            device=self.device,
+                                            batch_size=2 if self.use_cfg else 1)
+        self._transformer_cache_ready = True
 
     def _infer(self, obs, frame_st_id=0):
         infer_start_time = time.monotonic()
@@ -640,6 +679,7 @@ class VA_Server:
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
+        self._ensure_transformer_cache()
 
         latents = torch.randn(1,
                               48,
@@ -784,7 +824,6 @@ class VA_Server:
 
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
-        self.transformer.clear_pred_cache(self.cache_name)
         if self._is_rank0():
             save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
@@ -798,6 +837,8 @@ class VA_Server:
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
         )
+        self._ensure_transformer_cache()
+        self.transformer.clear_pred_cache(self.cache_name)
         input_dict = self._prepare_latent_input(latent_model_input,
                                                 action_model_input,
                                                 frame_st_id=self.frame_st_id)
@@ -921,6 +962,7 @@ class VA_Server:
         self.prompt_embeds = state['prompt_embeds'].to(self.device) if state['prompt_embeds'] is not None else None
         self.negative_prompt_embeds = state['negative_prompt_embeds'].to(self.device) if state['negative_prompt_embeds'] is not None else None
         self.use_cfg = state['use_cfg']
+        self._transformer_cache_ready = True
         if state['exp_name'] is not None:
             self.exp_name = state['exp_name']
         if state['exp_save_root'] is not None:
@@ -949,6 +991,7 @@ class VA_Server:
             self._active_session_id = None
             # Clear active-session GPU caches.
             self.transformer.clear_cache(self.cache_name)
+            self._transformer_cache_ready = False
             if self.streaming_vae is not None:
                 self.streaming_vae.clear_cache()
             if self.streaming_vae_half is not None:

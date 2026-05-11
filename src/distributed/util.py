@@ -31,7 +31,10 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
 
 
 def init_distributed(world_size, local_rank, rank):
-    torch.cuda.set_device(local_rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    if int(world_size) <= 1:
+        return
     # 60-min timeout gives cute-dsl cold compiles room to finish before the
     # NCCL watchdog fires monitoredBarrier (default 30 min was already tight
     # for FA4's first-shape compile on a 24-head 128-dim attention).

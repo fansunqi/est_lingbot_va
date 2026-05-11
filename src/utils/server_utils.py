@@ -92,6 +92,11 @@ def worker_loop(model, local_rank):
 
 def run_async_server_mode(model, local_rank, host, port):
     logger.info("Running in ASYNC SERVER mode")
+    if not (dist.is_available() and dist.is_initialized()):
+        model_server = WebsocketPolicyServer(model, host=host, port=port)
+        model_server.serve_forever()
+        return
+
     rank = dist.get_rank()
     if rank == 0:
         dist_model = DistributedModelWrapper(model, source_rank=0)
