@@ -1,30 +1,21 @@
-base_inference_config: configs/inference/robotwin_fsdp.yaml
+base_inference_config: configs/inference/robotwin.yaml
 
 port: 29546
-save_root: experiments/turn_switch_grpo_check_fsdp
-guidance_scale: 1
+save_root: experiments/robotwin_grpo_pilot
+guidance_scale: 5
 action_guidance_scale: 1
-enable_offload: false
-vae_offload: false
-text_encoder_cpu_offload: false
 prompt_max_sequence_length: 226
-
-fsdp:
-  load_transformer_on_cpu: false
-  rank0_aux_only: true
-  block_only: true
-  reshard_after_forward: true
-  reduce_dtype: float32
-  ac_granularity: all
 
 rl:
   reward:
     type: sparse_success
 
-  use_fsdp: true
+  use_fsdp: false
   group_size: 2
   rollout_groups_per_update: 1
-  update_epochs: 1
+  # update_epochs=2 lets us observe ratio != 1 and approx_kl > 0 on the second
+  # pass, which is the minimum signal that the policy is actually moving.
+  update_epochs: 2
   batch_size: 2
 
   action_noise_std: 0.02
@@ -32,9 +23,24 @@ rl:
   target_kl: null
   entropy_coef: 0.0
   bc_coef: 0.0
-  checkpoint_interval: 1
+  checkpoint_interval: 5
   export_inference_checkpoint: false
   max_grad_norm: 1.0
+
+  noise_schedule: per_chunk
+
+  lora:
+    enabled: true
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - action_embedder
+      - action_proj_out
 
   validate_logprob_consistency: true
   logprob_consistency_atol: 5.0e-3
@@ -48,5 +54,4 @@ rl:
     normalize_denoising_horizon: true
     normalize_action_dim: true
 
-  # Smoke test mode: keep the consistency check, then run one GRPO update.
   disable_updates: false

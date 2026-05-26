@@ -1,34 +1,42 @@
 base_inference_config: configs/inference/robotwin.yaml
 
 port: 29546
-save_root: experiments/turn_switch_grpo_check
+save_root: experiments/robotwin_grpo_turn_switch_validation
 guidance_scale: 5
 action_guidance_scale: 1
 prompt_max_sequence_length: 226
+
+wandb:
+  mode: online
+  project: lingbot-grpo
+  entity: Robotics-FiT
+  name: robotwin-grpo-turn-switch-validation
+  job_type: grpo-validation
+  tags:
+    - grpo
+    - robotwin
+    - turn_switch
+    - validation
 
 rl:
   reward:
     type: sparse_success
 
-  # Correctness check uses one split server process, not FSDP.
   use_fsdp: false
-  group_size: 2
+  group_size: 16
   rollout_groups_per_update: 1
-  update_epochs: 1
-  batch_size: 2
+  update_epochs: 2
+  batch_size: 16
 
   action_noise_std: 0.02
   clip_range: 0.2
-  target_kl: null
+  target_kl: 0.05
   entropy_coef: 0.0
   bc_coef: 0.0
-  checkpoint_interval: 1
-  export_inference_checkpoint: false
+  checkpoint_interval: 5
+  export_inference_checkpoint: true
   max_grad_norm: 1.0
 
-  # per_chunk: only the final scheduler step injects Gaussian noise; T-1 prior
-  # steps are deterministic (actions = scheduler mean). Keeps log-prob recompute
-  # to a single grad-bearing transformer forward per chunk instead of T.
   noise_schedule: per_chunk
 
   lora:
@@ -53,8 +61,7 @@ rl:
     betas: [0.9, 0.95]
 
   logprob:
-    normalize_denoising_horizon: true
+    normalize_denoising_horizon: false
     normalize_action_dim: true
 
-  # Smoke test mode: keep the consistency check, then run one GRPO update.
   disable_updates: false

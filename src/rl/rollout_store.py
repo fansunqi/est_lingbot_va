@@ -23,6 +23,20 @@ def _cpu_detach(value):
 
 @dataclass
 class RolloutChunk:
+    """One action chunk captured during rollout for later GRPO replay.
+
+    Field shapes depend on ``rl.noise_schedule`` used at sampling time:
+
+    - ``per_step``: ``action_chain`` has length T+1 (initial random actions and
+      every denoised state); ``action_timesteps`` has length T.
+    - ``per_chunk``: ``action_chain`` has length 2 (the input to the final
+      scheduler step and the noisy output); ``action_timesteps`` has length 1
+      (the single noise-bearing timestep).
+
+    The consumer (``_recompute_chunk_logprob``) branches on
+    ``action_timesteps.numel() == 1`` to detect ``per_chunk``.
+    """
+
     obs: dict[str, Any]
     frame_st_id: int
     latent_noise: torch.Tensor
@@ -129,6 +143,29 @@ class RolloutStore:
 
     def remove_session(self, session_id: str) -> None:
         self._active_by_session.pop(session_id, None)
+
+    def drop_episodes(self, episodes: list[EpisodeRecord]) -> None:
+        """Free episodes consumed by a completed GRPO update.
+
+        Each chunk carries CPU latents, KV cache state, and keyframes; without
+        trimming, _episodes grows without bound and the server eventually OOMs.
+        We also rebuild _completed_by_group entries to drop the matching ids.
+        """
+        dead_ids: set[str] = set()
+        groups_touched: set[str] = set()
+        for ep in episodes:
+            dead_ids.add(ep.episode_id)
+            groups_touched.add(ep.group_id)
+        for eid in dead_ids:
+            self._episodes.pop(eid, None)
+        for gid in groups_touched:
+            remaining = [
+                eid for eid in self._completed_by_group.get(gid, []) if eid not in dead_ids
+            ]
+            if remaining:
+                self._completed_by_group[gid] = remaining
+            else:
+                self._completed_by_group.pop(gid, None)
 
     def state_dict(self) -> dict[str, Any]:
         return {

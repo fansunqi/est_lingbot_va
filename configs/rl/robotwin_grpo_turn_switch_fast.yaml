@@ -1,0 +1,130 @@
+base_inference_config: configs/inference/robotwin.yaml
+
+# Fast GRPO sanity-check config for turn_switch — standard GRPO setting.
+#
+# One update step batches `rollout_groups_per_update` groups together:
+#   - advantage is normalized within each group (GRPO's defining property)
+#   - all episodes are concatenated into one training pool
+#   - each of `update_epochs` epochs shuffles the pool and steps the
+#     optimizer once per minibatch of `batch_size` episodes
+#
+# Episode pool per update = group_size × rollout_groups_per_update
+#                         = 4 × 4 = 16 episodes
+# Optimizer steps per update = update_epochs × ceil(16 / batch_size)
+#                            = 1 × 4 = 4
+#
+# Previous run (lr=2e-5, epochs=2, rgpu=2) saw approx_kl repeatedly hit
+# 0.15–0.33 in a single epoch and force early-stop in 14/22 updates while
+# success_rate oscillated between 0.12 and 0.88 without a clear trend.
+# Current values halve the per-step move (lr 2e-5 → 1e-5), double the
+# trained episode count per update for less noisy advantages, and drop to
+# a single epoch since epoch 2 was the one overshooting trust-region.
+# Only ratio/approx_kl from minibatches after the very first one of epoch
+# 1 are interpretable (the first minibatch necessarily has ratio=1
+# because new_logprobs is recomputed at its top).
+#
+# 2026-05-20 follow-up: at lr=1e-5 approx_kl still triggered early-stop in
+# 17/30 updates with mean ratio sitting at 0.83 (never >1). Halving lr
+# again (1e-5 → 5e-6) to bring approx_kl closer to the 0.1 target and let
+# more minibatches run before the trust-region brake kicks in.
+#
+# 2026-05-23 walkback: 22 号关 normalization + 紧 clip/target_kl 是误诊。
+# un-normalized 下 trajectory logprob ≈ 数万元素的高斯和,即使 lr=1e-8 一次
+# AdamW step (~1e-5 量级 Δθ) 在 outlier 轨迹(长 + 失败 + 尾部)上也会累出
+# -100~-2000 nats log_ratio,approx_kl=0.27 对 lr 不敏感。回到 normalized
+# 信任域(clip_range=0.2, target_kl=0.1 是 per-element 量级),原 baseline
+# approx_kl 0.0001–0.04 + early-stop 14/22 其实是健康区间,success_rate
+# 振荡的真正原因是 8 episodes/update 的 Bernoulli 噪声(σ≈0.18)。
+# 本轮:rgpu 2→4 把 episodes/update 升到 32 减半 advantage 噪声;lr 从
+# baseline 的 2e-5 砍到 5e-6 防过冲;若 approx_kl 仍稳定 < target,再抬 lr。
+
+port: 29546
+save_root: experiments/robotwin_grpo_turn_switch_fast
+guidance_scale: 5
+action_guidance_scale: 1
+prompt_max_sequence_length: 226
+# Override base inference config (50) to keep per_step recompute memory bounded.
+# At N=5 each chunk holds ~5x the activation graph of per_chunk during update.
+action_num_inference_steps: 5
+
+wandb:
+  mode: offline
+  project: lingbot-grpo
+  entity: Robotics-FiT
+  name: robotwin-grpo-turn-switch-fast
+  job_type: grpo-validation
+  tags:
+    - grpo
+    - robotwin
+    - turn_switch
+    - fast
+
+rl:
+  reward:
+    type: sparse_success
+
+  use_fsdp: false
+  group_size: 12
+  # 2026-05-23: 2 → 4,episodes/update 从 16 升到 32,
+  # 减半 advantage 的 Bernoulli 噪声(σ 从 0.18 → 0.12)。
+  rollout_groups_per_update: 2
+  update_epochs: 1
+  batch_size: 4
+
+  action_noise_std: 0.05
+  # 2026-05-23: 回到 PPO 默认 per-element 信任域(配合下方 normalize_* 全开)。
+  clip_range: 0.2
+  target_kl: 0.1
+  entropy_coef: 0.0
+  bc_coef: 0.0
+  checkpoint_interval: 4
+  # 每 N 次 GRPO update step 让 rollout clients 用 deterministic inference
+  # (LoRA on,但 sample_action 不注入 per-step 噪声) 把 assignment 跑一遍;
+  # 结果不进 training pool,只打到 wandb eval/* 用来 track 真实 success rate。
+  # 0 = 关闭。和 checkpoint_interval 对齐,每次出 ckpt 同步做一次 eval。
+  eval_enabled: true
+  eval_every: 4
+  # Periodic and eval-only GRPO eval use this deterministic action denoising horizon.
+  # Keep it explicit so checkpoint re-eval cannot silently fall back to the base 50-step config.
+  eval_action_num_inference_steps: 5
+  export_inference_checkpoint: false
+  save_rollout_store: false
+  save_full_transformer: false
+  max_grad_norm: 1.0
+
+  # per_step: inject Gaussian noise at every action denoising step, so the
+  # GRPO ratio is the product of N transition densities (mathematically the
+  # full trajectory likelihood). Each per-chunk recompute now runs the
+  # transformer N times with gradient — keep action_num_inference_steps small.
+  noise_schedule: per_step
+
+  lora:
+    enabled: true
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - action_embedder
+      - action_proj_out
+
+  validate_logprob_consistency: true
+  logprob_consistency_atol: 5.0e-3
+
+  optimizer:
+    # 2026-05-23: baseline 是 2e-5,这一轮 4×↓ 到 5e-6,配合 normalized 信任域。
+    # 若 approx_kl 仍稳定 < 0.05 且 clipfrac 长时间 < 5%,再往上抬到 1e-5/2e-5。
+    lr: 8.0e-5
+    weight_decay: 0.0
+    betas: [0.9, 0.95]
+
+  logprob:
+    # 2026-05-23: 回到 per-element 归一化,匹配 clip_range=0.2 / target_kl=0.1。
+    normalize_denoising_horizon: true
+    normalize_action_dim: true
+    normalize_episode_length: true
+
+  disable_updates: false

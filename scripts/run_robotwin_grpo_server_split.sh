@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Launch independent GRPO servers on consecutive GPUs, mirroring
 # evaluation/robotwin/launch_server_split.sh. Each process uses the normal
-# offload config path, not FSDP. Pair each server port with rollout clients.
+# no-offload config path, not FSDP. Pair each server port with rollout clients.
 
 CONFIG=${CONFIG:-configs/rl/robotwin_grpo_turn_switch_check.yaml}
 START_PORT=${START_PORT:-29546}
@@ -21,7 +21,7 @@ fi
 mkdir -p "${LOG_DIR}" "${SAVE_ROOT}"
 batch_time=$(date +%Y%m%d_%H%M%S)
 
-echo "Launching ${NUM_SERVERS} offloaded GRPO server(s) on GPU ${SERVER_GPU_START}..$((SERVER_GPU_START + NUM_SERVERS - 1))"
+echo "Launching ${NUM_SERVERS} GRPO server(s) without offload on GPU ${SERVER_GPU_START}..$((SERVER_GPU_START + NUM_SERVERS - 1))"
 
 for i in $(seq 0 $((NUM_SERVERS - 1))); do
   GPU=$((SERVER_GPU_START + i))
@@ -42,5 +42,5 @@ for i in $(seq 0 $((NUM_SERVERS - 1))); do
   sleep 2
 done
 
-echo "All ${NUM_SERVERS} offloaded GRPO server(s) launched."
+echo "All ${NUM_SERVERS} GRPO server(s) without offload launched."
 wait

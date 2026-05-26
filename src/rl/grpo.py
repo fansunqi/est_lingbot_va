@@ -59,14 +59,28 @@ def gaussian_logprob(
         std: Scalar or tensor standard deviation.
         mask: Optional boolean mask broadcastable to action dimensions.
         normalize_action_dim: Divide by the active element count per batch.
+
+    Returns:
+        Per-batch logprob in fp32. The compute happens in fp32 regardless of
+        the input dtype because the GRPO ratio amplifies tiny mean deltas by
+        1/var (= 2500 at std=0.02); bf16 reduction noise alone is enough to
+        produce multi-nat log_ratio outliers downstream. fp32 inside this op
+        does not eliminate the rollout-vs-recompute forward delta, but it does
+        eliminate the bf16-reduction-order share of it.
     """
 
+    compute_dtype = torch.float32
+    value_f = value.to(compute_dtype)
+    mean_f = mean.to(compute_dtype)
     if not torch.is_tensor(std):
-        std = torch.tensor(float(std), device=mean.device, dtype=mean.dtype)
-    std = std.to(device=mean.device, dtype=mean.dtype).clamp_min(1e-8)
-    var = std * std
-    log_scale = torch.log(std)
-    logp = -0.5 * ((value - mean) ** 2 / var + 2.0 * log_scale + torch.log(torch.tensor(2.0 * torch.pi, device=mean.device, dtype=mean.dtype)))
+        std_f = torch.tensor(float(std), device=mean.device, dtype=compute_dtype)
+    else:
+        std_f = std.to(device=mean.device, dtype=compute_dtype)
+    std_f = std_f.clamp_min(1e-8)
+    var = std_f * std_f
+    log_scale = torch.log(std_f)
+    log_2pi = torch.log(torch.tensor(2.0 * torch.pi, device=mean.device, dtype=compute_dtype))
+    logp = -0.5 * ((value_f - mean_f) ** 2 / var + 2.0 * log_scale + log_2pi)
 
     if mask is not None:
         mask = _expand_mask(mask, logp)
@@ -100,9 +114,31 @@ def compute_group_advantages(rewards: Sequence[float], eps: float = 1e-6) -> tor
 class GRPOStats:
     loss: torch.Tensor
     ratio_mean: torch.Tensor
+    ratio_min: torch.Tensor
+    ratio_max: torch.Tensor
+    ratio_std: torch.Tensor
+    log_ratio: torch.Tensor  # per-element (new - old) logprob diff, detached fp32
     clipfrac: torch.Tensor
     approx_kl: torch.Tensor
     entropy: torch.Tensor
+
+
+APPROX_KL_LOGRATIO_CLAMP = 1.0
+"""Clamp range for log_ratio when computing approx_kl.
+
+The loss path uses PPO's ``min(unclipped, clipped)`` so a single ratio≪1
+outlier contributes at most ``(1-clip_range)*advantage`` to the gradient.
+approx_kl has no such protection: ``((ratio-1) - log_ratio).mean()`` is
+dominated by whichever element has the largest ``|log_ratio|``, so one
+chunk drifting by -7 nats due to forward-pass numerical noise (1/var=2500
+amplification at std=0.02) can push the mean past ``target_kl=0.1`` and
+trigger early-stop on an otherwise-healthy epoch.
+
+Clamping to ±1.0 caps any single element's contribution to approx_kl at
+``(e-1) - 1 ≈ 0.72``, which is well above ``target_kl`` so it still flags
+genuinely diverged updates, but cannot be reached by a single outlier
+when the rest of the batch is near zero. Raw log_ratio stays unclamped
+in ``GRPOStats.log_ratio`` for diagnostics."""
 
 
 def grpo_clipped_loss(
@@ -129,11 +165,21 @@ def grpo_clipped_loss(
         entropy_term = entropy.to(new_logprob).mean()
         policy_loss = policy_loss - float(entropy_coef) * entropy_term
 
-    approx_kl = ((ratio - 1.0) - log_ratio).mean()
+    log_ratio_kl = log_ratio.detach().float().clamp(
+        -APPROX_KL_LOGRATIO_CLAMP, APPROX_KL_LOGRATIO_CLAMP
+    )
+    ratio_kl = log_ratio_kl.exp()
+    approx_kl = ((ratio_kl - 1.0) - log_ratio_kl).mean()
     clipfrac = ((ratio - 1.0).abs() > clip_range).to(new_logprob.dtype).mean()
+    ratio_f32 = ratio.float().detach()
+    log_ratio_f32 = log_ratio.float().detach()
     return GRPOStats(
         loss=policy_loss,
-        ratio_mean=ratio.mean().detach(),
+        ratio_mean=ratio_f32.mean(),
+        ratio_min=ratio_f32.min() if ratio_f32.numel() else ratio_f32.new_zeros(()),
+        ratio_max=ratio_f32.max() if ratio_f32.numel() else ratio_f32.new_zeros(()),
+        ratio_std=ratio_f32.std(unbiased=False) if ratio_f32.numel() > 1 else ratio_f32.new_zeros(()),
+        log_ratio=log_ratio_f32.reshape(-1),
         clipfrac=clipfrac.detach(),
         approx_kl=approx_kl.detach(),
         entropy=entropy_term.detach(),

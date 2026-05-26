@@ -57,17 +57,31 @@ class GRPOWebsocketClientPolicy:
         })
 
     def finish_episode(self, *, success: bool, step_count: int, **metadata) -> Dict:
+        step_count_int = int(step_count)
+        if success:
+            reward = 1.0 + 20.0 / max(step_count_int, 20)
+        else:
+            reward = 0.0
         payload = {
             "command": "finish_episode",
             "success": bool(success),
-            "reward": 1.0 if success else 0.0,
-            "step_count": int(step_count),
+            "reward": reward,
+            "step_count": step_count_int,
         }
         payload.update(metadata)
         return self._send(payload)
 
     def get_status(self) -> Dict:
         return self._send({"command": "get_status"})
+
+    def run_pending_updates(self) -> Dict:
+        return self._send({"command": "run_pending_updates"})
+
+    def get_eval_phase(self) -> Dict:
+        return self._send({"command": "get_eval_phase"})
+
+    def end_eval_phase(self) -> Dict:
+        return self._send({"command": "end_eval_phase"})
 
     def save_checkpoint(self) -> Dict:
         return self._send({"command": "save_checkpoint"})

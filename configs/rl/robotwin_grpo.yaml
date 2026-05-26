@@ -9,7 +9,7 @@ rl:
   reward:
     type: sparse_success
 
-  # Rollout/debug path uses split/offload servers by default, not FSDP.
+  # Rollout/debug path uses split servers by default, not FSDP.
   use_fsdp: false
   group_size: 2
   rollout_groups_per_update: 1

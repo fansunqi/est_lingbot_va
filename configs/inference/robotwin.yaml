@@ -1,11 +1,11 @@
 mode: server
 
 # Model
-model_name_or_path: /mnt/Shared_06_disk1/cxy/WAM/lingbot-va-posttrain-robotwin/
+model_name_or_path: /root/autodl-tmp/WAM/lingbot-va-posttrain-robotwin/
 param_dtype: bfloat16
 patch_size: [1, 2, 2]
-enable_offload: true
-vae_offload: true
+enable_offload: false
+vae_offload: false
 
 # Server
 host: 0.0.0.0

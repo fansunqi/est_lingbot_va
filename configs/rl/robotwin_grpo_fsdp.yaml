@@ -4,13 +4,13 @@ port: 29546
 save_root: experiments/robotwin_grpo_fsdp
 guidance_scale: 1
 action_guidance_scale: 1
-enable_offload: true
-vae_offload: true
+enable_offload: false
+vae_offload: false
 text_encoder_cpu_offload: false
 prompt_max_sequence_length: 226
 
 fsdp:
-  load_transformer_on_cpu: true
+  load_transformer_on_cpu: false
   rank0_aux_only: true
   block_only: true
   reshard_after_forward: true

@@ -12,6 +12,8 @@ if os.environ.get("CONDA_DEFAULT_ENV") != "RoboTwin" and not os.environ.get("ALL
         "if your RoboTwin environment has another name."
     )
 
+_ORIGINAL_CWD = Path.cwd()
+
 from evaluation.robotwin.collect_seeds import collect_valid_seeds_for_task
 
 
@@ -44,6 +46,8 @@ def main():
     ]
 
     out = Path(args.output)
+    if not out.is_absolute():
+        out = _ORIGINAL_CWD / out
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:
         json.dump(assignment, f, indent=2)

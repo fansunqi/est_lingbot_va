@@ -9,7 +9,7 @@ enable_offload: false
 vae_offload: false
 
 fsdp:
-  load_transformer_on_cpu: true
+  load_transformer_on_cpu: false
   rank0_aux_only: true
   block_only: true
   reshard_after_forward: true

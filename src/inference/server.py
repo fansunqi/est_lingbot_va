@@ -117,6 +117,11 @@ class VA_Server:
         self.cache_name = 'pos'
         self.job_config = job_config
         self.save_root = job_config.save_root
+        # Optional per-step dumps of latents/actions/obs into <save_root>/real/.
+        # Off by default — during GRPO training this would generate three .pt
+        # files per inference call and quickly fill the disk. Nothing in the
+        # codebase reads them back; set to True only for manual debugging.
+        self.save_debug_dumps = bool(getattr(job_config, 'save_debug_dumps', False))
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.rank = int(getattr(job_config, 'rank', _dist_rank()))
@@ -474,7 +479,7 @@ class VA_Server:
                               frame_st_id=0,
                               patch_size=(1, 2, 2)):
         if self._is_rank0():
-            logger.info(f"FRAME START ID: {frame_st_id}")
+            logger.debug("FRAME START ID: %s", frame_st_id)
         input_dict = dict()
         if latent_model_input is not None:
             input_dict['latent_res_lst'] = {
@@ -598,7 +603,7 @@ class VA_Server:
         return self._broadcast_optional_tensor_from_rank0(video_latent)
 
     def _reset(self, prompt=None):
-        logger.info('Reset.')
+        logger.debug("Reset inference session state.")
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
@@ -658,7 +663,8 @@ class VA_Server:
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
-        os.makedirs(self.exp_save_root, exist_ok=True)
+        if self.save_debug_dumps:
+            os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
 
     def _ensure_transformer_cache(self):
@@ -808,7 +814,7 @@ class VA_Server:
 
         actions[:, ~self.action_mask] *= 0
 
-        if self._is_rank0():
+        if self._is_rank0() and self.save_debug_dumps:
             save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
             save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
@@ -824,7 +830,7 @@ class VA_Server:
 
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
-        if self._is_rank0():
+        if self._is_rank0() and self.save_debug_dumps:
             save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
@@ -834,8 +840,10 @@ class VA_Server:
 
         action_model_input = self.preprocess_action(obs['state'])
         action_model_input = action_model_input.to(latent_model_input)
-        logger.info(
-            f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
+        logger.debug(
+            "get KV cache obs: %s %s",
+            latent_model_input.shape,
+            action_model_input.shape,
         )
         self._ensure_transformer_cache()
         self.transformer.clear_pred_cache(self.cache_name)
@@ -918,7 +926,7 @@ class VA_Server:
             'exp_name': getattr(self, 'exp_name', None),
             'exp_save_root': getattr(self, 'exp_save_root', None),
         }
-        logger.info(f"Swapped out session '{session_id}' to CPU")
+        logger.debug("Swapped out session '%s' to CPU", session_id)
 
     def _swap_in(self, session_id):
         """Restore a session's KV cache + VAE feat_cache from CPU to GPU."""
@@ -927,6 +935,8 @@ class VA_Server:
             return False
 
         stream = self._get_swap_stream()
+        restored_cache_count = 0
+        missing_cache_count = 0
         with torch.cuda.stream(stream):
             for block, cpu_cache in zip(self.transformer.blocks, state['kv_cache']):
                 if cpu_cache is not None:
@@ -937,8 +947,10 @@ class VA_Server:
                         else:
                             gpu_cache[key] = val
                     block.attn1.attn_caches[self.cache_name] = gpu_cache
+                    restored_cache_count += 1
                 else:
                     block.attn1.attn_caches[self.cache_name] = None
+                    missing_cache_count += 1
         stream.synchronize()
 
         # Restore VAE streaming feat_cache
@@ -962,13 +974,24 @@ class VA_Server:
         self.prompt_embeds = state['prompt_embeds'].to(self.device) if state['prompt_embeds'] is not None else None
         self.negative_prompt_embeds = state['negative_prompt_embeds'].to(self.device) if state['negative_prompt_embeds'] is not None else None
         self.use_cfg = state['use_cfg']
-        self._transformer_cache_ready = True
+        # A session can be swapped out after reset but before its first inference,
+        # in which case every per-block KV cache is still None. Treat that as
+        # "not ready" so the next _ensure_transformer_cache() allocates caches
+        # instead of letting clear_pred_cache/update_cache index into None.
+        self._transformer_cache_ready = restored_cache_count > 0 and missing_cache_count == 0
         if state['exp_name'] is not None:
             self.exp_name = state['exp_name']
         if state['exp_save_root'] is not None:
             self.exp_save_root = state['exp_save_root']
 
-        logger.info(f"Swapped in session '{session_id}' to GPU (frame_st_id={self.frame_st_id})")
+        logger.debug(
+            "Swapped in session '%s' to GPU (frame_st_id=%s, cache_ready=%s, restored_blocks=%s, missing_blocks=%s)",
+            session_id,
+            self.frame_st_id,
+            self._transformer_cache_ready,
+            restored_cache_count,
+            missing_cache_count,
+        )
         return True
 
     def _switch_to_session(self, session_id):
