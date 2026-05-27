@@ -355,10 +355,11 @@ class GRPOTrainingServer(VA_Server):
             ("train/*", "train/global_update_step"),
             ("train_epoch/global_update_step", None),
             ("train_epoch/*", "train_epoch/global_update_step"),
-            ("rollout/global_rollout_episode", None),
-            ("rollout/*", "rollout/global_rollout_episode"),
-            ("group/global_rollout_episode", None),
-            ("group/*", "group/global_rollout_episode"),
+            ("global_rollout_episode", None),
+            ("rollout/global_rollout_episode", "global_rollout_episode"),
+            ("rollout/*", "global_rollout_episode"),
+            ("group/global_rollout_episode", "global_rollout_episode"),
+            ("group/*", "global_rollout_episode"),
             ("eval/global_update_step", None),
             ("eval/success_rate", "eval/global_update_step"),
             ("eval/reward_mean", "eval/global_update_step"),
@@ -852,14 +853,16 @@ class GRPOTrainingServer(VA_Server):
                 group_rewards_summary.append(sum(g_rewards) / max(len(g_rewards), 1))
         if skipped_groups:
             logger.info(
-                "GRPO degenerate groups filtered: skipped=%s kept=%s total=%s",
+                "GRPO degenerate groups filtered: rank=%s skipped=%s kept=%s total=%s",
+                self.rank,
                 skipped_groups,
                 len(advantage_chunks),
                 len(groups),
             )
         if not episodes:
             logger.info(
-                "GRPO update skipped: all_groups_degenerate skipped_groups=%s",
+                "GRPO update skipped: rank=%s all_groups_degenerate skipped_groups=%s",
+                self.rank,
                 skipped_groups,
             )
             return
@@ -876,11 +879,12 @@ class GRPOTrainingServer(VA_Server):
         # Behavior stats use ALL rolled-out episodes (pre-filter). Training
         # stats (advantage, n_eps, group_count) use post-filter only.
         logger.info(
-            "GRPO update start: step=%s rollout_groups=%s kept_groups=%s rollout_episodes=%s "
+            "GRPO update start: rank=%s step=%s rollout_groups=%s kept_groups=%s rollout_episodes=%s "
             "trained_episodes=%s minibatch_size=%s degenerate_groups_skipped=%s "
             "reward_mean=%.4f reward_std=%.4f success_rate=%.4f "
             "old_logprob_mean=%.4f old_logprob_std=%.4f advantage_mean=%.4f advantage_std=%.4f "
             "step_count_mean=%.1f chunk_count_mean=%.1f epochs=%s",
+            self.rank,
             update_step,
             len(groups),
             n_kept_groups,
@@ -1001,8 +1005,9 @@ class GRPOTrainingServer(VA_Server):
                     drift_max = float(drift.max().detach().cpu())
                     if drift_max > self.logprob_consistency_atol:
                         logger.warning(
-                            "GRPO two-forward drift exceeds atol: max_abs_diff=%.3e "
+                            "GRPO two-forward drift exceeds atol: rank=%s max_abs_diff=%.3e "
                             "atol=%.3e mb_size=%s",
+                            self.rank,
                             drift_max,
                             self.logprob_consistency_atol,
                             len(mb_episodes),
@@ -1028,11 +1033,12 @@ class GRPOTrainingServer(VA_Server):
                 mb_chunks = [float(len(ep.chunks)) for ep in mb_episodes]
                 mb_steps = [float(ep.step_count) for ep in mb_episodes if ep.step_count is not None]
                 logger.info(
-                    "GRPO update minibatch: step=%s epoch=%s/%s mb=%s loss=%.6f approx_kl=%.6f "
+                    "GRPO update minibatch: rank=%s step=%s epoch=%s/%s mb=%s loss=%.6f approx_kl=%.6f "
                     "ratio=%.6f ratio_min=%.4f ratio_max=%.4f clipfrac=%.4f "
                     "episodes=%s reward_mean=%.4f success_rate=%.4f adv_mean=%.4f adv_min=%.4f adv_max=%.4f "
                     "old_logprob_mean=%.4f new_logprob_mean=%.4f logratio_abs_max=%.4f "
                     "chunks_mean=%.2f step_count_mean=%.1f grad_norm=%.4f lr=%.3e",
+                    self.rank,
                     update_step,
                     epoch_idx + 1,
                     self.update_epochs,
@@ -1267,7 +1273,7 @@ class GRPOTrainingServer(VA_Server):
                     "update_effect_active_count": epoch_effect_active_count,
                 })
             logger.info(
-                "GRPO update epoch: step=%s epoch=%s/%s mbs=%s loss=%.6f approx_kl=%.6f ratio=%.6f "
+                "GRPO update epoch: rank=%s step=%s epoch=%s/%s mbs=%s loss=%.6f approx_kl=%.6f ratio=%.6f "
                 "ratio_min=%.4f ratio_max=%.4f ratio_std=%.4f "
                 "mbs0_ratio=%.4f mbs0_ratio_min=%.4f mbs0_ratio_max=%.4f "
                 "logratio_min=%.4f logratio_max=%.4f logratio_std=%.4f logratio_abs_max=%.4f "
@@ -1276,6 +1282,7 @@ class GRPOTrainingServer(VA_Server):
                 "chunks_min=%.0f chunks_max=%.0f chunks_mean=%.2f "
                 "grad_norm_mean=%.3f grad_norm_max=%.3f grad_norm_min=%.3f "
                 "clipfrac=%.6f old_logprob_mean=%.4f new_logprob_mean=%.4f lr=%.3e",
+                self.rank,
                 update_step,
                 epoch_idx + 1,
                 self.update_epochs,
@@ -1312,8 +1319,9 @@ class GRPOTrainingServer(VA_Server):
             )
             for rank_idx, off in enumerate(worst_offenders):
                 logger.info(
-                    "GRPO update offender rank=%s log_ratio=%.4f advantage=%.4f chunks=%s "
+                    "GRPO update offender: server_rank=%s offender_rank=%s log_ratio=%.4f advantage=%.4f chunks=%s "
                     "step_count=%s success=%s reward=%.3f seed=%s group_member=%s group_id=%s",
+                    self.rank,
                     rank_idx,
                     off["log_ratio"],
                     off["advantage"],
@@ -1327,10 +1335,11 @@ class GRPOTrainingServer(VA_Server):
                 )
             if self.diagnose_update_effect:
                 logger.info(
-                    "GRPO update effect: step=%s epoch=%s/%s active=%s "
+                    "GRPO update effect: rank=%s step=%s epoch=%s/%s active=%s "
                     "delta_mean=%.6e signed_adv_delta_mean=%.6e "
                     "pos_adv_delta_mean=%.6e pos_adv_delta_positive_frac=%.3f "
                     "neg_adv_delta_mean=%.6e neg_adv_delta_negative_frac=%.3f",
+                    self.rank,
                     update_step,
                     epoch_idx + 1,
                     self.update_epochs,
@@ -1395,7 +1404,8 @@ class GRPOTrainingServer(VA_Server):
                 kl_for_stop = self._allreduce_scalar_max(stats["approx_kl"])
                 if kl_for_stop > self.target_kl:
                     logger.warning(
-                        "Stopping GRPO epochs early: approx_kl(max) %.6f > target %.6f",
+                        "Stopping GRPO epochs early: rank=%s approx_kl(max) %.6f > target %.6f",
+                        self.rank,
                         kl_for_stop,
                         self.target_kl,
                     )
@@ -1417,16 +1427,17 @@ class GRPOTrainingServer(VA_Server):
             self._eval_pending = True
             self._eval_results = []
             logger.info(
-                "GRPO eval phase armed: global_update_step=%s eval_every=%s eval_action_steps=%s",
+                "GRPO eval phase armed: rank=%s global_update_step=%s eval_every=%s eval_action_steps=%s",
+                self.rank,
                 self.global_update_step,
                 self.eval_every,
                 self.eval_action_num_inference_steps,
             )
-        logger.info("GRPO update complete: %s", stats)
+        logger.info("GRPO update complete: rank=%s %s", self.rank, stats)
 
     def _run_pending_updates(self) -> dict[str, Any]:
         if self.disable_updates:
-            logger.info("GRPO update skipped: updates_disabled pending_ready_groups=%s", len(self._pending_ready_groups))
+            logger.info("GRPO update skipped: rank=%s updates_disabled pending_ready_groups=%s", self.rank, len(self._pending_ready_groups))
             return {
                 "updated": False,
                 "reason": "updates_disabled",
@@ -1437,7 +1448,8 @@ class GRPOTrainingServer(VA_Server):
             }
         if len(self._pending_ready_groups) < self.rollout_groups_per_update:
             logger.info(
-                "GRPO update skipped: not_enough_ready_groups pending=%s required=%s",
+                "GRPO update skipped: rank=%s not_enough_ready_groups pending=%s required=%s",
+                self.rank,
                 len(self._pending_ready_groups),
                 self.rollout_groups_per_update,
             )
@@ -1455,7 +1467,8 @@ class GRPOTrainingServer(VA_Server):
         self._pending_ready_groups = []
         start_step = self.global_update_step
         logger.info(
-            "GRPO pending update trigger: ready_groups=%s required=%s group_ids=%s",
+            "GRPO pending update trigger: rank=%s ready_groups=%s required=%s group_ids=%s",
+            self.rank,
             len(ready_groups),
             self.rollout_groups_per_update,
             [group[0].group_id if group else "<empty>" for group in ready_groups],
@@ -1475,7 +1488,8 @@ class GRPOTrainingServer(VA_Server):
             self._pending_ready_groups = ready_groups + self._pending_ready_groups
             raise
         logger.info(
-            "GRPO pending update complete: updated_groups=%s global_update_step=%s last_stats=%s",
+            "GRPO pending update complete: rank=%s updated_groups=%s global_update_step=%s last_stats=%s",
+            self.rank,
             len(ready_groups),
             self.global_update_step,
             self.last_stats,
@@ -2073,6 +2087,7 @@ class GRPOTrainingServer(VA_Server):
                     "rollout/active_sessions": len(self.rollout_store._active_by_session),
                     "rollout/global_update_step": self.global_update_step,
                     "rollout/global_rollout_episode": self.global_rollout_episode,
+                    "global_rollout_episode": self.global_rollout_episode,
                 },
             )
             if ready_group is not None:
@@ -2091,6 +2106,7 @@ class GRPOTrainingServer(VA_Server):
                         "group/pending_ready_groups": pending_ready_groups_after,
                         "group/global_rollout_episode": self.global_rollout_episode,
                         "group/global_update_step": self.global_update_step,
+                        "global_rollout_episode": self.global_rollout_episode,
                     },
                 )
                 if not self.disable_updates:
@@ -2222,7 +2238,7 @@ class GRPOTrainingServer(VA_Server):
                 "success_rate": success_rate,
                 "reward_mean": reward_mean,
                 "global_update_step": self.global_update_step,
-                "rank_counts": rank_counts,
+                "rank_counts": {str(rank): count for rank, count in rank_counts.items()},
                 "results": results_snapshot,
             }
 
