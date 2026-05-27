@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 import yamlinclude
@@ -147,12 +148,31 @@ class GRPOTrainingServer(VA_Server):
                 for p in branch.text_embedder.parameters():
                     p.requires_grad_(False)
 
-        self.rollout_store = RolloutStore(group_size=int(self.rl_cfg.get("group_size", 2)))
+        # Sharded-group GRPO: under replicated multi-GPU, a single logical
+        # group of size ``group_size`` is split across ranks (each rank stores
+        # ``local_group_size = group_size // world_size`` members) and
+        # advantages are normalized over the FULL group via cross-rank reward
+        # gather. This keeps effective batch identical to single-GPU runs and
+        # halves rollout wall-clock with world_size=2. Single-GPU and FSDP runs
+        # keep the legacy behavior (one rank owns the entire group).
+        self.group_size = int(self.rl_cfg.get("group_size", 2))
+        self.sharded_group_enabled = bool(getattr(self, "replicated_enabled", False))
+        if self.sharded_group_enabled:
+            if self.group_size % self.world_size != 0:
+                raise ValueError(
+                    "Sharded-group GRPO requires rl.group_size divisible by world_size "
+                    f"(got group_size={self.group_size}, world_size={self.world_size})."
+                )
+            self.local_group_size = self.group_size // self.world_size
+        else:
+            self.local_group_size = self.group_size
+        self.rollout_store = RolloutStore(group_size=self.local_group_size)
         self.rollout_groups_per_update = int(self.rl_cfg.get("rollout_groups_per_update", 1))
         self._pending_ready_groups = []
         self._rollout_generators: dict[str, torch.Generator] = {}
         self.global_update_step = 0
         self.global_rollout_episode = 0
+        self.global_eval_episode = 0
         # Periodic eval pass. eval_every=N (in global_update_step units) arms
         # the eval phase after each GRPO update whose step is a multiple of N.
         # Client polls run_pending_updates / get_eval_phase, then drives one
@@ -194,6 +214,7 @@ class GRPOTrainingServer(VA_Server):
         self._pending_checkpoint_future: Future | None = None
 
         self.trainable_params = [p for p in self.transformer.parameters() if p.requires_grad]
+        self._sync_replicated_trainable_params_from_rank0()
         self.optimizer = None
         if not self.disable_updates:
             opt_cfg = self.rl_cfg.get("optimizer", {}) or {}
@@ -230,6 +251,9 @@ class GRPOTrainingServer(VA_Server):
         self.logprob_consistency_atol = float(
             self.rl_cfg.get("logprob_consistency_atol", 5e-3)
         )
+        self.diagnose_update_effect = bool(
+            self.rl_cfg.get("diagnose_update_effect", False)
+        )
         self.normalize_denoising_horizon = bool(
             self.rl_cfg.get("logprob", {}).get("normalize_denoising_horizon", True)
         )
@@ -260,15 +284,20 @@ class GRPOTrainingServer(VA_Server):
         Path(self.job_config.save_root).mkdir(parents=True, exist_ok=True)
         self._init_wandb()
         logger.info(
-            "GRPO server ready: group_size=%s update_epochs=%s action_noise_std=%s "
-            "noise_schedule=%s disable_updates=%s train_action_steps=%s eval_action_steps=%s",
-            self.rollout_store.group_size,
+            "GRPO server ready: group_size=%s local_group_size=%s sharded=%s "
+            "update_epochs=%s action_noise_std=%s noise_schedule=%s "
+            "disable_updates=%s train_action_steps=%s eval_action_steps=%s "
+            "diagnose_update_effect=%s",
+            self.group_size,
+            self.local_group_size,
+            self.sharded_group_enabled,
             self.update_epochs,
             self.action_noise_std,
             self.noise_schedule,
             self.disable_updates,
             int(self.job_config.action_num_inference_steps),
             self.eval_action_num_inference_steps,
+            self.diagnose_update_effect,
         )
         if self._eval_pending:
             logger.info(
@@ -308,10 +337,44 @@ class GRPOTrainingServer(VA_Server):
         init_kwargs = {k: v for k, v in init_kwargs.items() if v is not None}
         try:
             self._wandb_run = wandb.init(**init_kwargs)
+            self._define_wandb_metrics(wandb)
             logger.info("wandb logging enabled: project=%s name=%s mode=%s", init_kwargs["project"], init_kwargs.get("name"), mode)
         except Exception as exc:
             logger.warning("Failed to initialize wandb logging: %s", exc)
             self._wandb_run = None
+
+    def _define_wandb_metrics(self, wandb_module) -> None:
+        """Give each metric family its own x-axis in W&B.
+
+        Without explicit step metrics, every eval episode advances W&B's
+        internal `_step`. A 64-episode eval pass then stretches rollout charts
+        and creates vertical-looking 0/1 bands even though no rollout happened.
+        """
+        definitions = [
+            ("train/global_update_step", None),
+            ("train/*", "train/global_update_step"),
+            ("train_epoch/global_update_step", None),
+            ("train_epoch/*", "train_epoch/global_update_step"),
+            ("rollout/global_rollout_episode", None),
+            ("rollout/*", "rollout/global_rollout_episode"),
+            ("group/global_rollout_episode", None),
+            ("group/*", "group/global_rollout_episode"),
+            ("eval/global_update_step", None),
+            ("eval/success_rate", "eval/global_update_step"),
+            ("eval/reward_mean", "eval/global_update_step"),
+            ("eval/n_episodes", "eval/global_update_step"),
+            ("eval/per_seed/*", "eval/global_update_step"),
+            ("eval/global_eval_episode", None),
+            ("eval/episode_success", "eval/global_eval_episode"),
+            ("eval/episode_reward", "eval/global_eval_episode"),
+            ("eval/episode_step_count", "eval/global_eval_episode"),
+            ("eval/phase_episode", "eval/global_eval_episode"),
+            ("checkpoint/global_update_step", None),
+            ("checkpoint/*", "checkpoint/global_update_step"),
+        ]
+        for metric, step_metric in definitions:
+            kwargs = {"step_metric": step_metric} if step_metric is not None else {}
+            wandb_module.define_metric(metric, **kwargs)
 
     def _wandb_log(self, data: dict[str, Any], *, step: int | None = None) -> None:
         if self._wandb_run is None or not self._is_rank0():
@@ -724,6 +787,16 @@ class GRPOTrainingServer(VA_Server):
         if not groups:
             return
 
+        # Sharded mode: all ranks must enter the update collective in lockstep.
+        # The dist.barrier() here pairs with the subsequent all_gather_object;
+        # if one rank's clients lagged (e.g. crashed mid-rollout) we'd rather
+        # hang here than silently mismatch advantages.
+        if self.sharded_group_enabled:
+            dist.barrier()
+            global_rewards = self._gather_sharded_rewards(groups)
+        else:
+            global_rewards = None
+
         # Rollout-level (pre-filter) behavior stats. These describe what the
         # policy actually did over the rolled-out episodes; they must NOT be
         # restricted to the kept-after-degenerate-filter subset, otherwise
@@ -743,17 +816,40 @@ class GRPOTrainingServer(VA_Server):
         for group in groups:
             if not group:
                 continue
-            g_rewards = [float(ep.reward) for ep in group]
-            # Skip all-success or all-fail groups: compute_group_advantages returns
-            # all zeros, so they contribute no gradient but still occupy minibatch
-            # capacity. Filtering keeps the training pool concentrated on groups
-            # that actually carry an advantage signal.
-            if len(g_rewards) >= 2 and float(torch.tensor(g_rewards).std(unbiased=False)) <= 0.0:
-                skipped_groups += 1
-                continue
-            episodes.extend(group)
-            advantage_chunks.append(compute_group_advantages(g_rewards))
-            group_rewards_summary.append(sum(g_rewards) / max(len(g_rewards), 1))
+            if self.sharded_group_enabled:
+                # Use the merged cross-rank rewards for both the degenerate
+                # filter and advantage normalization. We then slice out the
+                # advantages corresponding to *this* rank's local members.
+                gid = group[0].group_id
+                global_bucket = global_rewards[gid]
+                global_members_sorted = sorted(global_bucket.keys())
+                g_rewards = [global_bucket[m] for m in global_members_sorted]
+                if len(g_rewards) >= 2 and float(torch.tensor(g_rewards).std(unbiased=False)) <= 0.0:
+                    skipped_groups += 1
+                    continue
+                global_adv = compute_group_advantages(g_rewards)
+                # Map global member → its position in global_members_sorted so
+                # we can fetch the right advantage for each local episode.
+                member_to_pos = {m: i for i, m in enumerate(global_members_sorted)}
+                local_adv = torch.stack([
+                    global_adv[member_to_pos[int(ep.metadata["group_member"])]]
+                    for ep in group
+                ])
+                episodes.extend(group)
+                advantage_chunks.append(local_adv)
+                group_rewards_summary.append(sum(g_rewards) / max(len(g_rewards), 1))
+            else:
+                g_rewards = [float(ep.reward) for ep in group]
+                # Skip all-success or all-fail groups: compute_group_advantages returns
+                # all zeros, so they contribute no gradient but still occupy minibatch
+                # capacity. Filtering keeps the training pool concentrated on groups
+                # that actually carry an advantage signal.
+                if len(g_rewards) >= 2 and float(torch.tensor(g_rewards).std(unbiased=False)) <= 0.0:
+                    skipped_groups += 1
+                    continue
+                episodes.extend(group)
+                advantage_chunks.append(compute_group_advantages(g_rewards))
+                group_rewards_summary.append(sum(g_rewards) / max(len(g_rewards), 1))
         if skipped_groups:
             logger.info(
                 "GRPO degenerate groups filtered: skipped=%s kept=%s total=%s",
@@ -829,6 +925,13 @@ class GRPOTrainingServer(VA_Server):
             # run. log_ratio is the trajectory-level (new - old) diff in fp32.
             epoch_episode_diag: list[dict[str, Any]] = []
             epoch_grad_norms: list[float] = []
+            epoch_effect_signed_adv_delta: list[float] = []
+            epoch_effect_delta: list[float] = []
+            epoch_effect_pos_delta: list[float] = []
+            epoch_effect_neg_delta: list[float] = []
+            epoch_effect_pos_delta_positive: list[float] = []
+            epoch_effect_neg_delta_negative: list[float] = []
+            epoch_effect_active_count = 0
             n_mbs = 0
             for mb_start in range(0, n_eps, minibatch_size):
                 mb_idx = perm[mb_start : mb_start + minibatch_size]
@@ -904,7 +1007,13 @@ class GRPOTrainingServer(VA_Server):
                             self.logprob_consistency_atol,
                             len(mb_episodes),
                         )
+                # Synchronize gradients across replicated-mode ranks BEFORE
+                # clipping — clip_grad_norm_ uses the global norm, so it must
+                # see the synchronized grads to produce a consistent clip
+                # factor on every rank.
+                self._allreduce_gradients()
                 grad_clip = self.rl_cfg.get("max_grad_norm", None)
+                pre_clip_norm_f = 0.0
                 if grad_clip is not None:
                     # clip_grad_norm_ returns the *pre-clip* total norm — capture it
                     # so we can see when a single outlier episode produced gradients
@@ -912,10 +1021,78 @@ class GRPOTrainingServer(VA_Server):
                     pre_clip_norm = torch.nn.utils.clip_grad_norm_(
                         self.trainable_params, float(grad_clip)
                     )
-                    epoch_grad_norms.append(float(pre_clip_norm))
+                    pre_clip_norm_f = float(pre_clip_norm)
+                    epoch_grad_norms.append(pre_clip_norm_f)
+                mb_rewards = [float(ep.reward) for ep in mb_episodes]
+                mb_successes = [1.0 if bool(ep.success) else 0.0 for ep in mb_episodes]
+                mb_chunks = [float(len(ep.chunks)) for ep in mb_episodes]
+                mb_steps = [float(ep.step_count) for ep in mb_episodes if ep.step_count is not None]
+                logger.info(
+                    "GRPO update minibatch: step=%s epoch=%s/%s mb=%s loss=%.6f approx_kl=%.6f "
+                    "ratio=%.6f ratio_min=%.4f ratio_max=%.4f clipfrac=%.4f "
+                    "episodes=%s reward_mean=%.4f success_rate=%.4f adv_mean=%.4f adv_min=%.4f adv_max=%.4f "
+                    "old_logprob_mean=%.4f new_logprob_mean=%.4f logratio_abs_max=%.4f "
+                    "chunks_mean=%.2f step_count_mean=%.1f grad_norm=%.4f lr=%.3e",
+                    update_step,
+                    epoch_idx + 1,
+                    self.update_epochs,
+                    n_mbs + 1,
+                    float(loss_stats.loss.detach().cpu()),
+                    float(loss_stats.approx_kl.detach().cpu()),
+                    float(loss_stats.ratio_mean.detach().cpu()),
+                    float(loss_stats.ratio_min.detach().cpu()),
+                    float(loss_stats.ratio_max.detach().cpu()),
+                    float(loss_stats.clipfrac.detach().cpu()),
+                    len(mb_episodes),
+                    float(torch.tensor(mb_rewards).mean()) if mb_rewards else 0.0,
+                    float(sum(mb_successes) / max(len(mb_successes), 1)),
+                    float(mb_advantages.detach().float().mean().cpu()),
+                    float(mb_advantages.detach().float().min().cpu()),
+                    float(mb_advantages.detach().float().max().cpu()),
+                    float(mb_old_logprobs.detach().float().mean().cpu()),
+                    float(mb_new_logprobs_gradfwd.detach().float().mean().cpu()),
+                    float(loss_stats.log_ratio.detach().float().abs().max().cpu()),
+                    float(torch.tensor(mb_chunks).mean()) if mb_chunks else 0.0,
+                    float(torch.tensor(mb_steps).mean()) if mb_steps else 0.0,
+                    pre_clip_norm_f,
+                    float(self.optimizer.param_groups[0]["lr"]),
+                )
                 self.optimizer.step()
                 if self.scheduler_lr is not None:
                     self.scheduler_lr.step()
+
+                if self.diagnose_update_effect:
+                    # Expensive but decisive: measure the actual parameter step's
+                    # effect on the same minibatch logprobs. Positive advantages
+                    # should usually get positive deltas; negative advantages
+                    # should usually get negative deltas. This is intentionally
+                    # post-step, unlike loss_stats.log_ratio above.
+                    with torch.no_grad():
+                        mb_post_logprobs = torch.cat(
+                            [self.get_action_logprobs(ep).reshape(1) for ep in mb_episodes],
+                            dim=0,
+                        )
+                    mb_effect_delta = (
+                        mb_post_logprobs.detach().float().cpu()
+                        - mb_new_logprobs_detached.detach().float().cpu()
+                    )
+                    mb_effect_adv = mb_advantages.detach().float().cpu()
+                    mb_effect_active = grad_coef.detach().float().cpu().abs() > 0
+                    if bool(mb_effect_active.any()):
+                        active_delta = mb_effect_delta[mb_effect_active]
+                        active_adv = mb_effect_adv[mb_effect_active]
+                        epoch_effect_active_count += int(active_delta.numel())
+                        for delta_val, adv_val in zip(active_delta.tolist(), active_adv.tolist()):
+                            delta_f = float(delta_val)
+                            adv_f = float(adv_val)
+                            epoch_effect_delta.append(delta_f)
+                            epoch_effect_signed_adv_delta.append(delta_f * adv_f)
+                            if adv_f > 0:
+                                epoch_effect_pos_delta.append(delta_f)
+                                epoch_effect_pos_delta_positive.append(1.0 if delta_f > 0 else 0.0)
+                            elif adv_f < 0:
+                                epoch_effect_neg_delta.append(delta_f)
+                                epoch_effect_neg_delta_negative.append(1.0 if delta_f < 0 else 0.0)
 
                 # Record per-episode diagnostics for outlier attribution. Each
                 # element of loss_stats.log_ratio corresponds to one episode in
@@ -1011,6 +1188,16 @@ class GRPOTrainingServer(VA_Server):
             else:
                 grad_norm_mean = grad_norm_max = grad_norm_min = 0.0
 
+            def _mean_or_zero(values: list[float]) -> float:
+                return float(torch.tensor(values, dtype=torch.float32).mean()) if values else 0.0
+
+            update_effect_delta_mean = _mean_or_zero(epoch_effect_delta)
+            update_effect_signed_adv_delta_mean = _mean_or_zero(epoch_effect_signed_adv_delta)
+            update_effect_pos_adv_delta_mean = _mean_or_zero(epoch_effect_pos_delta)
+            update_effect_neg_adv_delta_mean = _mean_or_zero(epoch_effect_neg_delta)
+            update_effect_pos_adv_delta_positive_frac = _mean_or_zero(epoch_effect_pos_delta_positive)
+            update_effect_neg_adv_delta_negative_frac = _mean_or_zero(epoch_effect_neg_delta_negative)
+
             # Identify the 3 worst offenders by |log_ratio| so we can see
             # exactly which (group_id, seed, group_member) trajectories are
             # responsible for the KL blow-up. Logged as a single info line.
@@ -1069,6 +1256,16 @@ class GRPOTrainingServer(VA_Server):
                 "grad_norm_max": grad_norm_max,
                 "grad_norm_min": grad_norm_min,
             }
+            if self.diagnose_update_effect:
+                stats.update({
+                    "update_effect_delta_mean": update_effect_delta_mean,
+                    "update_effect_signed_adv_delta_mean": update_effect_signed_adv_delta_mean,
+                    "update_effect_pos_adv_delta_mean": update_effect_pos_adv_delta_mean,
+                    "update_effect_neg_adv_delta_mean": update_effect_neg_adv_delta_mean,
+                    "update_effect_pos_adv_delta_positive_frac": update_effect_pos_adv_delta_positive_frac,
+                    "update_effect_neg_adv_delta_negative_frac": update_effect_neg_adv_delta_negative_frac,
+                    "update_effect_active_count": epoch_effect_active_count,
+                })
             logger.info(
                 "GRPO update epoch: step=%s epoch=%s/%s mbs=%s loss=%.6f approx_kl=%.6f ratio=%.6f "
                 "ratio_min=%.4f ratio_max=%.4f ratio_std=%.4f "
@@ -1128,6 +1325,33 @@ class GRPOTrainingServer(VA_Server):
                     off["group_member"],
                     off["group_id"],
                 )
+            if self.diagnose_update_effect:
+                logger.info(
+                    "GRPO update effect: step=%s epoch=%s/%s active=%s "
+                    "delta_mean=%.6e signed_adv_delta_mean=%.6e "
+                    "pos_adv_delta_mean=%.6e pos_adv_delta_positive_frac=%.3f "
+                    "neg_adv_delta_mean=%.6e neg_adv_delta_negative_frac=%.3f",
+                    update_step,
+                    epoch_idx + 1,
+                    self.update_epochs,
+                    stats["update_effect_active_count"],
+                    stats["update_effect_delta_mean"],
+                    stats["update_effect_signed_adv_delta_mean"],
+                    stats["update_effect_pos_adv_delta_mean"],
+                    stats["update_effect_pos_adv_delta_positive_frac"],
+                    stats["update_effect_neg_adv_delta_mean"],
+                    stats["update_effect_neg_adv_delta_negative_frac"],
+                )
+                self._wandb_log({
+                    "train_epoch/global_update_step": update_step,
+                    "train_epoch/update_effect_delta_mean": stats["update_effect_delta_mean"],
+                    "train_epoch/update_effect_signed_adv_delta_mean": stats["update_effect_signed_adv_delta_mean"],
+                    "train_epoch/update_effect_pos_adv_delta_mean": stats["update_effect_pos_adv_delta_mean"],
+                    "train_epoch/update_effect_neg_adv_delta_mean": stats["update_effect_neg_adv_delta_mean"],
+                    "train_epoch/update_effect_pos_adv_delta_positive_frac": stats["update_effect_pos_adv_delta_positive_frac"],
+                    "train_epoch/update_effect_neg_adv_delta_negative_frac": stats["update_effect_neg_adv_delta_negative_frac"],
+                    "train_epoch/update_effect_active_count": stats["update_effect_active_count"],
+                })
             self._wandb_log(
                 {
                     "train_epoch/global_update_step": update_step,
@@ -1164,13 +1388,18 @@ class GRPOTrainingServer(VA_Server):
                     "train_epoch/grad_norm_min": stats["grad_norm_min"],
                 },
             )
-            if self.target_kl is not None and stats["approx_kl"] > self.target_kl:
-                logger.warning(
-                    "Stopping GRPO epochs early: approx_kl %.6f > target %.6f",
-                    stats["approx_kl"],
-                    self.target_kl,
-                )
-                stop_outer = True
+            if self.target_kl is not None:
+                # All ranks must reach the same early-stop decision or they
+                # diverge on the next epoch. Use MAX across ranks: if any
+                # rank's batch shows runaway KL, everyone stops.
+                kl_for_stop = self._allreduce_scalar_max(stats["approx_kl"])
+                if kl_for_stop > self.target_kl:
+                    logger.warning(
+                        "Stopping GRPO epochs early: approx_kl(max) %.6f > target %.6f",
+                        kl_for_stop,
+                        self.target_kl,
+                    )
+                    stop_outer = True
 
         self.global_update_step += 1
         stats["global_update_step"] = self.global_update_step
@@ -1375,10 +1604,145 @@ class GRPOTrainingServer(VA_Server):
         return stats
 
     def _write_json(self, name: str, data: dict[str, Any]) -> None:
+        # In replicated mode every rank reaches this with identical data; if
+        # we let them all write the file races and partial content is observed
+        # by tail-watchers. Only rank 0 writes.
+        if not self._is_rank0():
+            return
         path = Path(self.job_config.save_root) / name
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
+
+    def _sync_replicated_trainable_params_from_rank0(self) -> None:
+        """Broadcast trainable params so replicated ranks start from one state."""
+        if not getattr(self, "replicated_enabled", False):
+            return
+        if not getattr(self, "trainable_params", None):
+            return
+        for param in self.trainable_params:
+            dist.broadcast(param.data, src=0)
+        if self._is_rank0():
+            n_tensors = len(self.trainable_params)
+            n_params = sum(param.numel() for param in self.trainable_params)
+            logger.info(
+                "Replicated trainable parameter sync complete: source_rank=0 tensors=%s params=%s",
+                n_tensors,
+                n_params,
+            )
+
+    def _allreduce_gradients(self) -> None:
+        """Average gradients across replicated-mode ranks before optimizer.step().
+
+        DDP-style replicated GRPO: each rank rolls out and backwards on its own
+        episodes, then we average the accumulated grads so every rank applies
+        the same update. No-op outside replicated mode (single-GPU or FSDP).
+        """
+        if not getattr(self, "replicated_enabled", False):
+            return
+        ws = float(self.world_size)
+        for param in self.trainable_params:
+            if param.grad is None:
+                continue
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(ws)
+
+    def _gather_sharded_rewards(
+        self, groups: list[list]
+    ) -> dict[str, dict[int, float]]:
+        """Collect per-group rewards keyed by ``group_member`` across all ranks.
+
+        Sharded-group GRPO splits one logical group of size ``group_size`` across
+        ranks (each holds ``local_group_size`` members). To normalize advantages
+        over the full group we exchange just the lightweight ``(group_id,
+        member, reward)`` triples; the heavy episode tensors stay on the rank
+        that owns them and are loaded only for backward on that rank's slice.
+
+        Returns ``{group_id: {member: reward}}`` after merging all ranks' slices.
+        Raises if a member appears on more than one rank or if a group is missing
+        members after the merge — both signal a client-side slicing bug.
+        """
+        if not getattr(self, "sharded_group_enabled", False):
+            raise RuntimeError("_gather_sharded_rewards called outside sharded mode")
+
+        # Build local payload: list of (group_id, [(member, reward), ...]) so a
+        # single all_gather covers every group this rank knows about.
+        local_payload: list[tuple[str, list[tuple[int, float]]]] = []
+        for group in groups:
+            if not group:
+                continue
+            members = []
+            for ep in group:
+                meta = getattr(ep, "metadata", {}) or {}
+                if "group_member" not in meta:
+                    raise RuntimeError(
+                        f"Sharded GRPO requires episode.metadata['group_member']; "
+                        f"missing on episode group_id={ep.group_id!r}"
+                    )
+                members.append((int(meta["group_member"]), float(ep.reward)))
+            local_payload.append((str(group[0].group_id), members))
+
+        gathered: list[Any] = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered, local_payload)
+
+        merged: dict[str, dict[int, float]] = {}
+        for rank_payload in gathered:
+            if not rank_payload:
+                continue
+            for gid, members in rank_payload:
+                bucket = merged.setdefault(gid, {})
+                for member, reward in members:
+                    if member in bucket:
+                        raise RuntimeError(
+                            f"Sharded GRPO: duplicate group_member={member} for "
+                            f"group_id={gid!r} across ranks (clients must use "
+                            "global slicing: global_id = rank*num_clients + client_id)"
+                        )
+                    bucket[member] = float(reward)
+
+        for gid, bucket in merged.items():
+            if len(bucket) != self.group_size:
+                raise RuntimeError(
+                    f"Sharded GRPO: incomplete group {gid!r} after cross-rank merge: "
+                    f"got {len(bucket)} members, expected {self.group_size}. "
+                    "Check client --world_size/--rank/--num_clients flags and that "
+                    "every assignment item completes on every rank."
+                )
+        return merged
+
+    def _gather_replicated_eval_results(self) -> list[dict[str, Any]]:
+        """Barrier and merge eval results across replicated server ranks."""
+        local_results = [dict(result) for result in self._eval_results]
+        if not getattr(self, "replicated_enabled", False):
+            return local_results
+
+        # Every rank's client-0 calls end_eval_phase after its local clients have
+        # finished. This barrier turns those local file barriers into one global
+        # eval-phase boundary before any rank clears _eval_results.
+        dist.barrier()
+        gathered: list[Any] = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered, local_results)
+
+        merged: list[dict[str, Any]] = []
+        for rank, rank_results in enumerate(gathered):
+            for result in rank_results or []:
+                item = dict(result)
+                item.setdefault("server_rank", int(rank))
+                merged.append(item)
+        return merged
+
+    def _allreduce_scalar_max(self, value: float) -> float:
+        """All-reduce a scalar by MAX across replicated ranks (used for KL early-stop).
+
+        Returns ``value`` unchanged outside replicated mode. Using MAX makes
+        early-stop a worst-case decision so all ranks reach the same verdict
+        and stop together.
+        """
+        if not getattr(self, "replicated_enabled", False):
+            return value
+        t = torch.tensor([float(value)], device=self.device, dtype=torch.float32)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return float(t.item())
 
     def _trainable_state_dict(self) -> dict[str, torch.Tensor]:
         """State dict containing only trainable params (LoRA adapters when LoRA is on)."""
@@ -1399,7 +1763,12 @@ class GRPOTrainingServer(VA_Server):
         and previously froze the server entirely (see notes on the 2026-05-13
         validation hang). The actual file write runs in a single-worker thread
         pool; if a previous save is still in flight we skip rather than queue.
+
+        In replicated (DDP-style) mode all ranks hold identical weights after
+        the gradient-synced optimizer step, so only rank 0 writes the file.
         """
+        if not self._is_rank0():
+            return ""
         ckpt_dir = Path(self.job_config.save_root) / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         step = self.global_update_step
@@ -1565,12 +1934,19 @@ class GRPOTrainingServer(VA_Server):
         self.transformer.load_state_dict(ckpt["transformer"], strict=False)
         if self.optimizer is not None and "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
+        self._sync_replicated_trainable_params_from_rank0()
         self.global_update_step = int(ckpt.get("global_update_step", 0))
         if self.global_update_step > 0:
             self._eval_pending = False
             self._eval_results = []
         if "rollout_store" in ckpt:
             self.rollout_store.load_state_dict(ckpt["rollout_store"])
+            # Resuming across a topology change (e.g. single-GPU checkpoint
+            # loaded under sharded multi-GPU) would otherwise inherit the
+            # serialized group_size and mismatch the current run's local
+            # threshold. The store should be empty after drop_episodes anyway,
+            # so re-asserting local_group_size is safe.
+            self.rollout_store.group_size = self.local_group_size
 
     def infer(self, obs):
         session_id = obs.pop("_session_id", None)
@@ -1654,12 +2030,14 @@ class GRPOTrainingServer(VA_Server):
                     "group_id": episode.group_id,
                 }
                 self._eval_results.append(result)
+                self.global_eval_episode += 1
                 self._wandb_log(
                     {
+                        "eval/global_eval_episode": self.global_eval_episode,
+                        "eval/phase_episode": len(self._eval_results),
                         "eval/episode_success": float(result["success"]),
                         "eval/episode_reward": result["reward"],
                         "eval/episode_step_count": float(result["step_count"]),
-                        "eval/episodes_collected": len(self._eval_results),
                         "eval/global_update_step": self.global_update_step,
                     },
                 )
@@ -1784,47 +2162,67 @@ class GRPOTrainingServer(VA_Server):
             }
 
         if command == "end_eval_phase":
-            n = len(self._eval_results)
+            local_n = len(self._eval_results)
+            results_snapshot = self._gather_replicated_eval_results()
+            n = len(results_snapshot)
             success_rate = 0.0
             reward_mean = 0.0
+            rank_counts: dict[int, int] = {}
+            for result in results_snapshot:
+                if "server_rank" in result:
+                    rank = int(result["server_rank"])
+                    rank_counts[rank] = rank_counts.get(rank, 0) + 1
             if n > 0:
-                successes = [1.0 if r["success"] else 0.0 for r in self._eval_results]
-                rewards = [r["reward"] for r in self._eval_results]
+                successes = [1.0 if r["success"] else 0.0 for r in results_snapshot]
+                rewards = [r["reward"] for r in results_snapshot]
                 success_rate = sum(successes) / n
                 reward_mean = sum(rewards) / n
                 per_seed = {
                     f"eval/per_seed/{r['task']}/{r['seed']}/success": float(r["success"])
-                    for r in self._eval_results
+                    for r in results_snapshot
                 }
                 self._wandb_log(
                     {
                         "eval/success_rate": success_rate,
                         "eval/reward_mean": reward_mean,
                         "eval/n_episodes": float(n),
+                        "eval/local_n_episodes": float(local_n),
                         "eval/global_update_step": self.global_update_step,
                         **per_seed,
                     },
                 )
+                if self._is_rank0():
+                    logger.info(
+                        "GRPO eval phase done: n=%s success_rate=%.4f reward_mean=%.4f "
+                        "global_update_step=%s local_n=%s rank_counts=%s",
+                        n,
+                        success_rate,
+                        reward_mean,
+                        self.global_update_step,
+                        local_n,
+                        rank_counts or None,
+                    )
+            elif self._is_rank0():
+                logger.warning(
+                    "GRPO end_eval_phase called with no merged eval results; clearing flag anyway."
+                )
+            elif local_n:
                 logger.info(
-                    "GRPO eval phase done: n=%s success_rate=%.4f reward_mean=%.4f global_update_step=%s",
+                    "GRPO eval rank merged: local_n=%s merged_n=%s global_update_step=%s",
+                    local_n,
                     n,
-                    success_rate,
-                    reward_mean,
                     self.global_update_step,
                 )
-            else:
-                logger.warning(
-                    "GRPO end_eval_phase called with no eval results; clearing flag anyway."
-                )
-            results_snapshot = list(self._eval_results)
             self._eval_pending = False
             self._eval_results = []
             return {
                 "in_eval": False,
                 "n_episodes": n,
+                "local_n_episodes": local_n,
                 "success_rate": success_rate,
                 "reward_mean": reward_mean,
                 "global_update_step": self.global_update_step,
+                "rank_counts": rank_counts,
                 "results": results_snapshot,
             }
 
@@ -1847,18 +2245,24 @@ def run(args):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     init_distributed(world_size, local_rank, rank)
-    if bool(config.rl.get("use_fsdp", False)) and world_size <= 1:
+    use_fsdp = bool(config.rl.get("use_fsdp", False))
+    if use_fsdp and world_size <= 1:
         raise RuntimeError("GRPO FSDP config requires torchrun with WORLD_SIZE > 1")
-    if not bool(config.rl.get("use_fsdp", False)) and world_size > 1:
-        raise RuntimeError("Distributed GRPO launch requires rl.use_fsdp=true")
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
 
+    # Replicated (DDP-style) mode: torchrun-launched, each rank holds a full
+    # copy of the model and binds its own websocket port (base_port + rank) so
+    # rollouts run in parallel. Gradients are synchronized across ranks at
+    # update time inside _run_grpo_update.
+    replicated_mode = world_size > 1 and not use_fsdp
+    rank_port = int(config.port) + rank if replicated_mode else int(config.port)
+
     model = GRPOTrainingServer(config)
     if args.resume_from:
         model.load_checkpoint(args.resume_from)
-    run_async_server_mode(model, local_rank, config.host, config.port)
+    run_async_server_mode(model, local_rank, config.host, rank_port)
 
 
 def main():

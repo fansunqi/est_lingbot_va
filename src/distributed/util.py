@@ -12,16 +12,20 @@ import torch
 import torch.distributed as dist
 
 
-def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
-    """Apply ``shard_fn`` if dist is up; otherwise materialize on a single device.
+def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True, shard=True):
+    """Apply ``shard_fn`` if dist is up and sharding is requested; otherwise materialize on a single device.
 
     Used by ``src.inference.server`` and ``src.tools.find_max_seq_len``. The
     Lightning training path replaces this with a ``LightningModule.configure_model``
     hook driven by the strategy's ``device_mesh``.
+
+    ``shard=False`` is the DDP-style (full replication) path: the model goes to
+    ``device`` directly even when ``dist`` is initialized. The caller is then
+    responsible for synchronizing gradients across ranks.
     """
     if eval_mode:
         model.eval().requires_grad_(False)
-    if dist.is_initialized():
+    if shard and dist.is_initialized():
         dist.barrier()
         model = shard_fn(model)
     else:

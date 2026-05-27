@@ -67,7 +67,7 @@ rl:
   group_size: 12
   # 2026-05-23: 2 → 4,episodes/update 从 16 升到 32,
   # 减半 advantage 的 Bernoulli 噪声(σ 从 0.18 → 0.12)。
-  rollout_groups_per_update: 2
+  rollout_groups_per_update: 4
   update_epochs: 1
   batch_size: 4
 
@@ -113,6 +113,10 @@ rl:
 
   validate_logprob_consistency: true
   logprob_consistency_atol: 5.0e-3
+  # Set true for a short diagnostic run. It roughly doubles update compute by
+  # recomputing each minibatch after optimizer.step, then logs whether positive
+  # advantages increased logprob and negative advantages decreased it.
+  diagnose_update_effect: true
 
   optimizer:
     # 2026-05-23: baseline 是 2e-5,这一轮 4×↓ 到 5e-6,配合 normalized 信任域。

@@ -579,9 +579,16 @@ def wait_and_run_eval_pass(
     barrier_dir.mkdir(parents=True, exist_ok=True)
 
     full_indexed = list(enumerate(assignment))
-    slice_with_idx = full_indexed[args.client_id :: args.num_clients]
+    # Eval slicing follows the same global pool as rollout members: each item
+    # is owned by exactly one (rank, client) across the full world. Local file
+    # barriers stay per-rank because RUN_DIR is per-rank; server-side
+    # end_eval_phase adds the cross-rank barrier and merges eval results.
+    global_client_id = getattr(args, "global_client_id", args.client_id)
+    global_num_clients = getattr(args, "global_num_clients", args.num_clients)
+    slice_with_idx = full_indexed[global_client_id :: global_num_clients]
     print(
-        f"[eval] client {args.client_id}/{args.num_clients} taking "
+        f"[eval] client {args.client_id}/{args.num_clients} "
+        f"(global {global_client_id}/{global_num_clients}) taking "
         f"{len(slice_with_idx)}/{len(assignment)} items "
         f"at global_update_step={global_update_step}"
     )
@@ -625,7 +632,13 @@ def main():
     parser.add_argument("--policy_name", type=str, default="ACT")
     parser.add_argument("--group_size", type=int, default=2)
     parser.add_argument("--num_clients", type=int, default=1,
-                        help="Total number of parallel clients sharing each GRPO group")
+                        help="Number of parallel clients on THIS rank sharing each GRPO group")
+    parser.add_argument("--world_size", type=int, default=1,
+                        help="Number of GRPO server ranks the rollout pool spans across. "
+                             "Members are sliced globally across (world_size * num_clients) clients.")
+    parser.add_argument("--rank", type=int, default=0,
+                        help="Index of THIS rank within the rollout pool [0, world_size). "
+                             "global_client_id = rank * num_clients + client_id.")
     parser.add_argument("--group_barrier", action="store_true",
                         help="Wait for all parallel clients after each assignment item")
     parser.add_argument("--group_barrier_timeout", type=float, default=0.0,
@@ -677,6 +690,30 @@ def main():
         raise ValueError(f"--client_id must be in [0, {args.num_clients}), got {args.client_id}")
     if args.num_passes < 1:
         raise ValueError("--num_passes must be >= 1")
+    if args.world_size < 1:
+        raise ValueError("--world_size must be >= 1")
+    if not (0 <= args.rank < args.world_size):
+        raise ValueError(f"--rank must be in [0, {args.world_size}), got {args.rank}")
+    # Sharded-group GRPO splits one logical group across server ranks. With
+    # world_size=W and group_size=G, each rank must hold G/W members locally —
+    # so G must be divisible by W. (W=1 collapses to single-rank behavior.)
+    if args.group_size % args.world_size != 0:
+        raise ValueError(
+            f"--group_size ({args.group_size}) must be divisible by --world_size "
+            f"({args.world_size}) for sharded-group GRPO."
+        )
+
+    # Global slicing across (world_size * num_clients) clients in the rollout
+    # pool. The server keys groups by group_id (deterministic across ranks),
+    # so assigning each member to exactly one (rank, client) is sufficient.
+    global_num_clients = args.world_size * args.num_clients
+    global_client_id = args.rank * args.num_clients + args.client_id
+    # Stash on args so helpers (eval slicing, barriers) can read the global
+    # indexing without threading it through every call site. Local barriers
+    # remain scoped by (rank, client) — the file barrier directory is already
+    # per-rank via RUN_DIR — so we don't override args.client_id / num_clients.
+    args.global_client_id = global_client_id
+    args.global_num_clients = global_num_clients
 
     with open(args.assignment, "r") as f:
         assignment = json.load(f)
@@ -692,15 +729,16 @@ def main():
     else:
         Sapien_TEST()
 
-    group_members = list(range(args.client_id, args.group_size, args.num_clients))
+    group_members = list(range(global_client_id, args.group_size, global_num_clients))
     if not group_members:
         print(
-            f"Client {args.client_id} has no group members for "
-            f"group_size={args.group_size}, num_clients={args.num_clients}; exiting."
+            f"Client {args.client_id} (global {global_client_id}/{global_num_clients}) "
+            f"has no group members for group_size={args.group_size}; exiting."
         )
         return
     print(
-        f"Client {args.client_id}/{args.num_clients} will run group members "
+        f"Client {args.client_id}/{args.num_clients} (rank {args.rank}/{args.world_size}, "
+        f"global {global_client_id}/{global_num_clients}) will run group members "
         f"{group_members} for each assignment item."
     )
 

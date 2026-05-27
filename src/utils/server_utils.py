@@ -98,6 +98,18 @@ def run_async_server_mode(model, local_rank, host, port):
         return
 
     rank = dist.get_rank()
+    # Replicated (DDP-style) mode: each rank holds a full model copy and serves
+    # its own port independently. The FSDP-style rank0-broadcast / worker_loop
+    # pattern doesn't apply — every rank runs its own websocket loop. Gradient
+    # sync happens later, inside the training update collective.
+    if not getattr(model, 'fsdp_enabled', True):
+        logger.info(
+            "Replicated server: rank=%s binding %s:%s", rank, host, port,
+        )
+        model_server = WebsocketPolicyServer(model, host=host, port=port)
+        model_server.serve_forever()
+        return
+
     if rank == 0:
         dist_model = DistributedModelWrapper(model, source_rank=0)
         model_server = WebsocketPolicyServer(dist_model, host=host, port=port)

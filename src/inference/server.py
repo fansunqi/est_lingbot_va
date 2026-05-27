@@ -126,8 +126,17 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.rank = int(getattr(job_config, 'rank', _dist_rank()))
         self.world_size = int(getattr(job_config, 'world_size', _dist_world_size()))
-        self.fsdp_enabled = dist.is_initialized() and self.world_size > 1
         fsdp_cfg = getattr(job_config, 'fsdp', {}) or {}
+        # An ``fsdp`` config block is the explicit signal that the model is
+        # sharded across ranks. Without it, WORLD_SIZE>1 means DDP-style full
+        # replication (each rank holds the entire model and serves its own port);
+        # gradient sync at update time is the caller's responsibility.
+        self.fsdp_enabled = bool(fsdp_cfg) and dist.is_initialized() and self.world_size > 1
+        self.replicated_enabled = (
+            (not self.fsdp_enabled)
+            and dist.is_initialized()
+            and self.world_size > 1
+        )
         self.fsdp_rank0_aux_only = bool(fsdp_cfg.get('rank0_aux_only', self.fsdp_enabled))
         self._has_aux_models = (not self.fsdp_rank0_aux_only) or self.rank == 0
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
@@ -214,6 +223,7 @@ class VA_Server:
                                             param_dtype=self.dtype,
                                             device=self.device,
                                             eval_mode=True,
+                                            shard=self.fsdp_enabled,
                                             )
 
         self.env_type = job_config.env_type
@@ -235,9 +245,25 @@ class VA_Server:
                 self.fsdp_rank0_aux_only,
                 transformer_load_device,
             )
+        elif self.replicated_enabled:
+            logger.info(
+                "Replicated (DDP-style) server initialized: rank=%s world_size=%s "
+                "transformer_load_device=%s",
+                self.rank,
+                self.world_size,
+                transformer_load_device,
+            )
 
     def _dist_active(self):
-        return dist.is_available() and dist.is_initialized() and self.world_size > 1
+        # Replicated DDP ranks serve independent websocket ports. Aux tensor
+        # broadcasts are only valid when the transformer itself is FSDP-sharded
+        # and every rank participates in the same inference request.
+        return (
+            self.fsdp_enabled
+            and dist.is_available()
+            and dist.is_initialized()
+            and self.world_size > 1
+        )
 
     def _is_rank0(self):
         return self.rank == 0

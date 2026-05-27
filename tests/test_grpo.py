@@ -85,11 +85,14 @@ def _make_fake_grpo_server(*, noise_schedule="per_step"):
         action_num_inference_steps = 3
 
     server.job_config = _Cfg()
+    server.eval_action_num_inference_steps = 2
     server.action_scheduler = FlowMatchScheduler(shift=1.0, sigma_min=0.0, extra_one_step=True)
 
     server._run_video_prefix = lambda *args, **kwargs: None
+    server.transformer_calls = []
 
     def _stub_transformer_step(actions, t, frame_st_id, *, last_step):
+        server.transformer_calls.append((float(t.reshape(-1)[0]), bool(last_step)))
         cond = (
             torch.zeros(
                 [1, server.job_config.action_dim, 1, server.action_per_frame, 1],
@@ -124,6 +127,22 @@ def test_sample_action_chunk_eval_mode_returns_placeholder_chunk():
     assert chunk.action_chain == []
     assert torch.equal(chunk.old_logprobs, torch.zeros(1))
     assert chunk.action_timesteps.numel() == 0
+
+
+def test_sample_action_chunk_eval_mode_uses_eval_inference_steps():
+    server = _make_fake_grpo_server(noise_schedule="per_step")
+    server.job_config.action_num_inference_steps = 5
+    server.eval_action_num_inference_steps = 2
+
+    server._sample_action_chunk({"obs": None}, frame_st_id=0, eval_mode=True)
+    eval_calls = len(server.transformer_calls)
+
+    server.transformer_calls.clear()
+    server._sample_action_chunk({"obs": None}, frame_st_id=0, eval_mode=False)
+    train_calls = len(server.transformer_calls)
+
+    assert eval_calls == server.eval_action_num_inference_steps + 1
+    assert train_calls == server.job_config.action_num_inference_steps + 1
 
 
 def test_sample_action_chunk_training_mode_per_step_records_logprobs():

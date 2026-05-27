@@ -23,6 +23,12 @@ NUM_PASSES=${NUM_PASSES:-1}
 EVAL_ONLY=${EVAL_ONLY:-0}
 CLIENT_GPUS=(${CLIENT_GPUS:-0})
 NUM_CLIENTS=${NUM_CLIENTS:-${#CLIENT_GPUS[@]}}
+# Sharded-group GRPO indexing. WORLD_SIZE = number of GRPO server ranks the
+# rollout pool spans (1 for single-server runs). RANK = which rank this
+# launcher binds to. The DDP top-level wrapper sets both per group; standalone
+# runs leave them at the defaults.
+WORLD_SIZE=${WORLD_SIZE:-1}
+RANK=${RANK:-0}
 
 ASSIGNMENT=$(realpath "${ASSIGNMENT}")
 SAVE_ROOT=$(realpath -m "${SAVE_ROOT}")
@@ -47,7 +53,7 @@ if [[ "${CONDA_DEFAULT_ENV:-}" != "RoboTwin" && -z "${ALLOW_NON_ROBOTWIN_CONDA:-
 fi
 
 mkdir -p "${RUN_DIR}/logs"
-echo "GRPO rollout settings: GROUP_SIZE=${GROUP_SIZE} NUM_CLIENTS=${NUM_CLIENTS} NUM_PASSES=${NUM_PASSES} EVAL_ONLY=${EVAL_ONLY} CLIENT_GPUS=${CLIENT_GPUS[*]}"
+echo "GRPO rollout settings: GROUP_SIZE=${GROUP_SIZE} NUM_CLIENTS=${NUM_CLIENTS} WORLD_SIZE=${WORLD_SIZE} RANK=${RANK} NUM_PASSES=${NUM_PASSES} EVAL_ONLY=${EVAL_ONLY} CLIENT_GPUS=${CLIENT_GPUS[*]}"
 
 CLIENT_PIDS=()
 CLIENT_PGIDS=()
@@ -119,6 +125,8 @@ for CLIENT_ID in $(seq 0 $((NUM_CLIENTS - 1))); do
     --client_id "${CLIENT_ID}" \
     --group_size "${GROUP_SIZE}" \
     --num_clients "${NUM_CLIENTS}" \
+    --world_size "${WORLD_SIZE}" \
+    --rank "${RANK}" \
     --num_passes "${NUM_PASSES}" \
     $([[ "${EVAL_ONLY}" == "1" ]] && printf '%s' '--eval_only') \
     --task_config "${TASK_CONFIG}" \
