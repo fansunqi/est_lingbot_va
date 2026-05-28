@@ -77,6 +77,71 @@ def _json_safe(value):
         return str(value)
 
 
+def _episode_summary_stats(records: list[dict[str, Any]]) -> dict[str, float]:
+    n = len(records)
+    rewards = [float(item.get("reward", 0.0)) for item in records]
+    successes = [1.0 if bool(item.get("success", False)) else 0.0 for item in records]
+    steps = [float(item.get("step_count", 0.0)) for item in records]
+    chunks = [float(item.get("chunks", 0.0)) for item in records]
+
+    reward_sum = sum(rewards)
+    success_count = sum(successes)
+    step_sum = sum(steps)
+    chunk_sum = sum(chunks)
+    reward_mean = reward_sum / n if n else 0.0
+    reward_var = sum((value - reward_mean) ** 2 for value in rewards) / n if n else 0.0
+    return {
+        "episode_count": float(n),
+        "reward_sum": float(reward_sum),
+        "reward_mean": float(reward_mean),
+        "reward_std": float(reward_var ** 0.5),
+        "success_count": float(success_count),
+        "success_rate": float(success_count / n) if n else 0.0,
+        "step_count_sum": float(step_sum),
+        "step_count_mean": float(step_sum / n) if n else 0.0,
+        "chunk_count_sum": float(chunk_sum),
+        "chunk_count_mean": float(chunk_sum / n) if n else 0.0,
+    }
+
+
+def _resolve_grpo_minibatch_sizes(
+    rl_cfg,
+    *,
+    group_size: int,
+    rollout_groups_per_update: int,
+    world_size: int,
+    sharded_group_enabled: bool,
+) -> tuple[int, int]:
+    """Return (global_minibatch_size, local_minibatch_size).
+
+    In replicated sharded-group mode each optimizer step averages gradients
+    across ranks. The config's ``batch_size`` is therefore the logical/global
+    episode count, while each rank should process ``batch_size / world_size``
+    local episodes so the post-allreduce gradient is the mean over the same
+    global minibatch size as single-GPU GRPO.
+    """
+    configured = rl_cfg.get("batch_size", None)
+    if configured is None:
+        global_minibatch_size = max(
+            1,
+            int(group_size) * max(int(rollout_groups_per_update), 1),
+        )
+    else:
+        global_minibatch_size = max(1, int(configured))
+
+    if not sharded_group_enabled:
+        return global_minibatch_size, global_minibatch_size
+
+    if global_minibatch_size % int(world_size) != 0:
+        raise ValueError(
+            "Sharded replicated GRPO requires rl.batch_size to be divisible "
+            f"by world_size so every rank contributes the same local minibatch "
+            f"size (got batch_size={global_minibatch_size}, world_size={world_size})."
+        )
+    local_minibatch_size = max(1, global_minibatch_size // int(world_size))
+    return global_minibatch_size, local_minibatch_size
+
+
 def load_rl_config(config_path: str) -> EasyDict:
     config_path = Path(config_path)
     config_root = config_path.parent.parent
@@ -232,19 +297,17 @@ class GRPOTrainingServer(VA_Server):
         self.target_kl = self.rl_cfg.get("target_kl", None)
         self.target_kl = None if self.target_kl is None else float(self.target_kl)
         self.update_epochs = int(self.rl_cfg.get("update_epochs", 1))
-        # Minibatch size in *episodes* used inside one GRPO update. When the
-        # update batches `rollout_groups_per_update` groups together, this
-        # controls how many episodes are processed per optimizer step. Default
-        # to processing the full batch in one step (one optimizer step / epoch).
-        _batch_size = self.rl_cfg.get("batch_size", None)
-        if _batch_size is None:
-            self.minibatch_size = max(
-                1,
-                int(self.rl_cfg.get("group_size", 2))
-                * max(int(self.rollout_groups_per_update), 1),
-            )
-        else:
-            self.minibatch_size = max(1, int(_batch_size))
+        # Minibatch size in *episodes* used inside one GRPO update. In
+        # replicated sharded-group mode, the config's batch_size is logical /
+        # global; each rank processes batch_size/world_size local episodes and
+        # the all-reduced gradient is the mean over the global minibatch.
+        self.global_minibatch_size, self.minibatch_size = _resolve_grpo_minibatch_sizes(
+            self.rl_cfg,
+            group_size=self.group_size,
+            rollout_groups_per_update=self.rollout_groups_per_update,
+            world_size=self.world_size,
+            sharded_group_enabled=self.sharded_group_enabled,
+        )
         self.validate_logprob_consistency = bool(
             self.rl_cfg.get("validate_logprob_consistency", False)
         )
@@ -287,6 +350,7 @@ class GRPOTrainingServer(VA_Server):
             "GRPO server ready: group_size=%s local_group_size=%s sharded=%s "
             "update_epochs=%s action_noise_std=%s noise_schedule=%s "
             "disable_updates=%s train_action_steps=%s eval_action_steps=%s "
+            "global_batch_size=%s local_batch_size=%s "
             "diagnose_update_effect=%s",
             self.group_size,
             self.local_group_size,
@@ -297,6 +361,8 @@ class GRPOTrainingServer(VA_Server):
             self.disable_updates,
             int(self.job_config.action_num_inference_steps),
             self.eval_action_num_inference_steps,
+            self.global_minibatch_size,
+            self.minibatch_size,
             self.diagnose_update_effect,
         )
         if self._eval_pending:
@@ -798,6 +864,18 @@ class GRPOTrainingServer(VA_Server):
         else:
             global_rewards = None
 
+        update_step = self.global_update_step + 1
+        if getattr(self, "replicated_enabled", False):
+            (
+                replicated_rollout_records,
+                rank_rollout_counts,
+            ) = self._gather_replicated_rollout_records(groups)
+            self._log_replicated_rollout_group_wandb(
+                replicated_rollout_records,
+                update_step=update_step,
+                rank_rollout_counts=rank_rollout_counts,
+            )
+
         # Rollout-level (pre-filter) behavior stats. These describe what the
         # policy actually did over the rolled-out episodes; they must NOT be
         # restricted to the kept-after-degenerate-filter subset, otherwise
@@ -869,18 +947,22 @@ class GRPOTrainingServer(VA_Server):
 
         advantages = torch.cat(advantage_chunks, dim=0).to(self.device)
         old_logprobs = self._episode_old_logprobs(episodes).to(self.device)
-        update_step = self.global_update_step + 1
         group_ids = [grp[0].group_id for grp in groups if grp]
         advantage_cpu = advantages.detach().cpu()
         n_eps = len(episodes)
         n_rollout_eps = len(rollout_episodes)
         n_kept_groups = len(advantage_chunks)
         minibatch_size = max(1, min(self.minibatch_size, n_eps))
+        global_minibatch_size = (
+            minibatch_size * self.world_size
+            if self.sharded_group_enabled
+            else minibatch_size
+        )
         # Behavior stats use ALL rolled-out episodes (pre-filter). Training
         # stats (advantage, n_eps, group_count) use post-filter only.
         logger.info(
             "GRPO update start: rank=%s step=%s rollout_groups=%s kept_groups=%s rollout_episodes=%s "
-            "trained_episodes=%s minibatch_size=%s degenerate_groups_skipped=%s "
+            "trained_episodes=%s minibatch_size=%s global_minibatch_size=%s degenerate_groups_skipped=%s "
             "reward_mean=%.4f reward_std=%.4f success_rate=%.4f "
             "old_logprob_mean=%.4f old_logprob_std=%.4f advantage_mean=%.4f advantage_std=%.4f "
             "step_count_mean=%.1f chunk_count_mean=%.1f epochs=%s",
@@ -891,6 +973,7 @@ class GRPOTrainingServer(VA_Server):
             n_rollout_eps,
             n_eps,
             minibatch_size,
+            global_minibatch_size,
             skipped_groups,
             float(rollout_reward_tensor.mean()) if rollout_reward_tensor.numel() else 0.0,
             float(rollout_reward_tensor.std(unbiased=False)) if rollout_reward_tensor.numel() > 1 else 0.0,
@@ -1242,6 +1325,7 @@ class GRPOTrainingServer(VA_Server):
                 "trained_episode_count": n_eps,
                 "trained_group_size": (n_eps // n_kept_groups) if n_kept_groups else 0,
                 "minibatch_size": minibatch_size,
+                "global_minibatch_size": global_minibatch_size,
                 "minibatches_per_epoch": n_mbs,
                 "lr": float(self.optimizer.param_groups[0]["lr"]),
                 # Per-episode outlier diagnostics for KL attribution.
@@ -1661,6 +1745,118 @@ class GRPOTrainingServer(VA_Server):
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
             param.grad.div_(ws)
 
+    def _gather_replicated_rollout_records(
+        self, groups: list[list]
+    ) -> tuple[list[dict[str, Any]], dict[int, int]]:
+        """Collect lightweight rollout records across replicated ranks.
+
+        Episode/group websocket callbacks are asynchronous across ranks, so they
+        cannot safely use collectives. This helper is called only from the GRPO
+        update path, where all replicated ranks are already in lockstep.
+        """
+        local_records: list[dict[str, Any]] = []
+        for group in groups:
+            for episode in group or []:
+                local_records.append({
+                    "server_rank": int(self.rank),
+                    "group_id": str(getattr(episode, "group_id", "")),
+                    "reward": float(getattr(episode, "reward", 0.0)),
+                    "success": bool(getattr(episode, "success", False)),
+                    "step_count": int(getattr(episode, "step_count", 0) or 0),
+                    "chunks": int(len(getattr(episode, "chunks", []) or [])),
+                })
+
+        if not getattr(self, "replicated_enabled", False):
+            return local_records, {int(self.rank): int(self.global_rollout_episode)}
+
+        local_payload = {
+            "records": local_records,
+            "global_rollout_episode": int(self.global_rollout_episode),
+        }
+        gathered: list[Any] = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered, local_payload)
+
+        merged_records: list[dict[str, Any]] = []
+        rank_rollout_counts: dict[int, int] = {}
+        for rank, payload in enumerate(gathered):
+            payload = payload or {}
+            rank_rollout_counts[int(rank)] = int(payload.get("global_rollout_episode", 0))
+            for record in payload.get("records", []) or []:
+                item = dict(record)
+                item.setdefault("server_rank", int(rank))
+                merged_records.append(item)
+        return merged_records, rank_rollout_counts
+
+    def _log_replicated_rollout_group_wandb(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        update_step: int,
+        rank_rollout_counts: dict[int, int],
+    ) -> None:
+        """Log DDP rollout/group W&B metrics as global aggregates on rank 0."""
+        if not getattr(self, "replicated_enabled", False):
+            return
+        if not self._is_rank0() or not records:
+            return
+
+        global_rollout_episode = float(sum(rank_rollout_counts.values()))
+        rollout_stats = _episode_summary_stats(records)
+        rank_episode_counts: dict[int, int] = {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            rank = int(record.get("server_rank", -1))
+            rank_episode_counts[rank] = rank_episode_counts.get(rank, 0) + 1
+            group_id = str(record.get("group_id", ""))
+            grouped.setdefault(group_id, []).append(record)
+
+        self._wandb_log({
+            "global_rollout_episode": global_rollout_episode,
+            "rollout/global_rollout_episode": global_rollout_episode,
+            "rollout/global_update_step": update_step,
+            "rollout/episode_reward": rollout_stats["reward_mean"],
+            "rollout/episode_success": rollout_stats["success_rate"],
+            "rollout/episode_step_count": rollout_stats["step_count_mean"],
+            "rollout/episode_chunks": rollout_stats["chunk_count_mean"],
+            "rollout/episode_count": rollout_stats["episode_count"],
+            "rollout/success_count": rollout_stats["success_count"],
+            "rollout/reward_sum": rollout_stats["reward_sum"],
+            "rollout/step_count_sum": rollout_stats["step_count_sum"],
+            "rollout/chunk_count_sum": rollout_stats["chunk_count_sum"],
+            "rollout/group_count": float(len(grouped)),
+            "rollout/rank_count": float(len(rank_episode_counts)),
+        })
+
+        for group_records in grouped.values():
+            group_stats = _episode_summary_stats(group_records)
+            self._wandb_log({
+                "global_rollout_episode": global_rollout_episode,
+                "group/global_rollout_episode": global_rollout_episode,
+                "group/global_update_step": update_step,
+                "group/reward_mean": group_stats["reward_mean"],
+                "group/reward_std": group_stats["reward_std"],
+                "group/reward_sum": group_stats["reward_sum"],
+                "group/success_rate": group_stats["success_rate"],
+                "group/success_count": group_stats["success_count"],
+                "group/size": group_stats["episode_count"],
+                "group/step_count_mean": group_stats["step_count_mean"],
+                "group/step_count_sum": group_stats["step_count_sum"],
+                "group/chunk_count_mean": group_stats["chunk_count_mean"],
+                "group/chunk_count_sum": group_stats["chunk_count_sum"],
+                "group/pending_ready_groups": float(len(grouped)),
+            })
+
+        logger.info(
+            "GRPO replicated rollout aggregate: step=%s episodes=%s groups=%s "
+            "success_rate=%.4f reward_mean=%.4f rank_episode_counts=%s",
+            update_step,
+            int(rollout_stats["episode_count"]),
+            len(grouped),
+            rollout_stats["success_rate"],
+            rollout_stats["reward_mean"],
+            rank_episode_counts,
+        )
+
     def _gather_sharded_rewards(
         self, groups: list[list]
     ) -> dict[str, dict[int, float]]:
@@ -2077,38 +2273,40 @@ class GRPOTrainingServer(VA_Server):
             self.global_rollout_episode += 1
             episode_idx = episode.metadata.get("episode_idx")
             group_member = episode.metadata.get("group_member")
-            self._wandb_log(
-                {
-                    "rollout/episode_reward": float(episode.reward),
-                    "rollout/episode_success": float(bool(episode.success)),
-                    "rollout/episode_step_count": float(episode.step_count or 0),
-                    "rollout/episode_chunks": len(episode.chunks),
-                    "rollout/ready_group": float(ready_group is not None),
-                    "rollout/active_sessions": len(self.rollout_store._active_by_session),
-                    "rollout/global_update_step": self.global_update_step,
-                    "rollout/global_rollout_episode": self.global_rollout_episode,
-                    "global_rollout_episode": self.global_rollout_episode,
-                },
-            )
+            if not getattr(self, "replicated_enabled", False):
+                self._wandb_log(
+                    {
+                        "rollout/episode_reward": float(episode.reward),
+                        "rollout/episode_success": float(bool(episode.success)),
+                        "rollout/episode_step_count": float(episode.step_count or 0),
+                        "rollout/episode_chunks": len(episode.chunks),
+                        "rollout/ready_group": float(ready_group is not None),
+                        "rollout/active_sessions": len(self.rollout_store._active_by_session),
+                        "rollout/global_update_step": self.global_update_step,
+                        "rollout/global_rollout_episode": self.global_rollout_episode,
+                        "global_rollout_episode": self.global_rollout_episode,
+                    },
+                )
             if ready_group is not None:
                 group_rewards = [float(ep.reward) for ep in ready_group]
                 group_successes = [1.0 if bool(ep.success) else 0.0 for ep in ready_group]
                 group_steps = [float(ep.step_count) for ep in ready_group if ep.step_count is not None]
                 group_chunks = [float(len(ep.chunks)) for ep in ready_group]
                 pending_ready_groups_after = len(self._pending_ready_groups) + (0 if self.disable_updates else 1)
-                self._wandb_log(
-                    {
-                        "group/reward_mean": float(torch.tensor(group_rewards).mean()) if group_rewards else 0.0,
-                        "group/reward_std": float(torch.tensor(group_rewards).std(unbiased=False)) if group_rewards else 0.0,
-                        "group/success_rate": float(sum(group_successes) / max(len(group_successes), 1)),
-                        "group/size": len(ready_group),
-                        "group/step_count_mean": float(torch.tensor(group_steps).mean()) if group_steps else 0.0,
-                        "group/pending_ready_groups": pending_ready_groups_after,
-                        "group/global_rollout_episode": self.global_rollout_episode,
-                        "group/global_update_step": self.global_update_step,
-                        "global_rollout_episode": self.global_rollout_episode,
-                    },
-                )
+                if not getattr(self, "replicated_enabled", False):
+                    self._wandb_log(
+                        {
+                            "group/reward_mean": float(torch.tensor(group_rewards).mean()) if group_rewards else 0.0,
+                            "group/reward_std": float(torch.tensor(group_rewards).std(unbiased=False)) if group_rewards else 0.0,
+                            "group/success_rate": float(sum(group_successes) / max(len(group_successes), 1)),
+                            "group/size": len(ready_group),
+                            "group/step_count_mean": float(torch.tensor(group_steps).mean()) if group_steps else 0.0,
+                            "group/pending_ready_groups": pending_ready_groups_after,
+                            "group/global_rollout_episode": self.global_rollout_episode,
+                            "group/global_update_step": self.global_update_step,
+                            "global_rollout_episode": self.global_rollout_episode,
+                        },
+                    )
                 if not self.disable_updates:
                     self._pending_ready_groups.append(ready_group)
                 logger.info(

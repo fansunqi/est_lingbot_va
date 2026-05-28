@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -55,6 +56,68 @@ def test_grpo_clipped_loss_returns_finite_stats():
     assert torch.isfinite(stats.ratio_mean)
     assert torch.isfinite(stats.clipfrac)
     assert torch.isfinite(stats.approx_kl)
+
+
+def test_replicated_sharded_minibatch_size_keeps_config_batch_global():
+    from src.rl.server import _resolve_grpo_minibatch_sizes
+
+    global_bs, local_bs = _resolve_grpo_minibatch_sizes(
+        {"batch_size": 4},
+        group_size=12,
+        rollout_groups_per_update=2,
+        world_size=2,
+        sharded_group_enabled=True,
+    )
+
+    assert global_bs == 4
+    assert local_bs == 2
+
+
+def test_replicated_sharded_minibatch_size_rejects_uneven_split():
+    from src.rl.server import _resolve_grpo_minibatch_sizes
+
+    with pytest.raises(ValueError, match="batch_size.*divisible"):
+        _resolve_grpo_minibatch_sizes(
+            {"batch_size": 5},
+            group_size=12,
+            rollout_groups_per_update=2,
+            world_size=2,
+            sharded_group_enabled=True,
+        )
+
+
+def test_single_rank_minibatch_size_is_unchanged():
+    from src.rl.server import _resolve_grpo_minibatch_sizes
+
+    global_bs, local_bs = _resolve_grpo_minibatch_sizes(
+        {"batch_size": 4},
+        group_size=12,
+        rollout_groups_per_update=2,
+        world_size=1,
+        sharded_group_enabled=False,
+    )
+
+    assert global_bs == 4
+    assert local_bs == 4
+
+
+def test_episode_summary_stats_aggregates_counts_and_means():
+    from src.rl.server import _episode_summary_stats
+
+    stats = _episode_summary_stats([
+        {"reward": 1.5, "success": True, "step_count": 10, "chunks": 2},
+        {"reward": 0.0, "success": False, "step_count": 20, "chunks": 4},
+    ])
+
+    assert stats["episode_count"] == 2.0
+    assert stats["success_count"] == 1.0
+    assert stats["success_rate"] == 0.5
+    assert stats["reward_sum"] == 1.5
+    assert stats["reward_mean"] == 0.75
+    assert stats["step_count_sum"] == 30.0
+    assert stats["step_count_mean"] == 15.0
+    assert stats["chunk_count_sum"] == 6.0
+    assert stats["chunk_count_mean"] == 3.0
 
 
 def _make_fake_grpo_server(*, noise_schedule="per_step"):

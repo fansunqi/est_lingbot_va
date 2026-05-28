@@ -15,7 +15,7 @@ set -euo pipefail
 # memory-sharded single logical server use ..._fsdp.sh; for fully independent
 # (non-synchronized) servers use ..._split.sh.
 
-CONFIG=${CONFIG:-configs/rl/robotwin_grpo_turn_switch_check.yaml}
+CONFIG=${CONFIG:-configs/rl/robotwin_grpo_turn_switch_fast.yaml}
 PORT=${PORT:-29546}
 SAVE_ROOT=${SAVE_ROOT:-experiments/robotwin_grpo_ddp}
 NPROC_PER_NODE=${NPROC_PER_NODE:-2}
