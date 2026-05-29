@@ -91,7 +91,7 @@ trap cleanup EXIT
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
 PYTHONUNBUFFERED=1 \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-setsid "${UV}" run torchrun \
+setsid "${UV}" run --active torchrun \
   --standalone \
   --nproc_per_node="${NPROC_PER_NODE}" \
   --master_port="${MASTER_PORT}" \

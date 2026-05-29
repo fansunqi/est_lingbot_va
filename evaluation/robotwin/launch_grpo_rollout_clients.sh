@@ -18,6 +18,7 @@ SKIP_RENDER_CHECK=${SKIP_RENDER_CHECK:-1}
 GROUP_BARRIER=${GROUP_BARRIER:-0}
 GROUP_BARRIER_TIMEOUT=${GROUP_BARRIER_TIMEOUT:-0}
 SAVE_VISUALIZATION=${SAVE_VISUALIZATION:-none}
+SAVE_EVAL_VISUALIZATION=${SAVE_EVAL_VISUALIZATION:-none}
 MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-}
 NUM_PASSES=${NUM_PASSES:-1}
 EVAL_ONLY=${EVAL_ONLY:-0}
@@ -131,6 +132,7 @@ for CLIENT_ID in $(seq 0 $((NUM_CLIENTS - 1))); do
     $([[ "${EVAL_ONLY}" == "1" ]] && printf '%s' '--eval_only') \
     --task_config "${TASK_CONFIG}" \
     --save_visualization "${SAVE_VISUALIZATION}" \
+    --save_eval_visualization "${SAVE_EVAL_VISUALIZATION}" \
     $([[ -n "${MAX_EPISODE_STEPS}" ]] && printf -- '--max_episode_steps %s' "${MAX_EPISODE_STEPS}") \
     $([[ "${GROUP_BARRIER}" == "1" ]] && printf '%s' '--group_barrier') \
     --group_barrier_timeout "${GROUP_BARRIER_TIMEOUT}" \

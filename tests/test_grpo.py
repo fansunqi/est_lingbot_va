@@ -4,6 +4,8 @@ from torch import nn
 
 from src.rl.grpo import (
     compute_group_advantages,
+    compute_flow_grpo_logprob,
+    flow_grpo_sde_step,
     gaussian_logprob,
     grpo_clipped_loss,
     sample_gaussian_transition,
@@ -56,6 +58,85 @@ def test_grpo_clipped_loss_returns_finite_stats():
     assert torch.isfinite(stats.ratio_mean)
     assert torch.isfinite(stats.clipfrac)
     assert torch.isfinite(stats.approx_kl)
+
+
+def test_flow_grpo_sde_step_matches_recomputed_logprob_and_kl_shape():
+    class _Model(nn.Module):
+        def __init__(self, scale: float):
+            super().__init__()
+            self.scale = scale
+
+        def forward(self, x, t, cond):
+            return x * self.scale + cond
+
+    x_t = torch.randn(2, 3, 4, 5)
+    cond = torch.full_like(x_t, 0.1)
+    t = torch.tensor([0.8, 0.4])
+    dt = torch.tensor([-0.1, -0.05])
+    eps = torch.randn_like(x_t)
+    model = _Model(0.2)
+    ref_model = _Model(0.1)
+
+    out = flow_grpo_sde_step(
+        x_t,
+        t,
+        dt,
+        model,
+        cond,
+        noise_level=0.7,
+        eps=eps,
+        return_logprob=True,
+        ref_model=ref_model,
+        logprob_reduce="sum",
+    )
+    recomputed = compute_flow_grpo_logprob(
+        x_t,
+        out["x_next"],
+        t,
+        dt,
+        model,
+        cond,
+        noise_level=0.7,
+        logprob_reduce="sum",
+    )
+
+    assert out["x_next"].shape == x_t.shape
+    assert out["std"].shape == (2, 1, 1, 1)
+    assert out["logprob"].shape == (2,)
+    assert out["kl_ref"].shape == (2,)
+    assert torch.allclose(out["logprob"], recomputed)
+
+
+def test_flow_grpo_logprob_reduce_mean_scales_over_non_batch_dims():
+    class _ZeroModel(nn.Module):
+        def forward(self, x, t, cond):
+            return torch.zeros_like(x)
+
+    x_t = torch.randn(1, 2, 3)
+    t = torch.tensor([0.5])
+    dt = torch.tensor([-0.25])
+    eps = torch.randn_like(x_t)
+    out = flow_grpo_sde_step(
+        x_t,
+        t,
+        dt,
+        _ZeroModel(),
+        None,
+        eps=eps,
+        return_logprob=True,
+        logprob_reduce="sum",
+    )
+    lp_mean = compute_flow_grpo_logprob(
+        x_t,
+        out["x_next"],
+        t,
+        dt,
+        _ZeroModel(),
+        None,
+        logprob_reduce="mean",
+    )
+
+    assert torch.allclose(lp_mean * x_t[0].numel(), out["logprob"])
 
 
 def test_replicated_sharded_minibatch_size_keeps_config_batch_global():
@@ -137,7 +218,9 @@ def _make_fake_grpo_server(*, noise_schedule="per_step"):
     server.noise_schedule = noise_schedule
     server.normalize_denoising_horizon = True
     server.normalize_action_dim = True
-    server.action_noise_std = 0.05
+    server.logprob_reduce = "mean"
+    server.flow_grpo_noise_level = 0.7
+    server.flow_t_eps = 1e-5
     server.frame_st_id = 0
     server.cache_name = "test"
     server.action_mask = torch.ones(30, dtype=torch.bool)

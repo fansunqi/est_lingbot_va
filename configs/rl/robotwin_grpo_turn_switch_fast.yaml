@@ -64,14 +64,17 @@ rl:
     type: sparse_success
 
   use_fsdp: false
-  group_size: 12
+  group_size: 16
   # 2026-05-23: 2 → 4,episodes/update 从 16 升到 32,
   # 减半 advantage 的 Bernoulli 噪声(σ 从 0.18 → 0.12)。
   rollout_groups_per_update: 2
   update_epochs: 1
   batch_size: 4
 
-  action_noise_std: 0.05
+  # Flow-GRPO SDE noise scale a in sigma_t = a * sqrt(t / (1 - t)).
+  flow_grpo_noise_level: 0.7
+  flow_t_eps: 1.0e-5
+  log_ratio_clip: 20.0
   # 2026-05-23: 回到 PPO 默认 per-element 信任域(配合下方 normalize_* 全开)。
   clip_range: 0.2
   target_kl: 0.1
@@ -128,7 +131,7 @@ rl:
   logprob:
     # 2026-05-23: 回到 per-element 归一化,匹配 clip_range=0.2 / target_kl=0.1。
     normalize_denoising_horizon: true
-    normalize_action_dim: true
+    reduce: mean
     normalize_episode_length: true
 
   disable_updates: false

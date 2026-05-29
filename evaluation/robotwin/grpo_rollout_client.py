@@ -17,7 +17,7 @@ if os.environ.get("CONDA_DEFAULT_ENV") != "RoboTwin" and not os.environ.get("ALL
         "if your RoboTwin environment has another name."
     )
 
-robowin_root = Path("/root/WAM/RoboTwin")
+robowin_root = Path("/apdcephfs_cq8/share_1611098/stevefan/robotics/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 os.chdir(robowin_root)
@@ -103,6 +103,7 @@ def run_one_grpo_episode(
     visualization_mode: str,
     max_episode_steps: int | None = None,
     is_eval: bool = False,
+    video_prefix: str | None = None,
 ) -> dict:
     episode_start = time.monotonic()
     TASK_ENV.setup_demo(now_ep_num=0, seed=seed, is_test=True, **args)
@@ -194,7 +195,8 @@ def run_one_grpo_episode(
     ):
         vis_dir = Path(save_root) / "visualization" / task_name
         vis_dir.mkdir(parents=True, exist_ok=True)
-        video_name = f"{episode_idx}_member{group_member}_{prompt.replace(' ', '_')}_{succ}.mp4"
+        prefix = f"{video_prefix}_" if video_prefix else ""
+        video_name = f"{prefix}{episode_idx}_member{group_member}_{prompt.replace(' ', '_')}_{succ}.mp4"
         video_path = vis_dir / video_name
 
         from evaluation.robotwin.eval_polict_client_openpi import save_comparison_video
@@ -437,9 +439,10 @@ def run_eval_pass(
                 episode_idx=episode_idx,
                 group_member=0,
                 save_root=str(run_dir),
-                visualization_mode="none",
+                visualization_mode=args.save_eval_visualization,
                 max_episode_steps=args.max_episode_steps,
                 is_eval=True,
+                video_prefix=f"eval_step{global_update_step:06d}_item{item_idx_in_pass}",
             )
             succ = bool(episode_result["success"])
             successes += int(succ)
@@ -452,11 +455,13 @@ def run_eval_pass(
                 "success": succ,
                 "step_count": episode_result["step_count"],
                 "elapsed_s": episode_result["elapsed_s"],
+                "video_path": episode_result["video_path"],
             })
+            video_msg = episode_result["video_path"] or "disabled"
             print(
                 f"[eval] item={item_idx_in_pass} task={task_name} seed={seed} "
                 f"success={succ} steps={episode_result['step_count']} "
-                f"elapsed_s={episode_result['elapsed_s']:.1f}"
+                f"elapsed_s={episode_result['elapsed_s']:.1f} video={video_msg}"
             )
         except Exception as exc:
             traceback.print_exc()
@@ -674,9 +679,16 @@ def main():
         default=os.environ.get("GRPO_SAVE_VISUALIZATION", "none"),
         help="Rollout video policy: none, all, success, failure, or every_N. Default: none",
     )
+    parser.add_argument(
+        "--save_eval_visualization",
+        type=str,
+        default=os.environ.get("GRPO_SAVE_EVAL_VISUALIZATION", "none"),
+        help="Eval video policy: none, all, success, failure, or every_N. Default: none",
+    )
     args = parser.parse_args()
     try:
         should_save_visualization(args.save_visualization, success=False, episode_idx=1)
+        should_save_visualization(args.save_eval_visualization, success=False, episode_idx=1)
     except ValueError as exc:
         parser.error(str(exc))
     if os.environ.get("GRPO_SHOW_ENV_STEPS") != "1":

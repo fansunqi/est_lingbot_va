@@ -31,7 +31,8 @@ from src.distributed.util import init_distributed
 from src.inference.server import VA_Server, _show_denoise_progress, load_inference_config
 from src.rl.grpo import (
     compute_group_advantages,
-    gaussian_logprob,
+    flow_grpo_gaussian_logprob,
+    flow_grpo_sde_transition,
     grpo_clipped_loss,
     scheduler_transition_mean,
 )
@@ -291,8 +292,17 @@ class GRPOTrainingServer(VA_Server):
             self.optimizer = torch.optim.AdamW(self.trainable_params, lr=lr, betas=betas, weight_decay=weight_decay)
         self.scheduler_lr = None
 
-        self.action_noise_std = float(self.rl_cfg.get("action_noise_std", 0.05))
+        # Flow-GRPO ODE-to-SDE noise scale ``a`` in sigma_t = a * sqrt(t / (1 - t)).
+        # Legacy ``action_noise_std`` no longer controls rollout noise; the
+        # transition std now comes from sigma_t * sqrt(abs(dt)).
+        self.flow_grpo_noise_level = float(
+            self.rl_cfg.get("flow_grpo_noise_level", self.rl_cfg.get("noise_level", 0.7))
+        )
+        self.flow_t_eps = float(self.rl_cfg.get("flow_t_eps", 1e-5))
         self.clip_range = float(self.rl_cfg.get("clip_range", 0.2))
+        self.log_ratio_clip = self.rl_cfg.get("log_ratio_clip", 20.0)
+        self.log_ratio_clip = None if self.log_ratio_clip is None else float(self.log_ratio_clip)
+        self.beta_kl = float(self.rl_cfg.get("beta_kl", 0.0))
         self.entropy_coef = float(self.rl_cfg.get("entropy_coef", 0.0))
         self.target_kl = self.rl_cfg.get("target_kl", None)
         self.target_kl = None if self.target_kl is None else float(self.target_kl)
@@ -320,9 +330,17 @@ class GRPOTrainingServer(VA_Server):
         self.normalize_denoising_horizon = bool(
             self.rl_cfg.get("logprob", {}).get("normalize_denoising_horizon", True)
         )
-        self.normalize_action_dim = bool(
-            self.rl_cfg.get("logprob", {}).get("normalize_action_dim", True)
-        )
+        logprob_cfg = self.rl_cfg.get("logprob", {}) or {}
+        if "reduce" in logprob_cfg:
+            self.logprob_reduce = str(logprob_cfg.get("reduce", "mean")).lower()
+            if self.logprob_reduce not in ("sum", "mean"):
+                raise ValueError(
+                    f"rl.logprob.reduce must be 'sum' or 'mean', got {self.logprob_reduce!r}"
+                )
+            self.normalize_action_dim = self.logprob_reduce == "mean"
+        else:
+            self.normalize_action_dim = bool(logprob_cfg.get("normalize_action_dim", True))
+            self.logprob_reduce = "mean" if self.normalize_action_dim else "sum"
         # When True, trajectory logprob is mean-over-chunks instead of sum-over-chunks.
         # This removes length-vs-reward correlation bias: with sum, failed episodes
         # (long, ~13 chunks) dominate the per-trajectory logprob magnitude vs successful
@@ -348,7 +366,8 @@ class GRPOTrainingServer(VA_Server):
         self._init_wandb()
         logger.info(
             "GRPO server ready: group_size=%s local_group_size=%s sharded=%s "
-            "update_epochs=%s action_noise_std=%s noise_schedule=%s "
+            "update_epochs=%s flow_grpo_noise_level=%s flow_t_eps=%s logprob_reduce=%s "
+            "noise_schedule=%s "
             "disable_updates=%s train_action_steps=%s eval_action_steps=%s "
             "global_batch_size=%s local_batch_size=%s "
             "diagnose_update_effect=%s",
@@ -356,7 +375,9 @@ class GRPOTrainingServer(VA_Server):
             self.local_group_size,
             self.sharded_group_enabled,
             self.update_epochs,
-            self.action_noise_std,
+            self.flow_grpo_noise_level,
+            self.flow_t_eps,
+            self.logprob_reduce,
             self.noise_schedule,
             self.disable_updates,
             int(self.job_config.action_num_inference_steps),
@@ -458,9 +479,46 @@ class GRPOTrainingServer(VA_Server):
             mask[:, :, 0:1] = False
         return mask
 
-    def _sample_action_transition(self, mean: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
-        noise = torch.randn(mean.shape, device=mean.device, dtype=mean.dtype, generator=generator)
-        return mean + noise * self.action_noise_std
+    def _flow_time(self, timestep: torch.Tensor) -> torch.Tensor:
+        return timestep.to(device=self.device, dtype=self.dtype) / float(self.action_scheduler.num_train_timesteps)
+
+    def _flow_dt(self, timestep: torch.Tensor, next_timestep: torch.Tensor) -> torch.Tensor:
+        return (
+            next_timestep.to(device=self.device, dtype=self.dtype)
+            - timestep.to(device=self.device, dtype=self.dtype)
+        ) / float(self.action_scheduler.num_train_timesteps)
+
+    def _flow_dt_for_stored_timestep(self, timestep: torch.Tensor) -> torch.Tensor:
+        scheduler_timesteps = self.action_scheduler.timesteps.to(device=self.device, dtype=self.dtype)
+        timestep_d = timestep.to(device=self.device, dtype=self.dtype)
+        timestep_id = torch.argmin((scheduler_timesteps - timestep_d).abs())
+        if int(timestep_id) + 1 >= scheduler_timesteps.numel():
+            next_timestep = torch.zeros_like(timestep_d)
+        else:
+            next_timestep = scheduler_timesteps[int(timestep_id) + 1]
+        return self._flow_dt(timestep_d, next_timestep)
+
+    def _flow_grpo_action_transition(
+        self,
+        actions: torch.Tensor,
+        timestep: torch.Tensor,
+        dt: torch.Tensor,
+        velocity: torch.Tensor,
+        *,
+        eps: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        transition = flow_grpo_sde_transition(
+            actions,
+            self._flow_time(timestep),
+            dt,
+            velocity,
+            noise_level=self.flow_grpo_noise_level,
+            t_eps=self.flow_t_eps,
+        )
+        if eps is not None:
+            transition["x_next"] = transition["mean"] + transition["std"] * eps
+            transition["eps"] = eps
+        return transition
 
     def _action_transformer_step(
         self,
@@ -470,9 +528,9 @@ class GRPOTrainingServer(VA_Server):
         *,
         last_step: bool,
     ):
-        """Run one action-mode transformer forward and (if not last_step) the scheduler mean.
+        """Run one action-mode transformer forward and return the RF velocity.
 
-        Returns ``(mean, action_cond)``. ``mean`` is None when ``last_step`` is True — that
+        Returns ``(v_theta, action_cond)``. ``v_theta`` is None when ``last_step`` is True — that
         call's sole purpose is to update the KV cache with the final denoised actions.
         """
         action_cond = torch.zeros(
@@ -501,8 +559,7 @@ class GRPOTrainingServer(VA_Server):
             action_noise_pred, "b (f n) c -> b c f n 1", f=self.job_config.frame_chunk_size
         )
         action_noise_pred = action_noise_pred[:1]
-        mean = scheduler_transition_mean(self.action_scheduler, action_noise_pred, t, actions)
-        return mean, action_cond
+        return action_noise_pred, action_cond
 
     def _run_video_prefix(self, obs, frame_st_id: int, latent_noise: torch.Tensor | None = None) -> torch.Tensor:
         frame_chunk_size = self.job_config.frame_chunk_size
@@ -623,6 +680,9 @@ class GRPOTrainingServer(VA_Server):
         )
         self.action_scheduler.set_timesteps(action_num_inference_steps)
         action_timesteps = F.pad(self.action_scheduler.timesteps, (0, 1), mode="constant", value=0)
+        action_dts = (
+            action_timesteps[1:] - action_timesteps[:-1]
+        ) / float(self.action_scheduler.num_train_timesteps)
         mask = self._action_logprob_mask(frame_st_id, actions)
 
         per_chunk = self.noise_schedule == "per_chunk"
@@ -636,15 +696,17 @@ class GRPOTrainingServer(VA_Server):
             action_chain: list[torch.Tensor] = []
             transition_logprobs: list[torch.Tensor] = []
             stored_timesteps: list[torch.Tensor] = []
+            stored_dts: list[torch.Tensor] = []
         else:
             action_chain = [actions.detach().cpu()]
             transition_logprobs = []
             stored_timesteps = None  # fall back to action_timesteps[:-1] at the end
+            stored_dts = None  # fall back to action_dts at the end
 
         with torch.no_grad():
             for i, t in enumerate(tqdm(action_timesteps, disable=not _show_denoise_progress())):
                 last_step = i == len(action_timesteps) - 1
-                mean, action_cond = self._action_transformer_step(
+                v_theta, action_cond = self._action_transformer_step(
                     actions, t, frame_st_id, last_step=last_step,
                 )
                 if last_step:
@@ -653,28 +715,42 @@ class GRPOTrainingServer(VA_Server):
                     continue
 
                 if eval_mode or (per_chunk and i < final_noise_idx):
-                    # Deterministic step: actions = mean, no noise, no logprob.
+                    # Deterministic ODE step: actions = scheduler mean, no noise, no logprob.
                     # eval_mode applies this to every step including the final
                     # noise-bearing one, so the trajectory matches plain
                     # deterministic inference under the same LoRA weights.
-                    next_actions = mean
+                    next_actions = scheduler_transition_mean(self.action_scheduler, v_theta, t, actions)
                     next_actions[:, ~self.action_mask] *= 0
                     if action_cond is not None:
                         next_actions[:, :, 0:1] = action_cond
                     actions = next_actions
                     continue
 
-                # Noise-bearing transition.
-                next_actions = self._sample_action_transition(mean, generator)
+                # Noise-bearing Flow-GRPO SDE transition.
+                dt = action_dts[i].to(device=self.device, dtype=self.dtype)
+                eps = torch.randn(
+                    actions.shape,
+                    device=actions.device,
+                    dtype=actions.dtype,
+                    generator=generator,
+                )
+                transition = self._flow_grpo_action_transition(
+                    actions,
+                    t,
+                    dt,
+                    v_theta,
+                    eps=eps,
+                )
+                next_actions = transition["x_next"]
                 next_actions[:, ~self.action_mask] *= 0
                 if action_cond is not None:
                     next_actions[:, :, 0:1] = action_cond
-                lp = gaussian_logprob(
+                lp = flow_grpo_gaussian_logprob(
                     next_actions,
-                    mean,
-                    self.action_noise_std,
+                    transition["mean"],
+                    transition["std"],
                     mask=mask,
-                    normalize_action_dim=self.normalize_action_dim,
+                    logprob_reduce=self.logprob_reduce,
                 )
 
                 if per_chunk:
@@ -682,6 +758,7 @@ class GRPOTrainingServer(VA_Server):
                     action_chain.append(actions.detach().cpu())
                     action_chain.append(next_actions.detach().cpu())
                     stored_timesteps.append(t.detach().cpu().reshape(1))
+                    stored_dts.append(dt.detach().cpu().reshape(1))
                     transition_logprobs.append(lp.detach().cpu())
                 else:
                     transition_logprobs.append(lp.detach().cpu())
@@ -691,24 +768,30 @@ class GRPOTrainingServer(VA_Server):
 
         actions[:, ~self.action_mask] *= 0
         if eval_mode:
-            old_logprob = torch.zeros(1)
+            old_logprobs_tensor = torch.zeros(1)
+            old_logprob_summary = torch.zeros(1)
             stored_timesteps_tensor = torch.empty(0, dtype=action_timesteps.dtype)
+            stored_dts_tensor = torch.empty(0, dtype=action_dts.dtype)
         elif per_chunk:
             assert len(transition_logprobs) == 1, "per_chunk mode must produce exactly one logprob term"
-            old_logprob = transition_logprobs[0]
+            old_logprobs_tensor = torch.stack(transition_logprobs, dim=0)
+            old_logprob_summary = transition_logprobs[0]
             stored_timesteps_tensor = torch.cat(stored_timesteps, dim=0)
+            stored_dts_tensor = torch.cat(stored_dts, dim=0)
         else:
-            old_logprob = torch.stack(transition_logprobs).sum(dim=0)
+            old_logprobs_tensor = torch.stack(transition_logprobs, dim=0)
+            old_logprob_summary = old_logprobs_tensor.sum(dim=0)
             if self.normalize_denoising_horizon and transition_logprobs:
-                old_logprob = old_logprob / len(transition_logprobs)
+                old_logprob_summary = old_logprob_summary / len(transition_logprobs)
             stored_timesteps_tensor = action_timesteps[:-1].detach().cpu()
+            stored_dts_tensor = action_dts.detach().cpu()
         env_action = self.postprocess_action(actions)
         logger.debug(
             "GRPO sample_action done: frame_st_id=%s elapsed_ms=%.1f old_logprob=%.6f "
             "noise_schedule=%s eval_mode=%s action_steps=%s",
             frame_st_id,
             (time.monotonic() - infer_start) * 1000,
-            float(old_logprob.mean()),
+            float(old_logprob_summary.mean()),
             self.noise_schedule,
             eval_mode,
             action_num_inference_steps,
@@ -718,38 +801,53 @@ class GRPOTrainingServer(VA_Server):
             frame_st_id=frame_st_id,
             latent_noise=latent_noise.detach().cpu(),
             action_chain=action_chain,
-            old_logprobs=old_logprob.detach().cpu(),
+            old_logprobs=old_logprobs_tensor.detach().cpu(),
             action_timesteps=stored_timesteps_tensor,
             action_mask=mask.detach().cpu(),
             env_action=env_action,
+            action_dts=stored_dts_tensor,
         )
 
     def _recompute_chunk_logprob(self, chunk: RolloutChunk) -> torch.Tensor:
         self._run_video_prefix(chunk.obs, chunk.frame_st_id, latent_noise=chunk.latent_noise)
-        frame_chunk_size = self.job_config.frame_chunk_size
         action_timesteps = chunk.action_timesteps.to(self.device)
+        action_dts = (
+            chunk.action_dts.to(self.device)
+            if getattr(chunk, "action_dts", None) is not None and chunk.action_dts.numel() > 0
+            else None
+        )
         action_chain = [x.to(self.device, dtype=self.dtype) for x in chunk.action_chain]
         mask = chunk.action_mask.to(self.device)
+        self.action_scheduler.set_timesteps(self.job_config.action_num_inference_steps)
 
         per_chunk = action_timesteps.numel() == 1
         if per_chunk:
             assert len(action_chain) == 2, (
                 f"per_chunk chunk expected action_chain of length 2, got {len(action_chain)}"
             )
-            # Rebuild sigma schedule used by scheduler.step; FlowMatchScheduler is stateless beyond that.
-            self.action_scheduler.set_timesteps(self.job_config.action_num_inference_steps)
             t = action_timesteps[0]
+            dt = (
+                action_dts[0].to(device=self.device, dtype=self.dtype)
+                if action_dts is not None
+                else self._flow_dt_for_stored_timestep(t)
+            )
             actions_prev = action_chain[0]
             next_actions = action_chain[1]
-            mean, _ = self._action_transformer_step(
+            v_theta, _ = self._action_transformer_step(
                 actions_prev, t, chunk.frame_st_id, last_step=False,
             )
-            lp = gaussian_logprob(
+            transition = self._flow_grpo_action_transition(
+                actions_prev,
+                t,
+                dt,
+                v_theta,
+            )
+            lp = flow_grpo_gaussian_logprob(
                 next_actions,
-                mean,
-                self.action_noise_std,
+                transition["mean"],
+                transition["std"],
                 mask=mask,
-                normalize_action_dim=self.normalize_action_dim,
+                logprob_reduce=self.logprob_reduce,
             )
             # Mirror rollout's last_step cache write (see per_step branch below
             # for the full rationale): without it the per_chunk recompute would
@@ -765,34 +863,29 @@ class GRPOTrainingServer(VA_Server):
         for i, t in enumerate(action_timesteps):
             actions = action_chain[i]
             next_actions = action_chain[i + 1]
-            input_dict = self._prepare_latent_input(
-                None,
+            dt = (
+                action_dts[i].to(device=self.device, dtype=self.dtype)
+                if action_dts is not None
+                else self._flow_dt_for_stored_timestep(t)
+            )
+            v_theta, _ = self._action_transformer_step(
                 actions,
                 t,
+                chunk.frame_st_id,
+                last_step=False,
+            )
+            transition = self._flow_grpo_action_transition(
+                actions,
                 t,
-                None,
-                torch.zeros(
-                    [1, self.job_config.action_dim, 1, self.action_per_frame, 1],
-                    device=self.device,
-                    dtype=self.dtype,
-                ) if chunk.frame_st_id == 0 else None,
-                frame_st_id=chunk.frame_st_id,
+                dt,
+                v_theta,
             )
-            action_noise_pred = self.transformer(
-                self._repeat_input_for_cfg(input_dict["action_res_lst"]),
-                update_cache=0,
-                cache_name=self.cache_name,
-                action_mode=True,
-            )
-            action_noise_pred = rearrange(action_noise_pred, "b (f n) c -> b c f n 1", f=frame_chunk_size)
-            action_noise_pred = action_noise_pred[:1]
-            mean = scheduler_transition_mean(self.action_scheduler, action_noise_pred, t, actions)
-            lp = gaussian_logprob(
+            lp = flow_grpo_gaussian_logprob(
                 next_actions,
-                mean,
-                self.action_noise_std,
+                transition["mean"],
+                transition["std"],
                 mask=mask,
-                normalize_action_dim=self.normalize_action_dim,
+                logprob_reduce=self.logprob_reduce,
             )
             transition_logprobs.append(lp)
 
@@ -1049,6 +1142,8 @@ class GRPOTrainingServer(VA_Server):
                     mb_old_logprobs,
                     mb_advantages,
                     clip_range=self.clip_range,
+                    log_ratio_clip=self.log_ratio_clip,
+                    beta_kl=self.beta_kl,
                     entropy_coef=self.entropy_coef,
                 )
                 # Per-episode PPO surrogate gradient wrt new_logprob,
@@ -1060,9 +1155,13 @@ class GRPOTrainingServer(VA_Server):
                 #   otherwise        → grad = -ratio * adv / B
                 # The 1/B factor matches ``.mean()`` in grpo_clipped_loss so
                 # gradient magnitudes are unchanged.
-                ratio_for_grad = torch.exp(
-                    mb_new_logprobs_detached.float() - mb_old_logprobs.float()
-                )
+                log_ratio_for_grad = mb_new_logprobs_detached.float() - mb_old_logprobs.float()
+                if self.log_ratio_clip is not None:
+                    log_ratio_for_grad = log_ratio_for_grad.clamp(
+                        -self.log_ratio_clip,
+                        self.log_ratio_clip,
+                    )
+                ratio_for_grad = torch.exp(log_ratio_for_grad)
                 adv_f32 = mb_advantages.float()
                 clipped_high = (adv_f32 > 0) & (ratio_for_grad > 1.0 + self.clip_range)
                 clipped_low = (adv_f32 < 0) & (ratio_for_grad < 1.0 - self.clip_range)
@@ -1668,7 +1767,17 @@ class GRPOTrainingServer(VA_Server):
     def _episode_old_logprobs(self, episodes) -> torch.Tensor:
         result = []
         for ep in episodes:
-            chunk_lps = torch.stack([chunk.old_logprobs.reshape(-1)[0] for chunk in ep.chunks])
+            chunk_lps = []
+            for chunk in ep.chunks:
+                transition_lps = chunk.old_logprobs.reshape(-1)
+                if transition_lps.numel() == 0:
+                    chunk_lps.append(torch.zeros((), dtype=torch.float32))
+                    continue
+                chunk_lp = transition_lps.sum()
+                if self.normalize_denoising_horizon and transition_lps.numel() > 1:
+                    chunk_lp = chunk_lp / transition_lps.numel()
+                chunk_lps.append(chunk_lp)
+            chunk_lps = torch.stack(chunk_lps)
             if self.normalize_episode_length and chunk_lps.numel() > 0:
                 result.append(chunk_lps.mean())
             else:
@@ -1741,7 +1850,11 @@ class GRPOTrainingServer(VA_Server):
         ws = float(self.world_size)
         for param in self.trainable_params:
             if param.grad is None:
-                continue
+                # A rank can have an all-clipped minibatch and skip backward,
+                # while peer ranks still have real gradients. All ranks must
+                # still enter the exact same all-reduce sequence; this rank's
+                # contribution is simply zero.
+                param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
             param.grad.div_(ws)
 
@@ -1757,6 +1870,7 @@ class GRPOTrainingServer(VA_Server):
         local_records: list[dict[str, Any]] = []
         for group in groups:
             for episode in group or []:
+                metadata = getattr(episode, "metadata", {}) or {}
                 local_records.append({
                     "server_rank": int(self.rank),
                     "group_id": str(getattr(episode, "group_id", "")),
@@ -1764,6 +1878,8 @@ class GRPOTrainingServer(VA_Server):
                     "success": bool(getattr(episode, "success", False)),
                     "step_count": int(getattr(episode, "step_count", 0) or 0),
                     "chunks": int(len(getattr(episode, "chunks", []) or [])),
+                    "episode_idx": metadata.get("episode_idx"),
+                    "group_member": metadata.get("group_member"),
                 })
 
         if not getattr(self, "replicated_enabled", False):
@@ -1810,14 +1926,51 @@ class GRPOTrainingServer(VA_Server):
             group_id = str(record.get("group_id", ""))
             grouped.setdefault(group_id, []).append(record)
 
+        def _optional_int(value: Any) -> int | None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _rollout_record_sort_key(item: tuple[int, dict[str, Any]]) -> tuple:
+            original_pos, record = item
+            episode_idx = _optional_int(record.get("episode_idx"))
+            group_member = _optional_int(record.get("group_member"))
+            return (
+                episode_idx is None,
+                episode_idx if episode_idx is not None else original_pos,
+                int(record.get("server_rank", -1)),
+                str(record.get("group_id", "")),
+                group_member if group_member is not None else -1,
+                original_pos,
+            )
+
+        indexed_records = list(enumerate(records))
+        ordered_records = [
+            record for _, record in sorted(indexed_records, key=_rollout_record_sort_key)
+        ]
+        # Reconstruct a monotonically increasing per-episode x-axis for W&B.
+        first_rollout_episode = max(int(global_rollout_episode) - len(ordered_records) + 1, 1)
+        for offset, record in enumerate(ordered_records):
+            episode_rollout_idx = float(first_rollout_episode + offset)
+            self._wandb_log({
+                "global_rollout_episode": episode_rollout_idx,
+                "rollout/global_rollout_episode": episode_rollout_idx,
+                "rollout/global_update_step": update_step,
+                "rollout/episode_reward": float(record.get("reward", 0.0)),
+                "rollout/episode_success": float(bool(record.get("success", False))),
+                "rollout/episode_step_count": float(record.get("step_count", 0.0)),
+                "rollout/episode_chunks": float(record.get("chunks", 0.0)),
+            })
+
         self._wandb_log({
             "global_rollout_episode": global_rollout_episode,
             "rollout/global_rollout_episode": global_rollout_episode,
             "rollout/global_update_step": update_step,
-            "rollout/episode_reward": rollout_stats["reward_mean"],
-            "rollout/episode_success": rollout_stats["success_rate"],
-            "rollout/episode_step_count": rollout_stats["step_count_mean"],
-            "rollout/episode_chunks": rollout_stats["chunk_count_mean"],
+            "rollout/reward_mean": rollout_stats["reward_mean"],
+            "rollout/success_rate": rollout_stats["success_rate"],
+            "rollout/step_count_mean": rollout_stats["step_count_mean"],
+            "rollout/chunk_count_mean": rollout_stats["chunk_count_mean"],
             "rollout/episode_count": rollout_stats["episode_count"],
             "rollout/success_count": rollout_stats["success_count"],
             "rollout/reward_sum": rollout_stats["reward_sum"],

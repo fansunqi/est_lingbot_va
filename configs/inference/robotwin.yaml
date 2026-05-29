@@ -1,7 +1,7 @@
 mode: server
 
 # Model
-model_name_or_path: /root/autodl-tmp/WAM/lingbot-va-posttrain-robotwin/
+model_name_or_path: /apdcephfs_tj5/share_303547874/stevefan/hf_home_new/hub/lingbot-va-posttrain-robotwin/
 param_dtype: bfloat16
 patch_size: [1, 2, 2]
 enable_offload: false

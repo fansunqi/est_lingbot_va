@@ -28,10 +28,10 @@ class RolloutChunk:
     Field shapes depend on ``rl.noise_schedule`` used at sampling time:
 
     - ``per_step``: ``action_chain`` has length T+1 (initial random actions and
-      every denoised state); ``action_timesteps`` has length T.
+      every denoised state); ``action_timesteps`` and ``action_dts`` have length T.
     - ``per_chunk``: ``action_chain`` has length 2 (the input to the final
-      scheduler step and the noisy output); ``action_timesteps`` has length 1
-      (the single noise-bearing timestep).
+      scheduler step and the noisy output); ``action_timesteps`` and
+      ``action_dts`` have length 1 (the single noise-bearing timestep).
 
     The consumer (``_recompute_chunk_logprob``) branches on
     ``action_timesteps.numel() == 1`` to detect ``per_chunk``.
@@ -45,6 +45,7 @@ class RolloutChunk:
     action_timesteps: torch.Tensor
     action_mask: torch.Tensor
     env_action: Any
+    action_dts: torch.Tensor | None = None
     keyframes: list[dict[str, Any]] | None = None
     state: Any | None = None
 
