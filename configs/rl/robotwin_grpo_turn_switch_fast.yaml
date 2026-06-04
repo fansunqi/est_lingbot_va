@@ -64,16 +64,16 @@ rl:
     type: sparse_success
 
   use_fsdp: false
-  group_size: 16
+  group_size: 32
   # 2026-05-23: 2 → 4,episodes/update 从 16 升到 32,
   # 减半 advantage 的 Bernoulli 噪声(σ 从 0.18 → 0.12)。
   rollout_groups_per_update: 2
   update_epochs: 1
-  batch_size: 4
+  batch_size: 8
 
   # Flow-GRPO SDE noise scale a in sigma_t = a * sqrt(t / (1 - t)).
-  flow_grpo_noise_level: 0.7
-  flow_t_eps: 1.0e-5
+  flow_grpo_noise_level: 1.0
+  flow_t_eps: 0.1
   log_ratio_clip: 20.0
   # 2026-05-23: 回到 PPO 默认 per-element 信任域(配合下方 normalize_* 全开)。
   clip_range: 0.2
@@ -119,12 +119,12 @@ rl:
   # Set true for a short diagnostic run. It roughly doubles update compute by
   # recomputing each minibatch after optimizer.step, then logs whether positive
   # advantages increased logprob and negative advantages decreased it.
-  diagnose_update_effect: false
+  diagnose_update_effect: true
 
   optimizer:
     # 2026-05-23: baseline 是 2e-5,这一轮 4×↓ 到 5e-6,配合 normalized 信任域。
     # 若 approx_kl 仍稳定 < 0.05 且 clipfrac 长时间 < 5%,再往上抬到 1e-5/2e-5。
-    lr: 8.0e-5
+    lr: 8e-5
     weight_decay: 0.0
     betas: [0.9, 0.95]
 

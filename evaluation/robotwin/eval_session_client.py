@@ -48,41 +48,160 @@ from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 from evaluation.robotwin.test_render import Sapien_TEST
 
 
-def cleanup_env_resources(task_env, clear_cache=True):
-    """Best-effort cleanup for SAPIEN scene/renderer resources after an episode."""
-    if task_env is None:
-        return
+def _call_safely(obj, method_name, *args, **kwargs):
+    method = getattr(obj, method_name, None)
+    if not callable(method):
+        return None
     try:
-        task_env.close_env(clear_cache=clear_cache)
+        return method(*args, **kwargs)
     except TypeError:
+        if args or kwargs:
+            try:
+                return method()
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+
+def _close_eval_video_ffmpeg(task_env):
+    ffmpeg = getattr(task_env, "eval_video_ffmpeg", None)
+    if ffmpeg is None:
+        return
+
+    stdin = getattr(ffmpeg, "stdin", None)
+    if stdin is not None:
         try:
-            task_env.close_env()
+            stdin.close()
+        except Exception:
+            pass
+
+    try:
+        ffmpeg.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            ffmpeg.terminate()
+            ffmpeg.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                ffmpeg.kill()
+                ffmpeg.wait(timeout=2)
+            except Exception:
+                pass
         except Exception:
             pass
     except Exception:
         pass
 
-    viewer = getattr(task_env, "viewer", None)
-    if viewer is not None:
-        try:
-            viewer.close()
-        except Exception:
-            pass
+    try:
+        task_env.eval_video_ffmpeg = None
+    except Exception:
+        pass
 
-    for attr in (
-        "scene", "renderer", "engine", "viewer", "robot",
-        "head_camera", "left_camera", "right_camera",
-        "eval_video_ffmpeg",
-    ):
-        if hasattr(task_env, attr):
+
+def _clear_sapien_render_cache():
+    try:
+        from sapien.render import clear_cache as sapien_clear_cache
+        sapien_clear_cache()
+    except Exception:
+        pass
+
+
+def cleanup_env_resources(task_env, clear_cache=True):
+    """Best-effort cleanup for SAPIEN scene/renderer resources after an episode."""
+    if task_env is not None:
+        _close_eval_video_ffmpeg(task_env)
+
+        viewer = getattr(task_env, "viewer", None)
+        if viewer is not None:
+            _call_safely(viewer, "close")
+
+        close_env = getattr(task_env, "close_env", None)
+        if callable(close_env):
             try:
-                setattr(task_env, attr, None)
+                close_env(clear_cache=False)
+            except TypeError:
+                _call_safely(task_env, "close_env")
+            except Exception:
+                pass
+        else:
+            _call_safely(task_env, "close")
+
+        scene = getattr(task_env, "scene", None)
+        if scene is not None:
+            _call_safely(scene, "clear")
+
+        cameras = getattr(task_env, "cameras", None)
+        if cameras is not None:
+            for attr in (
+                "left_camera", "right_camera", "observer_camera",
+                "world_camera1", "world_camera2", "static_camera_list",
+                "static_camera_config", "static_camera_name",
+            ):
+                if hasattr(cameras, attr):
+                    try:
+                        setattr(cameras, attr, None)
+                    except Exception:
+                        pass
+            try:
+                cameras.__dict__.clear()
             except Exception:
                 pass
 
+        robot = getattr(task_env, "robot", None)
+        if robot is not None:
+            try:
+                robot.__dict__.clear()
+            except Exception:
+                pass
+
+        for resource in (
+            getattr(task_env, "renderer", None),
+            getattr(task_env, "engine", None),
+        ):
+            if resource is not None:
+                _call_safely(resource, "close")
+                _call_safely(resource, "destroy")
+                _call_safely(resource, "release")
+
+        for attr in (
+            "cameras", "head_camera", "left_camera", "right_camera",
+            "observer_camera", "world_camera1", "world_camera2",
+            "scene", "renderer", "engine", "viewer", "robot",
+            "eval_video_ffmpeg", "now_obs", "world_pcd", "raw_head_pcl",
+            "real_head_pcl", "real_head_pcl_color", "point_light_lst",
+            "cluttered_objs", "record_cluttered_objects",
+        ):
+            if hasattr(task_env, attr):
+                try:
+                    setattr(task_env, attr, None)
+                except Exception:
+                    pass
+
+        try:
+            task_env.__dict__.clear()
+        except Exception:
+            pass
+
     gc.collect()
+    if clear_cache:
+        _clear_sapien_render_cache()
+        gc.collect()
     if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
         torch.cuda.empty_cache()
+
+
+def run_render_probe():
+    probe = None
+    try:
+        probe = Sapien_TEST()
+    finally:
+        cleanup_env_resources(probe, clear_cache=True)
 
 
 def write_json(data: dict, fpath: Path) -> None:
@@ -450,7 +569,7 @@ def main():
         return
 
     # Initialize renderer
-    Sapien_TEST()
+    run_render_probe()
 
     # Connect to server. The server assigns this websocket connection a session_id.
     # In restart-per-task mode each child process gets a new session, and process

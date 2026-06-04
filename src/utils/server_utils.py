@@ -87,17 +87,18 @@ def worker_loop(model, local_rank):
         else:
             pass
 
-    logger.info(f"[worker_loop] Rank {rank} exiting.")
+    logger.info("[worker_loop] rank=%s exiting.", rank)
 
 
 def run_async_server_mode(model, local_rank, host, port):
-    logger.info("Running in ASYNC SERVER mode")
-    if not (dist.is_available() and dist.is_initialized()):
+    dist_ready = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if dist_ready else int(getattr(model, "rank", local_rank))
+    logger.info("Running in ASYNC SERVER mode: rank=%s", rank)
+    if not dist_ready:
         model_server = WebsocketPolicyServer(model, host=host, port=port)
         model_server.serve_forever()
         return
 
-    rank = dist.get_rank()
     # Replicated (DDP-style) mode: each rank holds a full model copy and serves
     # its own port independently. The FSDP-style rank0-broadcast / worker_loop
     # pattern doesn't apply — every rank runs its own websocket loop. Gradient
@@ -124,4 +125,4 @@ def run_async_server_mode(model, local_rank, host, port):
         try:
             worker_loop(model, local_rank)
         except KeyboardInterrupt:
-            logger.info(f"Rank {local_rank}: Shutting down")
+            logger.info("Rank shutting down: rank=%s local_rank=%s", rank, local_rank)

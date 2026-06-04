@@ -1,6 +1,7 @@
 """RoboTwin rollout client for online LingBot-VA GRPO."""
 
 import argparse
+import gc
 import json
 import os
 import random
@@ -17,6 +18,7 @@ if os.environ.get("CONDA_DEFAULT_ENV") != "RoboTwin" and not os.environ.get("ALL
         "if your RoboTwin environment has another name."
     )
 
+LINGBOT_REPO_ROOT = Path(__file__).resolve().parents[2]
 robowin_root = Path("/apdcephfs_cq8/share_1611098/stevefan/robotics/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
@@ -32,11 +34,11 @@ from evaluation.robotwin.eval_session_client import (
     class_decorator,
     cleanup_env_resources,
     format_obs,
+    run_render_probe,
     write_json,
 )
 from evaluation.robotwin.geometry import euler2quat
 from evaluation.robotwin.grpo_websocket_client_policy import GRPOWebsocketClientPolicy
-from evaluation.robotwin.test_render import Sapien_TEST
 
 
 class _RoboTwinStepFilter:
@@ -266,6 +268,154 @@ def choose_instruction(
     return str(rng.choice(choices))
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_int(name: str, default: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return int(value)
+
+
+def assignment_order_for_pass(
+    assignment_len: int,
+    *,
+    pass_idx: int,
+    shuffle: bool,
+    shuffle_seed: int,
+) -> tuple[list[int], int | None]:
+    """Return assignment indices for this pass, identically on every client."""
+    order = list(range(assignment_len))
+    if not shuffle or assignment_len <= 1:
+        return order, None
+
+    # Each process/rank computes the same deterministic random permutation so
+    # item_idx, group_id, and file barriers stay aligned without communication.
+    pass_shuffle_seed = int(shuffle_seed) * 1000003 + int(pass_idx)
+    rng = np.random.default_rng(pass_shuffle_seed)
+    return [int(i) for i in rng.permutation(assignment_len)], pass_shuffle_seed
+
+
+def load_rollout_results(metrics_path: Path):
+    results = defaultdict(lambda: {"succ": 0, "total": 0, "episodes": []})
+    if not metrics_path.exists():
+        return results
+    try:
+        with open(metrics_path, "r") as f:
+            existing = json.load(f)
+    except Exception as exc:
+        print(f"Could not load existing rollout metrics {metrics_path}: {exc}")
+        return results
+
+    for task_name, task_results in existing.items():
+        results[task_name] = {
+            "succ": int(task_results.get("succ", 0)),
+            "total": int(task_results.get("total", 0)),
+            "episodes": list(task_results.get("episodes", [])),
+        }
+    return results
+
+
+def client_progress_scope(args, assignment_len: int) -> dict:
+    return {
+        "assignment": str(Path(args.assignment).resolve()),
+        "assignment_len": int(assignment_len),
+        "group_size": int(args.group_size),
+        "num_passes": int(args.num_passes),
+        "world_size": int(args.world_size),
+        "rank": int(args.rank),
+        "num_clients": int(args.num_clients),
+        "client_id": int(args.client_id),
+        "global_num_clients": int(args.global_num_clients),
+        "global_client_id": int(args.global_client_id),
+        "shuffle_assignment_each_pass": bool(args.shuffle_assignment_each_pass),
+        "assignment_shuffle_seed": int(args.assignment_shuffle_seed),
+    }
+
+
+def new_client_progress(scope: dict) -> dict:
+    return {
+        "scope": scope,
+        "next_item_idx": 0,
+        "completed_members_by_item": {},
+        "updated_at": time.time(),
+    }
+
+
+def load_client_progress(progress_path: Path, scope: dict) -> dict:
+    if not progress_path.exists():
+        return new_client_progress(scope)
+    try:
+        with open(progress_path, "r") as f:
+            progress = json.load(f)
+    except Exception as exc:
+        print(f"Could not load client progress {progress_path}: {exc}; starting fresh.")
+        return new_client_progress(scope)
+    if progress.get("scope") != scope:
+        print(f"Ignoring stale client progress with different scope: {progress_path}")
+        return new_client_progress(scope)
+    progress.setdefault("next_item_idx", 0)
+    progress.setdefault("completed_members_by_item", {})
+    return progress
+
+
+def completed_members_for_item(progress: dict, item_idx: int) -> set[int]:
+    members = progress.get("completed_members_by_item", {}).get(str(item_idx), [])
+    return {int(member) for member in members}
+
+
+def mark_member_complete(progress_path: Path, progress: dict, *, item_idx: int, group_member: int) -> None:
+    key = str(int(item_idx))
+    completed = completed_members_for_item(progress, item_idx)
+    completed.add(int(group_member))
+    progress.setdefault("completed_members_by_item", {})[key] = sorted(completed)
+    progress["updated_at"] = time.time()
+    write_json(progress, progress_path)
+
+
+def mark_item_complete(progress_path: Path, progress: dict, *, item_idx: int) -> None:
+    next_item_idx = max(int(progress.get("next_item_idx", 0)), int(item_idx) + 1)
+    progress["next_item_idx"] = next_item_idx
+    completed_by_item = progress.setdefault("completed_members_by_item", {})
+    for key in list(completed_by_item):
+        try:
+            if int(key) < next_item_idx:
+                completed_by_item.pop(key, None)
+        except ValueError:
+            completed_by_item.pop(key, None)
+    progress["updated_at"] = time.time()
+    write_json(progress, progress_path)
+
+
+def restart_client_process(*, reason: str) -> None:
+    restart_count = int(os.environ.get("GRPO_CLIENT_RESTART_COUNT", "0") or "0") + 1
+    os.environ["GRPO_CLIENT_RESTART_COUNT"] = str(restart_count)
+    print(
+        f"Restarting GRPO rollout client process ({reason}); "
+        f"restart_count={restart_count}",
+        flush=True,
+    )
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.chdir(LINGBOT_REPO_ROOT)
+    os.execv(
+        sys.executable,
+        [sys.executable, "-u", "-m", "evaluation.robotwin.grpo_rollout_client", *sys.argv[1:]],
+    )
+
+
 def wait_for_group_barrier(
     run_dir: Path,
     *,
@@ -330,6 +480,16 @@ def run_update_after_group_barrier(
     update_done = barrier_dir / "update.done"
     update_status = barrier_dir / "update_status.json"
     update_error = barrier_dir / "update_error.txt"
+
+    if update_done.exists():
+        if update_error.exists():
+            raise RuntimeError(update_error.read_text())
+        if not update_status.exists():
+            raise RuntimeError(f"Update barrier is done but status is missing: {update_status}")
+        with open(update_status, "r") as f:
+            status = json.load(f)
+        print(f"GRPO update already completed for item {item_idx}: {status}")
+        return status
 
     if client_id == 0:
         try:
@@ -582,6 +742,8 @@ def wait_and_run_eval_pass(
     """
     barrier_dir = run_dir / "barriers" / f"eval_{global_update_step:06d}"
     barrier_dir.mkdir(parents=True, exist_ok=True)
+    slice_done = barrier_dir / f"client_{args.client_id}.done"
+    end_done = barrier_dir / "end.done"
 
     full_indexed = list(enumerate(assignment))
     # Eval slicing follows the same global pool as rollout members: each item
@@ -598,26 +760,38 @@ def wait_and_run_eval_pass(
         f"at global_update_step={global_update_step}"
     )
 
-    try:
-        run_eval_pass(
-            model,
-            slice_with_idx,
-            args,
-            run_dir=run_dir,
-            global_update_step=global_update_step,
+    if slice_done.exists():
+        print(
+            f"[eval] slice already completed for client {args.client_id} "
+            f"at global_update_step={global_update_step}; skipping duplicate eval."
         )
-    finally:
-        # Mark our slice done even on failure so peers don't block forever
-        # on a crashed client. The crashed client will raise after this.
-        (barrier_dir / f"client_{args.client_id}.done").write_text(f"{time.time()}\n")
+    else:
+        try:
+            run_eval_pass(
+                model,
+                slice_with_idx,
+                args,
+                run_dir=run_dir,
+                global_update_step=global_update_step,
+            )
+        finally:
+            # Mark our slice done even on failure so peers don't block forever
+            # on a crashed client. The crashed client will raise after this.
+            slice_done.write_text(f"{time.time()}\n")
 
     if args.client_id == 0:
+        if end_done.exists():
+            end_status_path = barrier_dir / "end_status.json"
+            if end_status_path.exists():
+                with open(end_status_path, "r") as f:
+                    return json.load(f)
+            return None
         _wait_for_eval_slice_dones(
             barrier_dir, num_clients=args.num_clients, timeout_s=timeout_s
         )
         end_status = model.end_eval_phase()
         write_json(end_status, barrier_dir / "end_status.json")
-        (barrier_dir / "end.done").write_text(f"{time.time()}\n")
+        end_done.write_text(f"{time.time()}\n")
         print(f"[eval] phase done: {end_status}")
         return end_status
     else:
@@ -659,9 +833,29 @@ def main():
         "merging it with pass 1's.",
     )
     parser.add_argument(
+        "--shuffle_assignment_each_pass",
+        action="store_true",
+        default=env_flag("GRPO_SHUFFLE_ASSIGNMENT", False) or env_flag("SHUFFLE_ASSIGNMENT", False),
+        help="Randomly shuffle the assignment order independently for every pass. "
+        "The shuffle is deterministic across clients/ranks.",
+    )
+    parser.add_argument(
+        "--assignment_shuffle_seed",
+        type=int,
+        default=None,
+        help="Base seed for --shuffle_assignment_each_pass. Defaults to --seed.",
+    )
+    parser.add_argument(
         "--eval_only",
         action="store_true",
         help="Run one deterministic GRPO eval pass and exit without training rollouts.",
+    )
+    parser.add_argument(
+        "--restart_every_items",
+        type=int,
+        default=env_int("GRPO_CLIENT_RESTART_EVERY_ITEMS", 0),
+        help="Restart this rollout client process after this many completed "
+        "assignment items. 0 disables periodic restart.",
     )
     parser.add_argument("--skip_render_check", action="store_true",
                         help="Skip Sapien_TEST ray-tracing probe; useful on headless nodes where task env rendering still works")
@@ -702,6 +896,10 @@ def main():
         raise ValueError(f"--client_id must be in [0, {args.num_clients}), got {args.client_id}")
     if args.num_passes < 1:
         raise ValueError("--num_passes must be >= 1")
+    if args.restart_every_items < 0:
+        raise ValueError("--restart_every_items must be >= 0")
+    if args.assignment_shuffle_seed is None:
+        args.assignment_shuffle_seed = int(args.seed)
     if args.world_size < 1:
         raise ValueError("--world_size must be >= 1")
     if not (0 <= args.rank < args.world_size):
@@ -734,12 +932,22 @@ def main():
     metrics_dir = run_dir / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = metrics_dir / f"client_{args.client_id}.json"
-    results = defaultdict(lambda: {"succ": 0, "total": 0, "episodes": []})
+    results = load_rollout_results(metrics_path)
+    progress_path = run_dir / "progress" / f"client_{args.client_id}.json"
+    progress = load_client_progress(
+        progress_path,
+        client_progress_scope(args, len(assignment)),
+    )
+    if int(progress.get("next_item_idx", 0)) > 0:
+        print(
+            f"Resuming client {args.client_id} from item "
+            f"{progress.get('next_item_idx')} using {progress_path}"
+        )
 
     if args.skip_render_check or os.environ.get("SKIP_RENDER_CHECK") == "1":
         print("Skipping Sapien_TEST render probe.")
     else:
-        Sapien_TEST()
+        run_render_probe()
 
     group_members = list(range(global_client_id, args.group_size, global_num_clients))
     if not group_members:
@@ -805,16 +1013,37 @@ def main():
             return
 
         items_per_pass = len(assignment)
+        total_items = args.num_passes * items_per_pass
+        completed_items_this_process = 0
         for pass_idx in range(args.num_passes):
-            if args.num_passes > 1:
+            pass_order, pass_shuffle_seed = assignment_order_for_pass(
+                items_per_pass,
+                pass_idx=pass_idx,
+                shuffle=args.shuffle_assignment_each_pass,
+                shuffle_seed=args.assignment_shuffle_seed,
+            )
+            if args.num_passes > 1 or args.shuffle_assignment_each_pass:
+                shuffle_msg = ""
+                if args.shuffle_assignment_each_pass:
+                    preview = ", ".join(
+                        f"{assignment[i]['task']}:{assignment[i]['seed']}"
+                        for i in pass_order[: min(8, len(pass_order))]
+                    )
+                    shuffle_msg = (
+                        f" shuffled=True base_seed={args.assignment_shuffle_seed} "
+                        f"pass_seed={pass_shuffle_seed} preview=[{preview}]"
+                    )
                 print(
                     f"Client {args.client_id} starting pass {pass_idx + 1}/{args.num_passes} "
-                    f"({items_per_pass} items per pass)."
+                    f"({items_per_pass} items per pass).{shuffle_msg}"
                 )
-            for item_idx_in_pass, item in enumerate(assignment):
+            for item_idx_in_pass, assignment_idx in enumerate(pass_order):
+                item = assignment[assignment_idx]
                 # Globally-monotonic item_idx so group_id is unique across passes;
                 # the server keys groups by (task, seed, item_idx, instruction).
                 item_idx = pass_idx * items_per_pass + item_idx_in_pass
+                if item_idx < int(progress.get("next_item_idx", 0)):
+                    continue
                 task_name = item["task"]
                 seed = int(item["seed"])
                 episode_info = item.get("episode_info")
@@ -842,6 +1071,12 @@ def main():
                 )
 
                 for group_member in group_members:
+                    if group_member in completed_members_for_item(progress, item_idx):
+                        print(
+                            f"Client {args.client_id} skipping completed member: "
+                            f"item={item_idx} member={group_member}"
+                        )
+                        continue
                     TASK_ENV = None
                     episode_idx = item_idx * args.group_size + group_member + 1
                     try:
@@ -866,6 +1101,7 @@ def main():
                         results[task_name]["total"] += 1
                         results[task_name]["episodes"].append({
                             "seed": seed,
+                            "assignment_idx": assignment_idx,
                             "group_id": group_id,
                             "group_member": group_member,
                             "group_size": args.group_size,
@@ -887,6 +1123,12 @@ def main():
                             f"pending_ready_groups={server_status.get('pending_ready_groups')} "
                             f"video={video_msg}"
                         )
+                        mark_member_complete(
+                            progress_path,
+                            progress,
+                            item_idx=item_idx,
+                            group_member=group_member,
+                        )
                     except Exception as exc:
                         traceback.print_exc()
                         print(
@@ -896,6 +1138,7 @@ def main():
                         results[task_name]["total"] += 1
                         results[task_name]["episodes"].append({
                             "seed": seed,
+                            "assignment_idx": assignment_idx,
                             "group_id": group_id,
                             "group_member": group_member,
                             "group_size": args.group_size,
@@ -964,6 +1207,20 @@ def main():
                             global_update_step=gus,
                             timeout_s=args.group_barrier_timeout,
                         )
+                mark_item_complete(progress_path, progress, item_idx=item_idx)
+                completed_items_this_process += 1
+                if (
+                    args.restart_every_items > 0
+                    and completed_items_this_process >= args.restart_every_items
+                    and item_idx + 1 < total_items
+                ):
+                    model.close()
+                    restart_client_process(
+                        reason=(
+                            f"completed {completed_items_this_process} item(s) "
+                            f"since process start; next_item_idx={item_idx + 1}"
+                        )
+                    )
     finally:
         model.close()
 

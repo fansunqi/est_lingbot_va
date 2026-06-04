@@ -197,7 +197,8 @@ class GRPOTrainingServer(VA_Server):
                 freeze_base=True,
             )
             logger.info(
-                "GRPO LoRA enabled: rank=%s alpha=%s dropout=%s wrapped=%s trainable_params=%s total_params=%s",
+                "GRPO LoRA enabled: rank=%s lora_rank=%s alpha=%s dropout=%s wrapped=%s trainable_params=%s total_params=%s",
+                self.rank,
                 int(self.lora_cfg.get("rank", 8)),
                 float(self.lora_cfg.get("alpha", 16.0)),
                 float(self.lora_cfg.get("dropout", 0.0)),
@@ -357,20 +358,23 @@ class GRPOTrainingServer(VA_Server):
         self.noise_schedule = noise_schedule
         if self.noise_schedule == "per_chunk" and self.normalize_denoising_horizon:
             logger.warning(
-                "rl.logprob.normalize_denoising_horizon ignored under noise_schedule=per_chunk "
-                "(there is only one Gaussian transition per chunk); forcing to False."
+                "rl.logprob.normalize_denoising_horizon ignored: rank=%s "
+                "under noise_schedule=per_chunk "
+                "(there is only one Gaussian transition per chunk); forcing to False.",
+                self.rank,
             )
             self.normalize_denoising_horizon = False
 
         Path(self.job_config.save_root).mkdir(parents=True, exist_ok=True)
         self._init_wandb()
         logger.info(
-            "GRPO server ready: group_size=%s local_group_size=%s sharded=%s "
+            "GRPO server ready: rank=%s group_size=%s local_group_size=%s sharded=%s "
             "update_epochs=%s flow_grpo_noise_level=%s flow_t_eps=%s logprob_reduce=%s "
             "noise_schedule=%s "
             "disable_updates=%s train_action_steps=%s eval_action_steps=%s "
             "global_batch_size=%s local_batch_size=%s "
             "diagnose_update_effect=%s",
+            self.rank,
             self.group_size,
             self.local_group_size,
             self.sharded_group_enabled,
@@ -388,7 +392,8 @@ class GRPOTrainingServer(VA_Server):
         )
         if self._eval_pending:
             logger.info(
-                "GRPO initial eval phase armed at startup: eval_every=%s global_update_step=%s",
+                "GRPO initial eval phase armed at startup: rank=%s eval_every=%s global_update_step=%s",
+                self.rank,
                 self.eval_every,
                 self.global_update_step,
             )
@@ -405,7 +410,7 @@ class GRPOTrainingServer(VA_Server):
         try:
             import wandb
         except Exception as exc:
-            logger.warning("wandb logging requested but unavailable: %s", exc)
+            logger.warning("wandb logging requested but unavailable: rank=%s %s", self.rank, exc)
             return
 
         wandb_dir = Path(self.job_config.save_root) / "wandb"
@@ -425,9 +430,15 @@ class GRPOTrainingServer(VA_Server):
         try:
             self._wandb_run = wandb.init(**init_kwargs)
             self._define_wandb_metrics(wandb)
-            logger.info("wandb logging enabled: project=%s name=%s mode=%s", init_kwargs["project"], init_kwargs.get("name"), mode)
+            logger.info(
+                "wandb logging enabled: rank=%s project=%s name=%s mode=%s",
+                self.rank,
+                init_kwargs["project"],
+                init_kwargs.get("name"),
+                mode,
+            )
         except Exception as exc:
-            logger.warning("Failed to initialize wandb logging: %s", exc)
+            logger.warning("Failed to initialize wandb logging: rank=%s %s", self.rank, exc)
             self._wandb_run = None
 
     def _define_wandb_metrics(self, wandb_module) -> None:
@@ -470,7 +481,7 @@ class GRPOTrainingServer(VA_Server):
         try:
             self._wandb_run.log(_json_safe(data), step=step)
         except Exception as exc:
-            logger.warning("Failed to log wandb metrics: %s", exc)
+            logger.warning("Failed to log wandb metrics: rank=%s %s", self.rank, exc)
 
     def _action_logprob_mask(self, frame_st_id: int, reference: torch.Tensor) -> torch.Tensor:
         mask = self.action_mask.to(reference.device).view(1, -1, 1, 1, 1)
@@ -787,8 +798,9 @@ class GRPOTrainingServer(VA_Server):
             stored_dts_tensor = action_dts.detach().cpu()
         env_action = self.postprocess_action(actions)
         logger.debug(
-            "GRPO sample_action done: frame_st_id=%s elapsed_ms=%.1f old_logprob=%.6f "
+            "GRPO sample_action done: rank=%s frame_st_id=%s elapsed_ms=%.1f old_logprob=%.6f "
             "noise_schedule=%s eval_mode=%s action_steps=%s",
+            self.rank,
             frame_st_id,
             (time.monotonic() - infer_start) * 1000,
             float(old_logprob_summary.mean()),
@@ -1385,6 +1397,16 @@ class GRPOTrainingServer(VA_Server):
             update_effect_neg_adv_delta_mean = _mean_or_zero(epoch_effect_neg_delta)
             update_effect_pos_adv_delta_positive_frac = _mean_or_zero(epoch_effect_pos_delta_positive)
             update_effect_neg_adv_delta_negative_frac = _mean_or_zero(epoch_effect_neg_delta_negative)
+            update_effect_global_stats = None
+            if self.diagnose_update_effect:
+                update_effect_global_stats = self._allreduce_update_effect_stats(
+                    delta_values=epoch_effect_delta,
+                    signed_adv_delta_values=epoch_effect_signed_adv_delta,
+                    pos_delta_values=epoch_effect_pos_delta,
+                    neg_delta_values=epoch_effect_neg_delta,
+                    pos_delta_positive_values=epoch_effect_pos_delta_positive,
+                    neg_delta_negative_values=epoch_effect_neg_delta_negative,
+                )
 
             # Identify the 3 worst offenders by |log_ratio| so we can see
             # exactly which (group_id, seed, group_member) trajectories are
@@ -1446,14 +1468,17 @@ class GRPOTrainingServer(VA_Server):
                 "grad_norm_min": grad_norm_min,
             }
             if self.diagnose_update_effect:
+                assert update_effect_global_stats is not None
                 stats.update({
-                    "update_effect_delta_mean": update_effect_delta_mean,
-                    "update_effect_signed_adv_delta_mean": update_effect_signed_adv_delta_mean,
-                    "update_effect_pos_adv_delta_mean": update_effect_pos_adv_delta_mean,
-                    "update_effect_neg_adv_delta_mean": update_effect_neg_adv_delta_mean,
-                    "update_effect_pos_adv_delta_positive_frac": update_effect_pos_adv_delta_positive_frac,
-                    "update_effect_neg_adv_delta_negative_frac": update_effect_neg_adv_delta_negative_frac,
-                    "update_effect_active_count": epoch_effect_active_count,
+                    "update_effect_delta_mean": update_effect_global_stats["delta_mean"],
+                    "update_effect_signed_adv_delta_mean": update_effect_global_stats["signed_adv_delta_mean"],
+                    "update_effect_pos_adv_delta_mean": update_effect_global_stats["pos_adv_delta_mean"],
+                    "update_effect_neg_adv_delta_mean": update_effect_global_stats["neg_adv_delta_mean"],
+                    "update_effect_pos_adv_delta_positive_frac": update_effect_global_stats["pos_adv_delta_positive_frac"],
+                    "update_effect_neg_adv_delta_negative_frac": update_effect_global_stats["neg_adv_delta_negative_frac"],
+                    "update_effect_active_count": update_effect_global_stats["active_count"],
+                    "update_effect_pos_count": update_effect_global_stats["pos_count"],
+                    "update_effect_neg_count": update_effect_global_stats["neg_count"],
                 })
             logger.info(
                 "GRPO update epoch: rank=%s step=%s epoch=%s/%s mbs=%s loss=%.6f approx_kl=%.6f ratio=%.6f "
@@ -1502,7 +1527,7 @@ class GRPOTrainingServer(VA_Server):
             )
             for rank_idx, off in enumerate(worst_offenders):
                 logger.info(
-                    "GRPO update offender: server_rank=%s offender_rank=%s log_ratio=%.4f advantage=%.4f chunks=%s "
+                    "GRPO update offender: rank=%s offender_rank=%s log_ratio=%.4f advantage=%.4f chunks=%s "
                     "step_count=%s success=%s reward=%.3f seed=%s group_member=%s group_id=%s",
                     self.rank,
                     rank_idx,
@@ -1518,14 +1543,17 @@ class GRPOTrainingServer(VA_Server):
                 )
             if self.diagnose_update_effect:
                 logger.info(
-                    "GRPO update effect: rank=%s step=%s epoch=%s/%s active=%s "
-                    "delta_mean=%.6e signed_adv_delta_mean=%.6e "
-                    "pos_adv_delta_mean=%.6e pos_adv_delta_positive_frac=%.3f "
-                    "neg_adv_delta_mean=%.6e neg_adv_delta_negative_frac=%.3f",
+                    "GRPO update effect: rank=%s step=%s epoch=%s/%s local_active=%s global_active=%s "
+                    "global_delta_mean=%.6e global_signed_adv_delta_mean=%.6e "
+                    "global_pos_adv_delta_mean=%.6e global_pos_adv_delta_positive_frac=%.3f "
+                    "global_neg_adv_delta_mean=%.6e global_neg_adv_delta_negative_frac=%.3f "
+                    "local_delta_mean=%.6e local_signed_adv_delta_mean=%.6e "
+                    "local_pos_adv_delta_mean=%.6e local_neg_adv_delta_mean=%.6e",
                     self.rank,
                     update_step,
                     epoch_idx + 1,
                     self.update_epochs,
+                    epoch_effect_active_count,
                     stats["update_effect_active_count"],
                     stats["update_effect_delta_mean"],
                     stats["update_effect_signed_adv_delta_mean"],
@@ -1533,6 +1561,10 @@ class GRPOTrainingServer(VA_Server):
                     stats["update_effect_pos_adv_delta_positive_frac"],
                     stats["update_effect_neg_adv_delta_mean"],
                     stats["update_effect_neg_adv_delta_negative_frac"],
+                    update_effect_delta_mean,
+                    update_effect_signed_adv_delta_mean,
+                    update_effect_pos_adv_delta_mean,
+                    update_effect_neg_adv_delta_mean,
                 )
                 self._wandb_log({
                     "train_epoch/global_update_step": update_step,
@@ -1543,6 +1575,8 @@ class GRPOTrainingServer(VA_Server):
                     "train_epoch/update_effect_pos_adv_delta_positive_frac": stats["update_effect_pos_adv_delta_positive_frac"],
                     "train_epoch/update_effect_neg_adv_delta_negative_frac": stats["update_effect_neg_adv_delta_negative_frac"],
                     "train_epoch/update_effect_active_count": stats["update_effect_active_count"],
+                    "train_epoch/update_effect_pos_count": stats["update_effect_pos_count"],
+                    "train_epoch/update_effect_neg_count": stats["update_effect_neg_count"],
                 })
             self._wandb_log(
                 {
@@ -1802,9 +1836,9 @@ class GRPOTrainingServer(VA_Server):
         self.last_stats["logprob_consistency"] = stats
         self._write_json("latest_logprob_consistency.json", stats)
         if stats["passed"]:
-            logger.info("GRPO logprob consistency passed: %s", stats)
+            logger.info("GRPO logprob consistency passed: rank=%s %s", self.rank, stats)
         else:
-            logger.warning("GRPO logprob consistency failed: %s", stats)
+            logger.warning("GRPO logprob consistency failed: rank=%s %s", self.rank, stats)
         self._wandb_log(
             {f"debug/logprob_consistency/{key}": value for key, value in stats.items()},
         )
@@ -1833,7 +1867,8 @@ class GRPOTrainingServer(VA_Server):
             n_tensors = len(self.trainable_params)
             n_params = sum(param.numel() for param in self.trainable_params)
             logger.info(
-                "Replicated trainable parameter sync complete: source_rank=0 tensors=%s params=%s",
+                "Replicated trainable parameter sync complete: rank=%s source_rank=0 tensors=%s params=%s",
+                self.rank,
                 n_tensors,
                 n_params,
             )
@@ -2000,8 +2035,9 @@ class GRPOTrainingServer(VA_Server):
             })
 
         logger.info(
-            "GRPO replicated rollout aggregate: step=%s episodes=%s groups=%s "
+            "GRPO replicated rollout aggregate: rank=%s step=%s episodes=%s groups=%s "
             "success_rate=%.4f reward_mean=%.4f rank_episode_counts=%s",
+            self.rank,
             update_step,
             int(rollout_stats["episode_count"]),
             len(grouped),
@@ -2107,6 +2143,63 @@ class GRPOTrainingServer(VA_Server):
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
         return float(t.item())
 
+    def _allreduce_update_effect_stats(
+        self,
+        *,
+        delta_values: list[float],
+        signed_adv_delta_values: list[float],
+        pos_delta_values: list[float],
+        neg_delta_values: list[float],
+        pos_delta_positive_values: list[float],
+        neg_delta_negative_values: list[float],
+    ) -> dict[str, float]:
+        """Aggregate post-step update-effect diagnostics across replicated ranks."""
+
+        def _sum(values: list[float]) -> float:
+            return float(sum(values)) if values else 0.0
+
+        payload = torch.tensor(
+            [
+                _sum(delta_values),
+                float(len(delta_values)),
+                _sum(signed_adv_delta_values),
+                float(len(signed_adv_delta_values)),
+                _sum(pos_delta_values),
+                float(len(pos_delta_values)),
+                _sum(neg_delta_values),
+                float(len(neg_delta_values)),
+                _sum(pos_delta_positive_values),
+                float(len(pos_delta_positive_values)),
+                _sum(neg_delta_negative_values),
+                float(len(neg_delta_negative_values)),
+            ],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        if getattr(self, "replicated_enabled", False):
+            dist.all_reduce(payload, op=dist.ReduceOp.SUM)
+
+        values = payload.detach().cpu().tolist()
+
+        def _mean(sum_value: float, count_value: float) -> float:
+            return float(sum_value / count_value) if count_value > 0 else 0.0
+
+        active_count = values[1]
+        signed_count = values[3]
+        pos_count = values[5]
+        neg_count = values[7]
+        return {
+            "delta_mean": _mean(values[0], active_count),
+            "signed_adv_delta_mean": _mean(values[2], signed_count),
+            "pos_adv_delta_mean": _mean(values[4], pos_count),
+            "neg_adv_delta_mean": _mean(values[6], neg_count),
+            "pos_adv_delta_positive_frac": _mean(values[8], pos_count),
+            "neg_adv_delta_negative_frac": _mean(values[10], neg_count),
+            "active_count": int(active_count),
+            "pos_count": int(pos_count),
+            "neg_count": int(neg_count),
+        }
+
     def _trainable_state_dict(self) -> dict[str, torch.Tensor]:
         """State dict containing only trainable params (LoRA adapters when LoRA is on)."""
         trainable_names = {
@@ -2142,7 +2235,8 @@ class GRPOTrainingServer(VA_Server):
             and not self._pending_checkpoint_future.done()
         ):
             logger.warning(
-                "Skipping GRPO checkpoint at step %s: previous save still in flight",
+                "Skipping GRPO checkpoint: rank=%s step=%s previous save still in flight",
+                self.rank,
                 step,
             )
             return str(path)
@@ -2205,7 +2299,8 @@ class GRPOTrainingServer(VA_Server):
             if export_inference:
                 self._write_inference_export_async(step, adapter_snapshot)
             logger.info(
-                "Saved GRPO checkpoint: %s (transformer_keys=%d full=%s)",
+                "Saved GRPO checkpoint: rank=%s path=%s transformer_keys=%d full=%s",
+                self.rank,
                 path,
                 len(payload.get("transformer", {})),
                 save_full,
@@ -2219,7 +2314,8 @@ class GRPOTrainingServer(VA_Server):
             )
         except Exception:
             logger.error(
-                "Background GRPO checkpoint write failed at step %s:\n%s",
+                "Background GRPO checkpoint write failed: rank=%s step=%s\n%s",
+                self.rank,
                 step,
                 traceback.format_exc(),
             )
@@ -2242,7 +2338,12 @@ class GRPOTrainingServer(VA_Server):
             try:
                 os.symlink(target, link_path, target_is_directory=True)
             except OSError:
-                logger.warning("Could not symlink %s -> %s; write access may be restricted", link_path, target)
+                logger.warning(
+                    "Could not symlink: rank=%s %s -> %s; write access may be restricted",
+                    self.rank,
+                    link_path,
+                    target,
+                )
         try:
             if self.use_lora:
                 adapter_dir = export_root / "transformer_lora"
@@ -2270,7 +2371,12 @@ class GRPOTrainingServer(VA_Server):
                     try:
                         os.symlink(base_model / "transformer", base_link, target_is_directory=True)
                     except OSError:
-                        logger.warning("Could not symlink %s -> %s", base_link, base_model / "transformer")
+                        logger.warning(
+                            "Could not symlink: rank=%s %s -> %s",
+                            self.rank,
+                            base_link,
+                            base_model / "transformer",
+                        )
             else:
                 # Non-LoRA export still touches GPU weights; this path was not exercised
                 # in the validation run that hit the hang. We keep the legacy behavior
@@ -2281,7 +2387,10 @@ class GRPOTrainingServer(VA_Server):
                     safe_serialization=True,
                 )
         except Exception:
-            logger.exception("Failed to write inference-compatible transformer export")
+            logger.exception(
+                "Failed to write inference-compatible transformer export: rank=%s",
+                self.rank,
+            )
             return None
         latest = Path(self.job_config.save_root) / "inference_exports" / "latest"
         try:
@@ -2405,8 +2514,9 @@ class GRPOTrainingServer(VA_Server):
                     },
                 )
                 logger.info(
-                    "GRPO eval episode: task=%s seed=%s success=%s reward=%.3f "
+                    "GRPO eval episode: rank=%s task=%s seed=%s success=%s reward=%.3f "
                     "step_count=%s collected=%s action_steps=%s",
+                    self.rank,
                     result["task"],
                     result["seed"],
                     result["success"],
@@ -2463,9 +2573,10 @@ class GRPOTrainingServer(VA_Server):
                 if not self.disable_updates:
                     self._pending_ready_groups.append(ready_group)
                 logger.info(
-                    "GRPO group ready: group_id=%s size=%s success_rate=%.4f reward_mean=%.4f "
+                    "GRPO group ready: rank=%s group_id=%s size=%s success_rate=%.4f reward_mean=%.4f "
                     "reward_std=%.4f step_count_mean=%.1f step_count_min=%.0f step_count_max=%.0f "
                     "chunk_count_mean=%.1f pending_ready_groups=%s/%s update_deferred=True",
+                    self.rank,
                     episode.group_id,
                     len(ready_group),
                     float(sum(group_successes) / max(len(group_successes), 1)),
@@ -2479,9 +2590,10 @@ class GRPOTrainingServer(VA_Server):
                     self.rollout_groups_per_update,
                 )
             logger.info(
-                "GRPO episode finished: rollout_episode=%s task=%s seed=%s group_id=%s episode_idx=%s "
+                "GRPO episode finished: rank=%s rollout_episode=%s task=%s seed=%s group_id=%s episode_idx=%s "
                 "group_member=%s success=%s reward=%.3f step_count=%s chunks=%s ready_group=%s "
                 "pending_ready_groups=%s active_sessions=%s",
+                self.rank,
                 self.global_rollout_episode,
                 episode.task,
                 episode.seed,
@@ -2560,8 +2672,9 @@ class GRPOTrainingServer(VA_Server):
                 )
                 if self._is_rank0():
                     logger.info(
-                        "GRPO eval phase done: n=%s success_rate=%.4f reward_mean=%.4f "
+                        "GRPO eval phase done: rank=%s n=%s success_rate=%.4f reward_mean=%.4f "
                         "global_update_step=%s local_n=%s rank_counts=%s",
+                        self.rank,
                         n,
                         success_rate,
                         reward_mean,
@@ -2571,11 +2684,14 @@ class GRPOTrainingServer(VA_Server):
                     )
             elif self._is_rank0():
                 logger.warning(
-                    "GRPO end_eval_phase called with no merged eval results; clearing flag anyway."
+                    "GRPO end_eval_phase called with no merged eval results: "
+                    "rank=%s clearing flag anyway.",
+                    self.rank,
                 )
             elif local_n:
                 logger.info(
-                    "GRPO eval rank merged: local_n=%s merged_n=%s global_update_step=%s",
+                    "GRPO eval rank merged: rank=%s local_n=%s merged_n=%s global_update_step=%s",
+                    self.rank,
                     local_n,
                     n,
                     self.global_update_step,
