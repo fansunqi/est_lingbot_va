@@ -75,17 +75,37 @@ def flow_grpo_sde_transition(
     noise_level: float = 0.7,
     t_eps: float = 1e-5,
     std_eps: float = 1e-8,
+    sigma_min: float | None = None,
+    sigma_max: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build the Flow-GRPO Euler-Maruyama Gaussian transition.
 
     ``t`` is the rectified-flow time in ``[0, 1]`` and ``dt`` is the signed
     step to the next time. The drift uses the signed ``dt``; only the diffusion
     scale uses ``sqrt(abs(dt))``.
+
+    ``sigma_min``/``sigma_max`` optionally clamp ``sigma_t`` (the diffusion
+    coefficient ``a*sqrt(t/(1-t))``) into a band. The clamp is applied to
+    ``sigma_t`` itself — BEFORE it feeds both the score-correction ``drift`` and
+    the transition ``std`` — so the transition stays a valid marginal-preserving
+    SDE for the clamped diffusion coefficient (drift and diffusion remain
+    consistent). The point is conditioning: the raw ``a*sqrt(t/(1-t))`` schedule
+    spans a wide band across denoising steps, so the low-sigma (late) steps
+    dominate the GRPO ratio by ~1/sigma^2; clamping into a narrow band makes
+    every step contribute comparably. Clamping does introduce a small marginal
+    bias near the t-endpoints, but ``t`` is already clamped via ``t_eps`` and the
+    deployed policy uses deterministic ODE inference, so the conditioning win
+    dominates. Leave both ``None`` to recover the unclamped schedule.
     """
 
     t_safe = _broadcast_to_x(t, x_t).clamp(float(t_eps), 1.0 - float(t_eps))
     dt_b = _broadcast_to_x(dt, x_t)
     sigma_t = float(noise_level) * torch.sqrt(t_safe / (1.0 - t_safe))
+    if sigma_min is not None or sigma_max is not None:
+        sigma_t = sigma_t.clamp(
+            min=float(sigma_min) if sigma_min is not None else None,
+            max=float(sigma_max) if sigma_max is not None else None,
+        )
     drift = v_theta + (sigma_t ** 2) / (2.0 * t_safe) * (x_t + (1.0 - t_safe) * v_theta)
     std = (sigma_t * torch.sqrt(dt_b.abs())).clamp_min(float(std_eps))
     mean = x_t + drift * dt_b
@@ -369,16 +389,29 @@ def grpo_clipped_loss(
     advantages: torch.Tensor,
     *,
     clip_range: float = 0.2,
+    clip_range_high: float | None = None,
+    clip_range_low: float | None = None,
     log_ratio_clip: float | None = 20.0,
     kl_ref: torch.Tensor | None = None,
     beta_kl: float = 0.0,
     entropy: torch.Tensor | None = None,
     entropy_coef: float = 0.0,
 ) -> GRPOStats:
-    """Clipped policy loss used by ReinFlow-style GRPO_Gaussian."""
+    """Clipped policy loss used by ReinFlow-style GRPO_Gaussian.
+
+    ``clip_range_high``/``clip_range_low`` allow an asymmetric trust region
+    (PPO "dual-clip" style, as in LaST-R1's clip_ratio_high/low): the ratio is
+    clamped to ``[1 - clip_range_low, 1 + clip_range_high]``. A wider high side
+    gives positive-advantage samples more room to raise their probability before
+    the surrogate is clipped — the symmetric default tends to throttle the
+    "raise good actions" direction more than the "suppress bad actions" one.
+    Both default to ``clip_range`` when ``None`` (symmetric).
+    """
 
     advantages = advantages.to(device=new_logprob.device, dtype=new_logprob.dtype)
     old_logprob = old_logprob.to(device=new_logprob.device, dtype=new_logprob.dtype)
+    chigh = float(clip_range_high) if clip_range_high is not None else float(clip_range)
+    clow = float(clip_range_low) if clip_range_low is not None else float(clip_range)
     log_ratio = new_logprob - old_logprob
     if log_ratio_clip is None:
         log_ratio_for_ratio = log_ratio
@@ -386,7 +419,7 @@ def grpo_clipped_loss(
         log_ratio_for_ratio = log_ratio.clamp(-float(log_ratio_clip), float(log_ratio_clip))
     ratio = torch.exp(log_ratio_for_ratio)
     unclipped = ratio * advantages
-    clipped = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
+    clipped = torch.clamp(ratio, 1.0 - clow, 1.0 + chigh) * advantages
     surrogate_loss = -torch.minimum(unclipped, clipped).mean()
     total_loss = surrogate_loss
 
@@ -405,7 +438,7 @@ def grpo_clipped_loss(
     )
     ratio_kl = log_ratio_kl.exp()
     approx_kl = ((ratio_kl - 1.0) - log_ratio_kl).mean()
-    clipfrac = ((ratio - 1.0).abs() > clip_range).to(new_logprob.dtype).mean()
+    clipfrac = ((ratio > 1.0 + chigh) | (ratio < 1.0 - clow)).to(new_logprob.dtype).mean()
     ratio_f32 = ratio.float().detach()
     log_ratio_f32 = log_ratio.float().detach()
     return GRPOStats(

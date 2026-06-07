@@ -210,6 +210,7 @@ def _make_fake_grpo_server(*, noise_schedule="per_step"):
     from src.rl.server import GRPOTrainingServer
 
     server = GRPOTrainingServer.__new__(GRPOTrainingServer)
+    server.rank = 0
     server.device = torch.device("cpu")
     server.dtype = torch.float32
     server.latent_height = 4

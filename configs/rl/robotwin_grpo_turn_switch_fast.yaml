@@ -64,20 +64,52 @@ rl:
     type: sparse_success
 
   use_fsdp: false
-  group_size: 32
+  group_size: 8
   # 2026-05-23: 2 → 4,episodes/update 从 16 升到 32,
   # 减半 advantage 的 Bernoulli 噪声(σ 从 0.18 → 0.12)。
-  rollout_groups_per_update: 2
+  rollout_groups_per_update: 32
   update_epochs: 1
-  batch_size: 8
+  batch_size: 4
 
   # Flow-GRPO SDE noise scale a in sigma_t = a * sqrt(t / (1 - t)).
-  flow_grpo_noise_level: 1.0
+  flow_grpo_noise_level: 0.3
   flow_t_eps: 0.1
+  # Clamp sigma_t into a narrow band (applied to drift + std consistently, so the
+  # SDE stays marginal-preserving for the clamped coefficient). The raw schedule
+  # spans sigma_t∈[0.15,0.9] at noise_level=0.3 → std∈[0.067,0.40] across the 5
+  # denoising steps, an ~6x spread that lets the low-sigma late steps dominate the
+  # GRPO ratio by ~1/sigma^2 (last step hit |log_ratio|≈0.2, max 4.3 = ratio 75x).
+  # [0.34, 0.9] lifts the floor 2.2x → std∈[0.15,0.40], compressing the cross-step
+  # spread from ~6x to ~2.7x. Remove either key = that side unclamped.
+  flow_grpo_sigma_min: 0.34
+  flow_grpo_sigma_max: 0.9
   log_ratio_clip: 20.0
   # 2026-05-23: 回到 PPO 默认 per-element 信任域(配合下方 normalize_* 全开)。
   clip_range: 0.2
+  # 2026-06-05 Plan A: 不对称信任域(LaST-R1 clip_ratio_high/low 同款)。
+  # 诊断显示 pos_adv_delta_positive_frac 只有 0.34~0.38(正优势样本里只有 ~36%
+  # 概率上升,应 >0.5),而 neg_adv_delta_negative_frac=0.93(负优势学得很好)。
+  # 怀疑对称 clip 把"抬高好动作"(ratio>1+c)那侧裁得比"压低坏动作"更狠。
+  # high 侧放宽到 0.28 给正优势更多上升空间,low 侧保持 0.2。两个 key 留空 = 退回
+  # 对称 clip_range。
+  clip_range_high: 0.28
+  clip_range_low: 0.2
   target_kl: 0.1
+  # 2026-06-06: 两个 16h run 出现"崩溃→谷底(7h,8组跳7)→自愈"。早期 step5/7/13
+  # clipfrac 飙到 0.16/0.11/0.50、ratio_min 低到 0.48 把策略推出稳定区。本轮:
+  # (1) lr 2e-4 → 1e-4 减小每步移动;(2) 启用 KL-to-old 软惩罚 给越界 ratio 一个
+  # 连续回拉力(硬 clip 越界即梯度=0,缺这个)。
+  #
+  # beta_kl: KL(new‖old) 惩罚系数。用 k3 估计 KL≈ratio-1-log_ratio,梯度 ratio-1
+  # 手动加进 server 的 grad_coef(grpo_clipped_loss 的 loss 不 backward,只用于日志,
+  # 所以必须在 server 端加,见 src/rl/server.py grad_coef 构造处)。0 = 关闭(零回归)。
+  # 注意 update_epochs=1 下它只约束单步内 ratio 越界的 outlier,拦不住跨 step 漂移。
+  # 起步 0.05;压制过强(reward 上不去/ratio 死贴 1)调到 0.01,仍崩溃调到 0.1–0.2。
+  beta_kl: 0.05
+  # NOTE(2026-06-05): entropy_coef 目前是 no-op —— server 从不向 grpo_clipped_loss
+  # 传入 entropy 张量,且 SDE 的 sigma 是固定解析 schedule(非可学),高斯熵对 LoRA
+  # 参数梯度为 0。要真正约束 logprob 塌缩需改用可学 sigma(ReinFlow 式)或加 KL-to-ref
+  # (beta_kl);此处保留 0,Plan A 仅验证不对称 clip 是否能把 pos_frac 抬过 0.5。
   entropy_coef: 0.0
   bc_coef: 0.0
   checkpoint_interval: 4
@@ -103,8 +135,8 @@ rl:
 
   lora:
     enabled: true
-    rank: 8
-    alpha: 16
+    rank: 16
+    alpha: 32
     dropout: 0.0
     target_modules:
       - to_q
@@ -120,11 +152,18 @@ rl:
   # recomputing each minibatch after optimizer.step, then logs whether positive
   # advantages increased logprob and negative advantages decreased it.
   diagnose_update_effect: true
+  # Per-denoising-step log_ratio breakdown. Logs, per step index i, the
+  # flow-time t, sigma, and |log_ratio| distribution. Read it to decide whether
+  # the fixed sigma=a*sqrt(t/(1-t)) schedule is ill-conditioned across steps:
+  # if |log_ratio| rises as sigma falls (later i), low-sigma steps dominate the
+  # chunk ratio; if flat, the schedule is fine and outliers come from elsewhere.
+  diagnose_per_step_logratio: true
 
   optimizer:
     # 2026-05-23: baseline 是 2e-5,这一轮 4×↓ 到 5e-6,配合 normalized 信任域。
     # 若 approx_kl 仍稳定 < 0.05 且 clipfrac 长时间 < 5%,再往上抬到 1e-5/2e-5。
-    lr: 8e-5
+    # 2026-06-06: 因崩溃-自愈不稳定,从 2e-4 砍半到 1e-4,配合上方 beta_kl=0.05。
+    lr: 1e-4
     weight_decay: 0.0
     betas: [0.9, 0.95]
 

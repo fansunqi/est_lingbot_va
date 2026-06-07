@@ -19,7 +19,7 @@ if os.environ.get("CONDA_DEFAULT_ENV") != "RoboTwin" and not os.environ.get("ALL
     )
 
 LINGBOT_REPO_ROOT = Path(__file__).resolve().parents[2]
-robowin_root = Path("/apdcephfs_cq8/share_1611098/stevefan/robotics/RoboTwin")
+robowin_root = Path("/home/cxy/WAM/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 os.chdir(robowin_root)

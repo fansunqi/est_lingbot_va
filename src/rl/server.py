@@ -300,7 +300,21 @@ class GRPOTrainingServer(VA_Server):
             self.rl_cfg.get("flow_grpo_noise_level", self.rl_cfg.get("noise_level", 0.7))
         )
         self.flow_t_eps = float(self.rl_cfg.get("flow_t_eps", 1e-5))
+        # Optional clamp on the SDE diffusion coefficient sigma_t = a*sqrt(t/(1-t))
+        # into a narrow band, applied consistently to drift + std (see
+        # flow_grpo_sde_transition). None = unclamped raw schedule.
+        _sigma_min = self.rl_cfg.get("flow_grpo_sigma_min", None)
+        _sigma_max = self.rl_cfg.get("flow_grpo_sigma_max", None)
+        self.flow_grpo_sigma_min = float(_sigma_min) if _sigma_min is not None else None
+        self.flow_grpo_sigma_max = float(_sigma_max) if _sigma_max is not None else None
         self.clip_range = float(self.rl_cfg.get("clip_range", 0.2))
+        # Optional asymmetric trust region (LaST-R1 clip_ratio_high/low style).
+        # None = fall back to symmetric clip_range. A wider high side gives
+        # positive-advantage samples more room to raise probability.
+        _ch = self.rl_cfg.get("clip_range_high", None)
+        _cl = self.rl_cfg.get("clip_range_low", None)
+        self.clip_range_high = float(_ch) if _ch is not None else self.clip_range
+        self.clip_range_low = float(_cl) if _cl is not None else self.clip_range
         self.log_ratio_clip = self.rl_cfg.get("log_ratio_clip", 20.0)
         self.log_ratio_clip = None if self.log_ratio_clip is None else float(self.log_ratio_clip)
         self.beta_kl = float(self.rl_cfg.get("beta_kl", 0.0))
@@ -328,6 +342,18 @@ class GRPOTrainingServer(VA_Server):
         self.diagnose_update_effect = bool(
             self.rl_cfg.get("diagnose_update_effect", False)
         )
+        # Per-denoising-step log_ratio diagnostic. Answers: is the chunk-level
+        # ratio dominated by the low-std (late, near-clean) transitions? For
+        # each step index i we record (t_i, sigma_i, new_lp_i, old_lp_i) during
+        # the detached forward, then aggregate |log_ratio_i| by i at update end.
+        # If |log_ratio_i| grows as sigma_i shrinks -> the fixed sigma schedule
+        # is ill-conditioned across steps; if it's flat -> the schedule is fine
+        # and outliers come from elsewhere (forward drift, trajectory length).
+        self.diagnose_per_step_logratio = bool(
+            self.rl_cfg.get("diagnose_per_step_logratio", False)
+        )
+        self._per_step_diag_active = False
+        self._per_step_diag_records: list[dict[str, float]] = []
         self.normalize_denoising_horizon = bool(
             self.rl_cfg.get("logprob", {}).get("normalize_denoising_horizon", True)
         )
@@ -475,6 +501,17 @@ class GRPOTrainingServer(VA_Server):
             kwargs = {"step_metric": step_metric} if step_metric is not None else {}
             wandb_module.define_metric(metric, **kwargs)
 
+    def _info0(self, msg: str, *args: Any) -> None:
+        """logger.info emitted only on rank 0.
+
+        Used for per-rank-local lifecycle / detail lines (minibatch progress,
+        group-ready, episode-finished, ...) so a 4-rank run logs one stream
+        instead of four interleaved copies. The authoritative cross-rank numbers
+        live in the aggregated ``GRPO update epoch [global]`` line.
+        """
+        if self._is_rank0():
+            logger.info(msg, *args)
+
     def _wandb_log(self, data: dict[str, Any], *, step: int | None = None) -> None:
         if self._wandb_run is None or not self._is_rank0():
             return
@@ -525,6 +562,8 @@ class GRPOTrainingServer(VA_Server):
             velocity,
             noise_level=self.flow_grpo_noise_level,
             t_eps=self.flow_t_eps,
+            sigma_min=getattr(self, "flow_grpo_sigma_min", None),
+            sigma_max=getattr(self, "flow_grpo_sigma_max", None),
         )
         if eps is not None:
             transition["x_next"] = transition["mean"] + transition["std"] * eps
@@ -820,6 +859,29 @@ class GRPOTrainingServer(VA_Server):
             action_dts=stored_dts_tensor,
         )
 
+    def _record_per_step_diag(
+        self,
+        chunk: RolloutChunk,
+        step_idx: int,
+        timestep: torch.Tensor,
+        std: torch.Tensor,
+        new_lp: torch.Tensor,
+    ) -> None:
+        """Record one denoising-step's (t, sigma, new_lp, old_lp) for the
+        per-step log_ratio diagnostic. ``old_lp`` is the stored rollout-time
+        per-transition logprob, aligned by index with the recompute loop."""
+        old_flat = chunk.old_logprobs.reshape(-1)
+        old_lp = float(old_flat[step_idx]) if step_idx < old_flat.numel() else float("nan")
+        self._per_step_diag_records.append(
+            {
+                "i": int(step_idx),
+                "t": float(self._flow_time(timestep).detach().float().mean().cpu()),
+                "std": float(std.detach().float().mean().cpu()),
+                "new_lp": float(new_lp.detach().float().mean().cpu()),
+                "old_lp": old_lp,
+            }
+        )
+
     def _recompute_chunk_logprob(self, chunk: RolloutChunk) -> torch.Tensor:
         self._run_video_prefix(chunk.obs, chunk.frame_st_id, latent_noise=chunk.latent_noise)
         action_timesteps = chunk.action_timesteps.to(self.device)
@@ -861,6 +923,8 @@ class GRPOTrainingServer(VA_Server):
                 mask=mask,
                 logprob_reduce=self.logprob_reduce,
             )
+            if self._per_step_diag_active:
+                self._record_per_step_diag(chunk, 0, t, transition["std"], lp)
             # Mirror rollout's last_step cache write (see per_step branch below
             # for the full rationale): without it the per_chunk recompute would
             # have the same KV-cache drift as per_step.
@@ -899,6 +963,8 @@ class GRPOTrainingServer(VA_Server):
                 mask=mask,
                 logprob_reduce=self.logprob_reduce,
             )
+            if self._per_step_diag_active:
+                self._record_per_step_diag(chunk, i, t, transition["std"], lp)
             transition_logprobs.append(lp)
 
         # Mirror rollout's last_step KV-cache write. _sample_action_chunk runs an
@@ -1035,7 +1101,7 @@ class GRPOTrainingServer(VA_Server):
                 advantage_chunks.append(compute_group_advantages(g_rewards))
                 group_rewards_summary.append(sum(g_rewards) / max(len(g_rewards), 1))
         if skipped_groups:
-            logger.info(
+            self._info0(
                 "GRPO degenerate groups filtered: rank=%s skipped=%s kept=%s total=%s",
                 self.rank,
                 skipped_groups,
@@ -1043,7 +1109,7 @@ class GRPOTrainingServer(VA_Server):
                 len(groups),
             )
         if not episodes:
-            logger.info(
+            self._info0(
                 "GRPO update skipped: rank=%s all_groups_degenerate skipped_groups=%s",
                 self.rank,
                 skipped_groups,
@@ -1065,8 +1131,8 @@ class GRPOTrainingServer(VA_Server):
         )
         # Behavior stats use ALL rolled-out episodes (pre-filter). Training
         # stats (advantage, n_eps, group_count) use post-filter only.
-        logger.info(
-            "GRPO update start: rank=%s step=%s rollout_groups=%s kept_groups=%s rollout_episodes=%s "
+        self._info0(
+            "GRPO update start [rank0-local]: rank=%s step=%s rollout_groups=%s kept_groups=%s rollout_episodes=%s "
             "trained_episodes=%s minibatch_size=%s global_minibatch_size=%s degenerate_groups_skipped=%s "
             "reward_mean=%.4f reward_std=%.4f success_rate=%.4f "
             "old_logprob_mean=%.4f old_logprob_std=%.4f advantage_mean=%.4f advantage_std=%.4f "
@@ -1099,6 +1165,8 @@ class GRPOTrainingServer(VA_Server):
             if stop_outer:
                 break
             perm = torch.randperm(n_eps).tolist()
+            if self.diagnose_per_step_logratio:
+                self._per_step_diag_records = []
             epoch_loss = 0.0
             epoch_ratio = 0.0
             epoch_ratio_min = float("inf")
@@ -1143,10 +1211,16 @@ class GRPOTrainingServer(VA_Server):
                 # pinned to ~1.0 even on positive-advantage episodes.
                 self.optimizer.zero_grad(set_to_none=True)
                 with torch.no_grad():
+                    # Per-step diagnostic records only this clean detached
+                    # forward (not the grad-forward or the update-effect
+                    # recompute), so it reflects the pre-step policy on the
+                    # exact surface the ratio/clip decisions are derived from.
+                    self._per_step_diag_active = self.diagnose_per_step_logratio
                     mb_new_logprobs_detached = torch.cat(
                         [self.get_action_logprobs(ep).reshape(1) for ep in mb_episodes],
                         dim=0,
                     )
+                    self._per_step_diag_active = False
                 # Stats are computed entirely in detached space — used only
                 # for logging. Loss is informational; we do NOT backward it.
                 loss_stats = grpo_clipped_loss(
@@ -1154,6 +1228,8 @@ class GRPOTrainingServer(VA_Server):
                     mb_old_logprobs,
                     mb_advantages,
                     clip_range=self.clip_range,
+                    clip_range_high=self.clip_range_high,
+                    clip_range_low=self.clip_range_low,
                     log_ratio_clip=self.log_ratio_clip,
                     beta_kl=self.beta_kl,
                     entropy_coef=self.entropy_coef,
@@ -1175,14 +1251,34 @@ class GRPOTrainingServer(VA_Server):
                     )
                 ratio_for_grad = torch.exp(log_ratio_for_grad)
                 adv_f32 = mb_advantages.float()
-                clipped_high = (adv_f32 > 0) & (ratio_for_grad > 1.0 + self.clip_range)
-                clipped_low = (adv_f32 < 0) & (ratio_for_grad < 1.0 - self.clip_range)
+                clipped_high = (adv_f32 > 0) & (ratio_for_grad > 1.0 + self.clip_range_high)
+                clipped_low = (adv_f32 < 0) & (ratio_for_grad < 1.0 - self.clip_range_low)
                 clip_mask_episode = clipped_high | clipped_low
                 grad_coef = torch.where(
                     clip_mask_episode,
                     torch.zeros_like(ratio_for_grad),
                     -(ratio_for_grad * adv_f32) / float(len(mb_episodes)),
                 )
+
+                # KL-to-old penalty (added directly to the surrogate gradient,
+                # because grpo_clipped_loss's beta_kl term is computed for
+                # logging only and never backwarded — see the no_grad/loss
+                # comment above). Using the k3 estimator
+                #   KL(new‖old) ≈ ratio - 1 - log_ratio   (per element)
+                # whose gradient wrt new_logprob is ``ratio - 1``. We add
+                # ``beta_kl * (ratio - 1) / B`` to grad_coef. This term is
+                # applied UNCONDITIONALLY (not gated by clip_mask): its whole
+                # purpose is to pull back exactly the large-ratio outliers the
+                # PPO clip zeroes out, giving a continuous restoring force
+                # toward ratio=1. ``/ B`` matches the surrogate term's mean
+                # reduction. NOTE(update_epochs=1): within a single epoch
+                # new≈old for most minibatches, so this mainly constrains the
+                # in-step outliers (the high-clipfrac steps); it does not stop
+                # cross-update-step drift (the anchor resets each step).
+                if self.beta_kl:
+                    grad_coef = grad_coef + (
+                        float(self.beta_kl) * (ratio_for_grad - 1.0) / float(len(mb_episodes))
+                    )
 
                 # Grad-forward + per-chunk backward. Returned tensor is the
                 # logprob the gradient actually saw (per-chunk grad-forward
@@ -1226,8 +1322,8 @@ class GRPOTrainingServer(VA_Server):
                 mb_successes = [1.0 if bool(ep.success) else 0.0 for ep in mb_episodes]
                 mb_chunks = [float(len(ep.chunks)) for ep in mb_episodes]
                 mb_steps = [float(ep.step_count) for ep in mb_episodes if ep.step_count is not None]
-                logger.info(
-                    "GRPO update minibatch: rank=%s step=%s epoch=%s/%s mb=%s loss=%.6f approx_kl=%.6f "
+                self._info0(
+                    "GRPO update minibatch [rank0-local]: rank=%s step=%s epoch=%s/%s mb=%s loss=%.6f approx_kl=%.6f "
                     "ratio=%.6f ratio_min=%.4f ratio_max=%.4f clipfrac=%.4f "
                     "episodes=%s reward_mean=%.4f success_rate=%.4f adv_mean=%.4f adv_min=%.4f adv_max=%.4f "
                     "old_logprob_mean=%.4f new_logprob_mean=%.4f logratio_abs_max=%.4f "
@@ -1480,80 +1576,150 @@ class GRPOTrainingServer(VA_Server):
                     "update_effect_pos_count": update_effect_global_stats["pos_count"],
                     "update_effect_neg_count": update_effect_global_stats["neg_count"],
                 })
-            logger.info(
-                "GRPO update epoch: rank=%s step=%s epoch=%s/%s mbs=%s loss=%.6f approx_kl=%.6f ratio=%.6f "
-                "ratio_min=%.4f ratio_max=%.4f ratio_std=%.4f "
-                "mbs0_ratio=%.4f mbs0_ratio_min=%.4f mbs0_ratio_max=%.4f "
-                "logratio_min=%.4f logratio_max=%.4f logratio_std=%.4f logratio_abs_max=%.4f "
-                "logratio_per_chunk_abs_max=%.4f logratio_outlier_count=%s chunks_logratio_corr=%.3f "
-                "adv_min=%.4f adv_max=%.4f adv_abs_max=%.4f "
-                "chunks_min=%.0f chunks_max=%.0f chunks_mean=%.2f "
-                "grad_norm_mean=%.3f grad_norm_max=%.3f grad_norm_min=%.3f "
-                "clipfrac=%.6f old_logprob_mean=%.4f new_logprob_mean=%.4f lr=%.3e",
-                self.rank,
-                update_step,
-                epoch_idx + 1,
-                self.update_epochs,
-                n_mbs,
-                stats["loss"],
-                stats["approx_kl"],
-                stats["ratio"],
-                stats["ratio_min"],
-                stats["ratio_max"],
-                stats["ratio_std"],
-                stats["mbs0_ratio_mean"],
-                stats["mbs0_ratio_min"],
-                stats["mbs0_ratio_max"],
-                stats["logratio_min"],
-                stats["logratio_max"],
-                stats["logratio_std"],
-                stats["logratio_abs_max"],
-                stats["logratio_per_chunk_abs_max"],
-                stats["logratio_outlier_count"],
-                stats["chunks_logratio_corr"],
-                stats["advantage_min"],
-                stats["advantage_max"],
-                stats["advantage_abs_max"],
-                stats["chunks_min"],
-                stats["chunks_max"],
-                stats["chunks_mean"],
-                stats["grad_norm_mean"],
-                stats["grad_norm_max"],
-                stats["grad_norm_min"],
-                stats["clipfrac"],
-                stats["old_logprob_mean"],
-                stats["new_logprob_mean"],
-                stats["lr"],
-            )
-            for rank_idx, off in enumerate(worst_offenders):
+            # Reduce per-rank epoch stats to a single global view. Every rank
+            # executes the collective (lockstep at epoch end); only rank 0 emits
+            # the consolidated line and pushes to wandb. The per-rank locals
+            # remain for the rank-0-gated debug lines that follow.
+            global_stats = self._allreduce_named_stats(stats)
+            if self._is_rank0():
                 logger.info(
-                    "GRPO update offender: rank=%s offender_rank=%s log_ratio=%.4f advantage=%.4f chunks=%s "
-                    "step_count=%s success=%s reward=%.3f seed=%s group_member=%s group_id=%s",
-                    self.rank,
-                    rank_idx,
-                    off["log_ratio"],
-                    off["advantage"],
-                    off["chunks"],
-                    off["step_count"],
-                    off["success"],
-                    off["reward"],
-                    off["seed"],
-                    off["group_member"],
-                    off["group_id"],
-                )
-            if self.diagnose_update_effect:
-                logger.info(
-                    "GRPO update effect: rank=%s step=%s epoch=%s/%s local_active=%s global_active=%s "
-                    "global_delta_mean=%.6e global_signed_adv_delta_mean=%.6e "
-                    "global_pos_adv_delta_mean=%.6e global_pos_adv_delta_positive_frac=%.3f "
-                    "global_neg_adv_delta_mean=%.6e global_neg_adv_delta_negative_frac=%.3f "
-                    "local_delta_mean=%.6e local_signed_adv_delta_mean=%.6e "
-                    "local_pos_adv_delta_mean=%.6e local_neg_adv_delta_mean=%.6e",
-                    self.rank,
+                    "GRPO update epoch [global]: step=%s epoch=%s/%s ranks=%s mbs/rank=%s "
+                    "loss=%.6f approx_kl=%.6f ratio=%.6f ratio_min=%.4f ratio_max=%.4f ratio_std=%.4f "
+                    "mbs0_ratio=%.4f mbs0_ratio_min=%.4f mbs0_ratio_max=%.4f "
+                    "logratio_min=%.4f logratio_max=%.4f logratio_std=%.4f logratio_abs_max=%.4f "
+                    "logratio_per_chunk_abs_max=%.4f logratio_outlier_count=%s chunks_logratio_corr=%.3f "
+                    "adv_min=%.4f adv_max=%.4f adv_abs_max=%.4f "
+                    "chunks_min=%.0f chunks_max=%.0f chunks_mean=%.2f "
+                    "grad_norm_mean=%.3f grad_norm_max=%.3f grad_norm_min=%.3f "
+                    "clipfrac=%.6f old_logprob_mean=%.4f new_logprob_mean=%.4f lr=%.3e",
                     update_step,
                     epoch_idx + 1,
                     self.update_epochs,
-                    epoch_effect_active_count,
+                    self.world_size,
+                    n_mbs,
+                    global_stats["loss"],
+                    global_stats["approx_kl"],
+                    global_stats["ratio"],
+                    global_stats["ratio_min"],
+                    global_stats["ratio_max"],
+                    global_stats["ratio_std"],
+                    global_stats["mbs0_ratio_mean"],
+                    global_stats["mbs0_ratio_min"],
+                    global_stats["mbs0_ratio_max"],
+                    global_stats["logratio_min"],
+                    global_stats["logratio_max"],
+                    global_stats["logratio_std"],
+                    global_stats["logratio_abs_max"],
+                    global_stats["logratio_per_chunk_abs_max"],
+                    global_stats["logratio_outlier_count"],
+                    global_stats["chunks_logratio_corr"],
+                    global_stats["advantage_min"],
+                    global_stats["advantage_max"],
+                    global_stats["advantage_abs_max"],
+                    global_stats["chunks_min"],
+                    global_stats["chunks_max"],
+                    global_stats["chunks_mean"],
+                    global_stats["grad_norm_mean"],
+                    global_stats["grad_norm_max"],
+                    global_stats["grad_norm_min"],
+                    global_stats["clipfrac"],
+                    global_stats["old_logprob_mean"],
+                    global_stats["new_logprob_mean"],
+                    global_stats["lr"],
+                )
+                # Offenders are per-rank-local (worst |log_ratio| this rank saw);
+                # rank 0's are a representative sample, not a global top-k.
+                for rank_idx, off in enumerate(worst_offenders):
+                    logger.info(
+                        "GRPO update offender [rank0-local]: idx=%s log_ratio=%.4f advantage=%.4f chunks=%s "
+                        "step_count=%s success=%s reward=%.3f seed=%s group_member=%s group_id=%s",
+                        rank_idx,
+                        off["log_ratio"],
+                        off["advantage"],
+                        off["chunks"],
+                        off["step_count"],
+                        off["success"],
+                        off["reward"],
+                        off["seed"],
+                        off["group_member"],
+                        off["group_id"],
+                    )
+            if self.diagnose_per_step_logratio and self._per_step_diag_records:
+                # Group this epoch's per-transition records by denoising-step
+                # index i and report, per i: the flow-time t, sigma, and the
+                # distribution of per-step log_ratio = new_lp - old_lp. The
+                # decisive read: scan i from 0 (high-t, high-sigma) to the last
+                # (low-t, low-sigma) and watch |log_ratio|. If it rises as sigma
+                # falls, the fixed sigma schedule is ill-conditioned across
+                # steps (low-sigma steps dominate the chunk ratio); if it stays
+                # flat, the schedule is fine and ratio outliers come from
+                # elsewhere (two-forward drift, trajectory length).
+                by_step: dict[int, list[dict[str, float]]] = {}
+                for rec in self._per_step_diag_records:
+                    by_step.setdefault(rec["i"], []).append(rec)
+                per_step_summary: list[dict[str, float]] = []
+                for i in sorted(by_step):
+                    recs = by_step[i]
+                    lr = torch.tensor(
+                        [r["new_lp"] - r["old_lp"] for r in recs], dtype=torch.float32
+                    )
+                    t_mean = float(torch.tensor([r["t"] for r in recs]).mean())
+                    std_mean = float(torch.tensor([r["std"] for r in recs]).mean())
+                    per_step_summary.append(
+                        {
+                            "i": i,
+                            "t": t_mean,
+                            "sigma": std_mean,
+                            "count": int(lr.numel()),
+                            "logratio_mean": float(lr.mean()),
+                            "logratio_std": float(lr.std(unbiased=False)) if lr.numel() > 1 else 0.0,
+                            "logratio_abs_mean": float(lr.abs().mean()),
+                            "logratio_abs_max": float(lr.abs().max()),
+                        }
+                    )
+                # Per-step records are this rank's local transitions. The sigma
+                # schedule is identical across ranks, so rank 0's per-step profile
+                # is representative; emit only it to avoid a 5*world_size line dump.
+                if self._is_rank0():
+                    for s in per_step_summary:
+                        logger.info(
+                            "GRPO per-step logratio [rank0-local]: step=%s epoch=%s/%s i=%s t=%.4f sigma=%.4f "
+                            "count=%s logratio_mean=%.5f logratio_std=%.5f logratio_abs_mean=%.5f logratio_abs_max=%.5f",
+                            update_step,
+                            epoch_idx + 1,
+                            self.update_epochs,
+                            s["i"],
+                            s["t"],
+                            s["sigma"],
+                            s["count"],
+                            s["logratio_mean"],
+                            s["logratio_std"],
+                            s["logratio_abs_mean"],
+                            s["logratio_abs_max"],
+                        )
+                self._wandb_log(
+                    {
+                        f"debug/per_step_logratio/i{int(s['i'])}/{key}": s[key]
+                        for s in per_step_summary
+                        for key in ("sigma", "logratio_abs_mean", "logratio_std")
+                    },
+                )
+                if self.rank == 0:
+                    self._write_json(
+                        "latest_per_step_logratio.json",
+                        {"update_step": update_step, "epoch": epoch_idx + 1, "per_step": per_step_summary},
+                    )
+            if self.diagnose_update_effect and self._is_rank0():
+                # These fields are already cross-rank-reduced (global_active = sum
+                # over ranks); emit once from rank 0. Per-rank locals dropped.
+                logger.info(
+                    "GRPO update effect [global]: step=%s epoch=%s/%s active=%s "
+                    "delta_mean=%.6e signed_adv_delta_mean=%.6e "
+                    "pos_adv_delta_mean=%.6e pos_adv_delta_positive_frac=%.3f "
+                    "neg_adv_delta_mean=%.6e neg_adv_delta_negative_frac=%.3f",
+                    update_step,
+                    epoch_idx + 1,
+                    self.update_epochs,
                     stats["update_effect_active_count"],
                     stats["update_effect_delta_mean"],
                     stats["update_effect_signed_adv_delta_mean"],
@@ -1561,10 +1727,6 @@ class GRPOTrainingServer(VA_Server):
                     stats["update_effect_pos_adv_delta_positive_frac"],
                     stats["update_effect_neg_adv_delta_mean"],
                     stats["update_effect_neg_adv_delta_negative_frac"],
-                    update_effect_delta_mean,
-                    update_effect_signed_adv_delta_mean,
-                    update_effect_pos_adv_delta_mean,
-                    update_effect_neg_adv_delta_mean,
                 )
                 self._wandb_log({
                     "train_epoch/global_update_step": update_step,
@@ -1578,40 +1740,30 @@ class GRPOTrainingServer(VA_Server):
                     "train_epoch/update_effect_pos_count": stats["update_effect_pos_count"],
                     "train_epoch/update_effect_neg_count": stats["update_effect_neg_count"],
                 })
+            # Push the cross-rank-reduced epoch stats (rank-0-gated inside
+            # _wandb_log). reward_mean/success_rate are now the global rollout
+            # behavior, not rank 0's slice.
             self._wandb_log(
                 {
                     "train_epoch/global_update_step": update_step,
                     "train_epoch/epoch": epoch_idx + 1,
-                    "train_epoch/loss": stats["loss"],
-                    "train_epoch/approx_kl": stats["approx_kl"],
-                    "train_epoch/ratio": stats["ratio"],
-                    "train_epoch/ratio_min": stats["ratio_min"],
-                    "train_epoch/ratio_max": stats["ratio_max"],
-                    "train_epoch/ratio_std": stats["ratio_std"],
-                    "train_epoch/mbs0_ratio_mean": stats["mbs0_ratio_mean"],
-                    "train_epoch/mbs0_ratio_min": stats["mbs0_ratio_min"],
-                    "train_epoch/mbs0_ratio_max": stats["mbs0_ratio_max"],
-                    "train_epoch/clipfrac": stats["clipfrac"],
-                    "train_epoch/old_logprob_mean": stats["old_logprob_mean"],
-                    "train_epoch/new_logprob_mean": stats["new_logprob_mean"],
-                    "train_epoch/lr": stats["lr"],
                     "train_epoch/minibatches": n_mbs,
-                    "train_epoch/logratio_min": stats["logratio_min"],
-                    "train_epoch/logratio_max": stats["logratio_max"],
-                    "train_epoch/logratio_std": stats["logratio_std"],
-                    "train_epoch/logratio_abs_max": stats["logratio_abs_max"],
-                    "train_epoch/logratio_per_chunk_abs_max": stats["logratio_per_chunk_abs_max"],
-                    "train_epoch/logratio_outlier_count": stats["logratio_outlier_count"],
-                    "train_epoch/chunks_logratio_corr": stats["chunks_logratio_corr"],
-                    "train_epoch/advantage_min": stats["advantage_min"],
-                    "train_epoch/advantage_max": stats["advantage_max"],
-                    "train_epoch/advantage_abs_max": stats["advantage_abs_max"],
-                    "train_epoch/chunks_min": stats["chunks_min"],
-                    "train_epoch/chunks_max": stats["chunks_max"],
-                    "train_epoch/chunks_mean": stats["chunks_mean"],
-                    "train_epoch/grad_norm_mean": stats["grad_norm_mean"],
-                    "train_epoch/grad_norm_max": stats["grad_norm_max"],
-                    "train_epoch/grad_norm_min": stats["grad_norm_min"],
+                    **{
+                        f"train_epoch/{key}": global_stats[key]
+                        for key in (
+                            "loss", "approx_kl", "ratio", "ratio_min", "ratio_max",
+                            "ratio_std", "mbs0_ratio_mean", "mbs0_ratio_min",
+                            "mbs0_ratio_max", "clipfrac", "old_logprob_mean",
+                            "new_logprob_mean", "lr", "logratio_min", "logratio_max",
+                            "logratio_std", "logratio_abs_max",
+                            "logratio_per_chunk_abs_max", "logratio_outlier_count",
+                            "chunks_logratio_corr", "advantage_min", "advantage_max",
+                            "advantage_abs_max", "chunks_min", "chunks_max",
+                            "chunks_mean", "grad_norm_mean", "grad_norm_max",
+                            "grad_norm_min", "reward_mean", "reward_std",
+                            "success_rate", "step_count_mean",
+                        )
+                    },
                 },
             )
             if self.target_kl is not None:
@@ -1629,11 +1781,16 @@ class GRPOTrainingServer(VA_Server):
                     stop_outer = True
 
         self.global_update_step += 1
-        stats["global_update_step"] = self.global_update_step
-        self.last_stats = stats
-        self._write_json("latest_stats.json", stats)
+        # global_stats holds the last epoch's cross-rank-reduced view (every rank
+        # computed it in lockstep). Use it as the canonical record so update
+        # complete / checkpoints / wandb all report the global numbers, not rank
+        # 0's local slice. Falls back to local stats if no epoch ran.
+        canonical_stats = locals().get("global_stats", stats)
+        canonical_stats["global_update_step"] = self.global_update_step
+        self.last_stats = canonical_stats
+        self._write_json("latest_stats.json", canonical_stats)
         self._wandb_log(
-            {f"train/{key}": value for key, value in stats.items()},
+            {f"train/{key}": value for key, value in canonical_stats.items()},
         )
         if self.global_update_step % int(self.rl_cfg.get("checkpoint_interval", 1)) == 0:
             self.save_checkpoint()
@@ -1643,18 +1800,18 @@ class GRPOTrainingServer(VA_Server):
             # deterministic pass through their assignment.
             self._eval_pending = True
             self._eval_results = []
-            logger.info(
+            self._info0(
                 "GRPO eval phase armed: rank=%s global_update_step=%s eval_every=%s eval_action_steps=%s",
                 self.rank,
                 self.global_update_step,
                 self.eval_every,
                 self.eval_action_num_inference_steps,
             )
-        logger.info("GRPO update complete: rank=%s %s", self.rank, stats)
+        self._info0("GRPO update complete [global]: %s", self.last_stats)
 
     def _run_pending_updates(self) -> dict[str, Any]:
         if self.disable_updates:
-            logger.info("GRPO update skipped: rank=%s updates_disabled pending_ready_groups=%s", self.rank, len(self._pending_ready_groups))
+            self._info0("GRPO update skipped: rank=%s updates_disabled pending_ready_groups=%s", self.rank, len(self._pending_ready_groups))
             return {
                 "updated": False,
                 "reason": "updates_disabled",
@@ -1664,7 +1821,7 @@ class GRPOTrainingServer(VA_Server):
                 "status": self.last_stats,
             }
         if len(self._pending_ready_groups) < self.rollout_groups_per_update:
-            logger.info(
+            self._info0(
                 "GRPO update skipped: rank=%s not_enough_ready_groups pending=%s required=%s",
                 self.rank,
                 len(self._pending_ready_groups),
@@ -1683,7 +1840,7 @@ class GRPOTrainingServer(VA_Server):
         ready_groups = list(self._pending_ready_groups)
         self._pending_ready_groups = []
         start_step = self.global_update_step
-        logger.info(
+        self._info0(
             "GRPO pending update trigger: rank=%s ready_groups=%s required=%s group_ids=%s",
             self.rank,
             len(ready_groups),
@@ -1704,7 +1861,7 @@ class GRPOTrainingServer(VA_Server):
             # Re-queue everything so the next trigger retries.
             self._pending_ready_groups = ready_groups + self._pending_ready_groups
             raise
-        logger.info(
+        self._info0(
             "GRPO pending update complete: rank=%s updated_groups=%s global_update_step=%s last_stats=%s",
             self.rank,
             len(ready_groups),
@@ -2034,7 +2191,7 @@ class GRPOTrainingServer(VA_Server):
                 "group/pending_ready_groups": float(len(grouped)),
             })
 
-        logger.info(
+        self._info0(
             "GRPO replicated rollout aggregate: rank=%s step=%s episodes=%s groups=%s "
             "success_rate=%.4f reward_mean=%.4f rank_episode_counts=%s",
             self.rank,
@@ -2199,6 +2356,69 @@ class GRPOTrainingServer(VA_Server):
             "pos_count": int(pos_count),
             "neg_count": int(neg_count),
         }
+
+    # Per-epoch stats reduction spec: which keys combine across ranks by which op.
+    # Means assume each rank trained on an equal episode count (true unless
+    # degenerate-group filtering dropped different counts per rank, which is rare
+    # with shaped rewards); the small inaccuracy is acceptable for a log/wandb
+    # aggregate. Keys absent from all four lists pass through from the local dict
+    # (lr, *_minibatch_size, update_effect_* which are already global, etc.).
+    _EPOCH_STATS_MEAN_KEYS = (
+        "loss", "ratio", "ratio_std", "mbs0_ratio_mean", "clipfrac", "approx_kl",
+        "old_logprob_mean", "new_logprob_mean", "reward_mean", "reward_std",
+        "success_rate", "step_count_mean", "chunk_count_mean", "chunks_mean",
+        "grad_norm_mean", "chunks_logratio_corr", "logratio_std",
+    )
+    _EPOCH_STATS_MIN_KEYS = (
+        "ratio_min", "mbs0_ratio_min", "reward_min", "logratio_min",
+        "advantage_min", "chunks_min", "grad_norm_min",
+    )
+    _EPOCH_STATS_MAX_KEYS = (
+        "ratio_max", "mbs0_ratio_max", "reward_max", "logratio_max",
+        "logratio_abs_max", "logratio_per_chunk_abs_max", "advantage_max",
+        "advantage_abs_max", "chunks_max", "grad_norm_max",
+    )
+    _EPOCH_STATS_SUM_KEYS = (
+        "rollout_episode_count", "rollout_group_count", "kept_group_count",
+        "degenerate_groups_skipped", "trained_episode_count",
+        "minibatches_per_epoch", "logratio_outlier_count",
+    )
+
+    def _allreduce_named_stats(self, stats: dict[str, Any]) -> dict[str, float | Any]:
+        """Reduce a per-rank epoch ``stats`` dict to a global one across ranks.
+
+        Mean keys are averaged, min/max keys reduced with the matching op, sum
+        keys summed; everything else is passed through unchanged. No-op (returns
+        a shallow copy) when running single-rank. Safe to call only at a
+        synchronization point where every rank executes it in lockstep — the
+        per-epoch logging site qualifies (all ranks finish the epoch together)."""
+        out = dict(stats)
+        if getattr(self, "world_size", 1) <= 1 or not dist.is_initialized():
+            return out
+
+        mean_keys = [k for k in self._EPOCH_STATS_MEAN_KEYS if k in stats]
+        sum_keys = [k for k in self._EPOCH_STATS_SUM_KEYS if k in stats]
+        min_keys = [k for k in self._EPOCH_STATS_MIN_KEYS if k in stats]
+        max_keys = [k for k in self._EPOCH_STATS_MAX_KEYS if k in stats]
+
+        def _reduce(keys: list[str], op) -> list[float]:
+            if not keys:
+                return []
+            t = torch.tensor(
+                [float(stats[k]) for k in keys], device=self.device, dtype=torch.float64
+            )
+            dist.all_reduce(t, op=op)
+            return t.detach().cpu().tolist()
+
+        # mean and sum share one SUM all_reduce; means are divided afterwards.
+        sum_pack = mean_keys + sum_keys
+        for k, v in zip(sum_pack, _reduce(sum_pack, dist.ReduceOp.SUM)):
+            out[k] = v / float(self.world_size) if k in self._EPOCH_STATS_MEAN_KEYS else v
+        for k, v in zip(min_keys, _reduce(min_keys, dist.ReduceOp.MIN)):
+            out[k] = v
+        for k, v in zip(max_keys, _reduce(max_keys, dist.ReduceOp.MAX)):
+            out[k] = v
+        return out
 
     def _trainable_state_dict(self) -> dict[str, torch.Tensor]:
         """State dict containing only trainable params (LoRA adapters when LoRA is on)."""
@@ -2513,7 +2733,7 @@ class GRPOTrainingServer(VA_Server):
                         "eval/global_update_step": self.global_update_step,
                     },
                 )
-                logger.info(
+                self._info0(
                     "GRPO eval episode: rank=%s task=%s seed=%s success=%s reward=%.3f "
                     "step_count=%s collected=%s action_steps=%s",
                     self.rank,
@@ -2572,8 +2792,8 @@ class GRPOTrainingServer(VA_Server):
                     )
                 if not self.disable_updates:
                     self._pending_ready_groups.append(ready_group)
-                logger.info(
-                    "GRPO group ready: rank=%s group_id=%s size=%s success_rate=%.4f reward_mean=%.4f "
+                self._info0(
+                    "GRPO group ready [rank0-local]: rank=%s group_id=%s size=%s success_rate=%.4f reward_mean=%.4f "
                     "reward_std=%.4f step_count_mean=%.1f step_count_min=%.0f step_count_max=%.0f "
                     "chunk_count_mean=%.1f pending_ready_groups=%s/%s update_deferred=True",
                     self.rank,
@@ -2589,7 +2809,7 @@ class GRPOTrainingServer(VA_Server):
                     len(self._pending_ready_groups),
                     self.rollout_groups_per_update,
                 )
-            logger.info(
+            self._info0(
                 "GRPO episode finished: rank=%s rollout_episode=%s task=%s seed=%s group_id=%s episode_idx=%s "
                 "group_member=%s success=%s reward=%.3f step_count=%s chunks=%s ready_group=%s "
                 "pending_ready_groups=%s active_sessions=%s",
@@ -2689,7 +2909,8 @@ class GRPOTrainingServer(VA_Server):
                     self.rank,
                 )
             elif local_n:
-                logger.info(
+                # Non-rank0 bookkeeping only; rank 0 emits the aggregate above.
+                logger.debug(
                     "GRPO eval rank merged: rank=%s local_n=%s merged_n=%s global_update_step=%s",
                     self.rank,
                     local_n,
