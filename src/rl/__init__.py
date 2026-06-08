@@ -3,6 +3,8 @@
 from .grpo import (
     GRPOStats,
     compute_group_advantages,
+    flow_cps_logprob,
+    flow_cps_transition,
     gaussian_logprob,
     grpo_clipped_loss,
     sample_gaussian_transition,
@@ -16,6 +18,8 @@ __all__ = [
     "RolloutChunk",
     "RolloutStore",
     "compute_group_advantages",
+    "flow_cps_logprob",
+    "flow_cps_transition",
     "gaussian_logprob",
     "grpo_clipped_loss",
     "sample_gaussian_transition",

@@ -7,6 +7,7 @@ separate so it can be unit-tested without loading the full model.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 
@@ -121,6 +122,71 @@ def flow_grpo_sde_transition(
     }
 
 
+def flow_cps_transition(
+    x_t: torch.Tensor,
+    t: torch.Tensor | float,
+    dt: torch.Tensor | float,
+    v_theta: torch.Tensor,
+    *,
+    eta: float = 0.7,
+    t_eps: float = 1e-5,
+) -> dict[str, torch.Tensor]:
+    """Build the Coefficients-Preserving Sampling (CPS) Gaussian transition.
+
+    This is the Flow-CPS reformulation from Wang & Yu, *Coefficients-Preserving
+    Sampling for RL with Flow Matching* (arXiv:2509.05952), Eq. 8 + Eq. 13. It
+    is the drop-in alternative to :func:`flow_grpo_sde_transition`: same call
+    signature and the same ``{"mean", "std", ...}`` dict contract, so the rest of
+    the rollout/logprob plumbing is unchanged.
+
+    Unlike Flow-SDE, CPS is *coefficients-preserving*: at every step the total
+    injected noise level equals the scheduler's ``t_next = t - |dt|`` exactly
+    (the RSS of the predicted-noise and fresh-noise coefficients is
+    ``t_next * sqrt(cos^2 + sin^2) = t_next``), instead of Flow-SDE's
+    ``sqrt((t-dt)^2 + (sigma*dt)^2/t + ...) >= t - dt``. Two consequences this
+    code relies on:
+
+    - ``std`` is analytic — ``t_next * sin(eta*pi/2)`` — and depends only on the
+      scheduler, never on the model. There is no ``sigma_t = a*sqrt(t/(1-t))``
+      schedule and hence no ``sigma_min``/``sigma_max`` clamp (that clamp existed
+      only to compress Flow-SDE's ill-conditioned ``1/sigma^2`` spread).
+    - At the final denoising step ``t_next -> 0`` so ``std -> 0`` *by design*:
+      the executed action collapses to the deterministic prediction ``x0_hat``,
+      eliminating the train(SDE)/deploy(ODE) discrepancy. ``std`` is therefore
+      NOT floored — callers must score this transition with
+      :func:`flow_cps_logprob` (Eq. 15, no ``1/2*sigma^2`` denominator) rather
+      than the Gaussian logprob, which would divide by ~0 here.
+
+    ``eta`` in ``[0, 1]`` controls the stochastic strength (``eta=0`` recovers the
+    deterministic Flow-ODE Euler step; ``eta=1`` puts the full noise budget into
+    the fresh Gaussian). ``t`` is clamped to ``[t_eps, 1 - t_eps]`` only for the
+    ``x0_hat``/``x1_hat`` predictions; ``t_next`` is clamped at 0 (never floored
+    by ``t_eps``) so the clean final step is preserved.
+    """
+
+    t_safe = _broadcast_to_x(t, x_t).clamp(float(t_eps), 1.0 - float(t_eps))
+    dt_b = _broadcast_to_x(dt, x_t)
+    t_next = (t_safe + dt_b).clamp_min(0.0)
+    x0_hat = x_t - t_safe * v_theta
+    x1_hat = x_t + (1.0 - t_safe) * v_theta
+    angle = float(eta) * math.pi / 2.0
+    cos_c = math.cos(angle)
+    sin_c = math.sin(angle)
+    mean = (1.0 - t_next) * x0_hat + t_next * cos_c * x1_hat
+    std = t_next * sin_c
+    return {
+        "mean": mean,
+        "std": std,
+        "v_theta": v_theta,
+        "x0_hat": x0_hat,
+        "x1_hat": x1_hat,
+        "t": _as_tensor_like(t, x_t),
+        "dt": _as_tensor_like(dt, x_t),
+        "t_safe": t_safe,
+        "t_next": t_next,
+    }
+
+
 def _expand_mask(mask: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     while mask.ndim < target.ndim:
         mask = mask.unsqueeze(0)
@@ -204,6 +270,60 @@ def flow_grpo_gaussian_logprob(
     )
 
 
+def flow_cps_logprob(
+    value: torch.Tensor,
+    mean: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+    logprob_reduce: str = "sum",
+) -> torch.Tensor:
+    """Coefficients-Preserving Sampling log-probability (Eq. 15).
+
+    The CPS paper defines ``log p_theta(x_{t-dt} | x_t) = -||x_{t-dt} - mu||^2``,
+    dropping the ``1/(2*sigma^2)`` denominator and the ``log sigma`` / ``log 2pi``
+    constants from the Gaussian. This is the counterpart of
+    :func:`flow_grpo_gaussian_logprob` for transitions built by
+    :func:`flow_cps_transition`, and it takes NO ``std`` argument on purpose:
+
+    - ``std = t_next * sin(eta*pi/2)`` is model-independent, so ``log sigma`` and
+      ``log 2pi`` already cancel exactly in the GRPO ratio ``p_theta/p_theta_old``.
+      Only the ``1/(2*sigma^2)`` weight survives, and because it shrinks across
+      denoising steps it disproportionately weights the late (low-noise) steps —
+      the exact ill-conditioning the ``sigma_min/max`` clamp was fighting. Eq. 15
+      removes it so every step contributes comparably (and, per the paper,
+      reallocates weight toward the earlier, higher-diversity steps).
+    - At the final step ``std -> 0``; the Gaussian form would divide by ~0, while
+      this squared-error form stays finite (that step's contribution is just
+      ``-||x_next - mean||^2``, which is ~0 because the step is deterministic).
+
+    fp32 throughout for the same reason as :func:`gaussian_logprob` — the GRPO
+    ratio amplifies tiny mean deltas, so bf16 reduction noise alone produces
+    multi-nat log-ratio outliers. Returns a per-batch logprob; with
+    ``logprob_reduce='mean'`` it divides by the active element count.
+    """
+
+    logprob_reduce = _check_logprob_reduce(logprob_reduce)
+    compute_dtype = torch.float32
+    sq_err = (value.to(compute_dtype) - mean.to(compute_dtype)) ** 2
+
+    if mask is not None:
+        mask = _expand_mask(mask, sq_err)
+        sq_err = sq_err.masked_fill(~mask, 0.0)
+        active = mask.reshape(mask.shape[0], -1).sum(dim=1).clamp_min(1)
+    else:
+        active = torch.full(
+            (sq_err.shape[0],),
+            int(torch.tensor(sq_err.shape[1:]).prod().item()),
+            device=sq_err.device,
+            dtype=torch.long,
+        )
+
+    summed = sq_err.reshape(sq_err.shape[0], -1).sum(dim=1)
+    if logprob_reduce == "mean":
+        summed = summed / active.to(summed.dtype)
+    return -summed
+
+
 def _flow_grpo_same_variance_kl(
     mean: torch.Tensor,
     mean_ref: torch.Tensor,
@@ -216,6 +336,47 @@ def _flow_grpo_same_variance_kl(
     compute_dtype = torch.float32
     std_f = std.to(device=mean.device, dtype=compute_dtype).clamp_min(1e-8)
     kl = ((mean.to(compute_dtype) - mean_ref.to(compute_dtype)) ** 2) / (2.0 * std_f ** 2)
+    if mask is not None:
+        mask = _expand_mask(mask, kl)
+        kl = kl.masked_fill(~mask, 0.0)
+        active = mask.reshape(mask.shape[0], -1).sum(dim=1).clamp_min(1)
+    else:
+        active = torch.full(
+            (kl.shape[0],),
+            int(torch.tensor(kl.shape[1:]).prod().item()),
+            device=kl.device,
+            dtype=torch.long,
+        )
+    reduced = kl.reshape(kl.shape[0], -1).sum(dim=1)
+    if logprob_reduce == "mean":
+        reduced = reduced / active.to(reduced.dtype)
+    return reduced
+
+
+def _flow_cps_kl(
+    mean: torch.Tensor,
+    mean_ref: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+    logprob_reduce: str = "sum",
+) -> torch.Tensor:
+    """Coefficients-Preserving KL-to-reference (Eq. 16): ``||mu_theta - mu_ref||^2``.
+
+    The CPS counterpart of :func:`_flow_grpo_same_variance_kl`, with the
+    ``2*sigma^2`` denominator removed (consistent with the Eq. 15 logprob, and
+    required because CPS ``std -> 0`` at the final step would otherwise divide by
+    ~0). Takes no ``std`` argument.
+
+    NOTE: in this codebase the live GRPO update applies its KL penalty through the
+    k3 estimator on the trajectory ``log_ratio`` (``beta_kl * (ratio - 1)`` added
+    to ``grad_coef`` in ``server.py``), not through this closed form — which is
+    only exercised by :func:`flow_grpo_sde_step` and the tests. It is provided so
+    the CPS sampler path stays internally consistent for any future ref-KL use.
+    """
+
+    logprob_reduce = _check_logprob_reduce(logprob_reduce)
+    compute_dtype = torch.float32
+    kl = (mean.to(compute_dtype) - mean_ref.to(compute_dtype)) ** 2
     if mask is not None:
         mask = _expand_mask(mask, kl)
         kl = kl.masked_fill(~mask, 0.0)

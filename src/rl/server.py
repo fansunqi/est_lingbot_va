@@ -31,6 +31,8 @@ from src.distributed.util import init_distributed
 from src.inference.server import VA_Server, _show_denoise_progress, load_inference_config
 from src.rl.grpo import (
     compute_group_advantages,
+    flow_cps_logprob,
+    flow_cps_transition,
     flow_grpo_gaussian_logprob,
     flow_grpo_sde_transition,
     grpo_clipped_loss,
@@ -293,6 +295,24 @@ class GRPOTrainingServer(VA_Server):
             self.optimizer = torch.optim.AdamW(self.trainable_params, lr=lr, betas=betas, weight_decay=weight_decay)
         self.scheduler_lr = None
 
+        # Stochastic sampler for action rollout. ``flow_sde`` (default) is the
+        # Flow-GRPO Euler-Maruyama SDE; ``flow_cps`` is Coefficients-Preserving
+        # Sampling (arXiv:2509.05952), which keeps the injected noise level equal
+        # to the scheduler's t_next at every step and yields a clean final action.
+        # CPS uses ``flow_cps_eta`` (in [0,1]) for its noise strength and the
+        # Eq. 15 squared-error logprob; ``flow_grpo_noise_level`` and the
+        # ``flow_grpo_sigma_min/max`` clamp do not apply under CPS.
+        self.sampler = str(self.rl_cfg.get("sampler", "flow_sde")).lower()
+        if self.sampler not in ("flow_sde", "flow_cps"):
+            raise ValueError(
+                f"rl.sampler must be 'flow_sde' or 'flow_cps', got {self.sampler!r}"
+            )
+        self.flow_cps_eta = float(self.rl_cfg.get("flow_cps_eta", 0.7))
+        if not 0.0 <= self.flow_cps_eta <= 1.0:
+            raise ValueError(
+                f"rl.flow_cps_eta must be in [0, 1], got {self.flow_cps_eta}"
+            )
+
         # Flow-GRPO ODE-to-SDE noise scale ``a`` in sigma_t = a * sqrt(t / (1 - t)).
         # Legacy ``action_noise_std`` no longer controls rollout noise; the
         # transition std now comes from sigma_t * sqrt(abs(dt)).
@@ -382,6 +402,17 @@ class GRPOTrainingServer(VA_Server):
                 f"rl.noise_schedule must be 'per_chunk' or 'per_step', got {noise_schedule!r}"
             )
         self.noise_schedule = noise_schedule
+        if self.sampler == "flow_cps" and self.noise_schedule == "per_chunk":
+            # per_chunk injects noise only at the final step (t_next -> 0), where
+            # CPS's noise coefficient t_next*sin(eta*pi/2) is exactly 0 -> zero
+            # exploration. CPS must spread noise over the earlier steps, so it
+            # requires per_step (steps 0..N-2 carry noise, the final step is the
+            # deterministic clean action).
+            raise ValueError(
+                "rl.sampler='flow_cps' requires rl.noise_schedule='per_step' "
+                "(per_chunk injects noise only at the final step, where CPS noise "
+                "vanishes -> no exploration)."
+            )
         if self.noise_schedule == "per_chunk" and self.normalize_denoising_horizon:
             logger.warning(
                 "rl.logprob.normalize_denoising_horizon ignored: rank=%s "
@@ -395,7 +426,8 @@ class GRPOTrainingServer(VA_Server):
         self._init_wandb()
         logger.info(
             "GRPO server ready: rank=%s group_size=%s local_group_size=%s sharded=%s "
-            "update_epochs=%s flow_grpo_noise_level=%s flow_t_eps=%s logprob_reduce=%s "
+            "update_epochs=%s sampler=%s flow_cps_eta=%s flow_grpo_noise_level=%s "
+            "flow_t_eps=%s logprob_reduce=%s "
             "noise_schedule=%s "
             "disable_updates=%s train_action_steps=%s eval_action_steps=%s "
             "global_batch_size=%s local_batch_size=%s "
@@ -405,6 +437,8 @@ class GRPOTrainingServer(VA_Server):
             self.local_group_size,
             self.sharded_group_enabled,
             self.update_epochs,
+            self.sampler,
+            self.flow_cps_eta,
             self.flow_grpo_noise_level,
             self.flow_t_eps,
             self.logprob_reduce,
@@ -555,20 +589,60 @@ class GRPOTrainingServer(VA_Server):
         *,
         eps: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        transition = flow_grpo_sde_transition(
-            actions,
-            self._flow_time(timestep),
-            dt,
-            velocity,
-            noise_level=self.flow_grpo_noise_level,
-            t_eps=self.flow_t_eps,
-            sigma_min=getattr(self, "flow_grpo_sigma_min", None),
-            sigma_max=getattr(self, "flow_grpo_sigma_max", None),
-        )
+        if self.sampler == "flow_cps":
+            # CPS: analytic std = t_next*sin(eta*pi/2); no sigma_t schedule, so
+            # flow_grpo_noise_level / sigma_min/max do not apply. Score with
+            # _action_logprob (-> flow_cps_logprob, Eq. 15).
+            transition = flow_cps_transition(
+                actions,
+                self._flow_time(timestep),
+                dt,
+                velocity,
+                eta=self.flow_cps_eta,
+                t_eps=self.flow_t_eps,
+            )
+        else:
+            transition = flow_grpo_sde_transition(
+                actions,
+                self._flow_time(timestep),
+                dt,
+                velocity,
+                noise_level=self.flow_grpo_noise_level,
+                t_eps=self.flow_t_eps,
+                sigma_min=getattr(self, "flow_grpo_sigma_min", None),
+                sigma_max=getattr(self, "flow_grpo_sigma_max", None),
+            )
         if eps is not None:
             transition["x_next"] = transition["mean"] + transition["std"] * eps
             transition["eps"] = eps
         return transition
+
+    def _action_logprob(
+        self,
+        value: torch.Tensor,
+        transition: dict[str, torch.Tensor],
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score one transition under the active sampler's log-density.
+
+        flow_sde -> Gaussian logprob (with the 1/2*sigma^2 term); flow_cps ->
+        Eq. 15 squared-error logprob (no sigma denominator, so it stays finite at
+        the final step where CPS std -> 0).
+        """
+        if self.sampler == "flow_cps":
+            return flow_cps_logprob(
+                value,
+                transition["mean"],
+                mask=mask,
+                logprob_reduce=self.logprob_reduce,
+            )
+        return flow_grpo_gaussian_logprob(
+            value,
+            transition["mean"],
+            transition["std"],
+            mask=mask,
+            logprob_reduce=self.logprob_reduce,
+        )
 
     def _action_transformer_step(
         self,
@@ -795,13 +869,7 @@ class GRPOTrainingServer(VA_Server):
                 next_actions[:, ~self.action_mask] *= 0
                 if action_cond is not None:
                     next_actions[:, :, 0:1] = action_cond
-                lp = flow_grpo_gaussian_logprob(
-                    next_actions,
-                    transition["mean"],
-                    transition["std"],
-                    mask=mask,
-                    logprob_reduce=self.logprob_reduce,
-                )
+                lp = self._action_logprob(next_actions, transition, mask)
 
                 if per_chunk:
                     # Record the (prev, final) pair and the single timestep used.
@@ -916,13 +984,7 @@ class GRPOTrainingServer(VA_Server):
                 dt,
                 v_theta,
             )
-            lp = flow_grpo_gaussian_logprob(
-                next_actions,
-                transition["mean"],
-                transition["std"],
-                mask=mask,
-                logprob_reduce=self.logprob_reduce,
-            )
+            lp = self._action_logprob(next_actions, transition, mask)
             if self._per_step_diag_active:
                 self._record_per_step_diag(chunk, 0, t, transition["std"], lp)
             # Mirror rollout's last_step cache write (see per_step branch below
@@ -956,13 +1018,7 @@ class GRPOTrainingServer(VA_Server):
                 dt,
                 v_theta,
             )
-            lp = flow_grpo_gaussian_logprob(
-                next_actions,
-                transition["mean"],
-                transition["std"],
-                mask=mask,
-                logprob_reduce=self.logprob_reduce,
-            )
+            lp = self._action_logprob(next_actions, transition, mask)
             if self._per_step_diag_active:
                 self._record_per_step_diag(chunk, i, t, transition["std"], lp)
             transition_logprobs.append(lp)

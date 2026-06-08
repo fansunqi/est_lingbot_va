@@ -67,13 +67,42 @@ rl:
   group_size: 8
   # 2026-05-23: 2 → 4,episodes/update 从 16 升到 32,
   # 减半 advantage 的 Bernoulli 噪声(σ 从 0.18 → 0.12)。
-  rollout_groups_per_update: 32
+  rollout_groups_per_update: 16
   update_epochs: 1
-  batch_size: 4
+  batch_size: 16
+
+  # Stochastic sampler: flow_sde (default, Flow-GRPO Euler-Maruyama SDE) or
+  # flow_cps (Coefficients-Preserving Sampling, arXiv:2509.05952). flow_sde keeps
+  # this run bit-for-bit identical to the historical baseline; flow_cps is the
+  # opt-in A/B path. See the "Flow-CPS A/B" block below for the CPS-side knobs.
+  sampler: flow_cps
+  flow_t_eps: 1.0e-5
+
+  # ── Flow-CPS A/B (only active when sampler: flow_cps) ────────────────────────
+  # CPS makes the per-step injected noise level equal the scheduler's t_next
+  # exactly, so the sigma_t = a*sqrt(t/(1-t)) schedule and its sigma_min/max
+  # clamp do NOT apply, and the final step is a clean (deterministic) action.
+  # To run CPS, flip `sampler: flow_cps` and apply the overrides flagged [CPS]:
+  #   sampler: flow_cps
+  #   flow_cps_eta: 0.7        # [CPS] noise strength in [0,1]; paper uses 0.7-0.9.
+  #                            #       eta=0 -> deterministic ODE (no exploration).
+  #   flow_t_eps: 1.0e-5       # [CPS] MUST be small, not 0.1 — a large t_eps would
+  #                            #       keep injecting ~t_eps*sin(.) noise at the
+  #                            #       final step and destroy the clean action.
+  #   # flow_grpo_sigma_min/max: remove or ignore (no-op under CPS).
+  #   # noise_schedule MUST stay per_step (per_chunk -> zero exploration under CPS).
+  #   # Trust region (clip_range / target_kl / beta_kl) is calibrated to the
+  #   # normalized-Gaussian logprob scale; CPS's Eq.15 logprob (-||x-mu||^2, no
+  #   # 1/2sigma^2) changes the log_ratio magnitude, so RE-TUNE by diagnosis:
+  #   # turn on diagnose_per_step_logratio + diagnose_update_effect, read the
+  #   # |log_ratio_i| distribution, and set clip_range/target_kl so clipfrac
+  #   # lands ~5-10%. Expect |log_ratio_i| to be roughly FLAT across steps under
+  #   # CPS (vs rising as sigma shrinks under SDE) — that flatness is the win.
+  flow_cps_eta: 0.5
+  # ─────────────────────────────────────────────────────────────────────────────
 
   # Flow-GRPO SDE noise scale a in sigma_t = a * sqrt(t / (1 - t)).
   flow_grpo_noise_level: 0.3
-  flow_t_eps: 0.1
   # Clamp sigma_t into a narrow band (applied to drift + std consistently, so the
   # SDE stays marginal-preserving for the clamped coefficient). The raw schedule
   # spans sigma_t∈[0.15,0.9] at noise_level=0.3 → std∈[0.067,0.40] across the 5
@@ -118,7 +147,7 @@ rl:
   # 结果不进 training pool,只打到 wandb eval/* 用来 track 真实 success rate。
   # 0 = 关闭。和 checkpoint_interval 对齐,每次出 ckpt 同步做一次 eval。
   eval_enabled: true
-  eval_every: 4
+  eval_every: 2
   # Periodic and eval-only GRPO eval use this deterministic action denoising horizon.
   # Keep it explicit so checkpoint re-eval cannot silently fall back to the base 50-step config.
   eval_action_num_inference_steps: 5
@@ -163,7 +192,7 @@ rl:
     # 2026-05-23: baseline 是 2e-5,这一轮 4×↓ 到 5e-6,配合 normalized 信任域。
     # 若 approx_kl 仍稳定 < 0.05 且 clipfrac 长时间 < 5%,再往上抬到 1e-5/2e-5。
     # 2026-06-06: 因崩溃-自愈不稳定,从 2e-4 砍半到 1e-4,配合上方 beta_kl=0.05。
-    lr: 1e-4
+    lr: 5e-5
     weight_decay: 0.0
     betas: [0.9, 0.95]
 

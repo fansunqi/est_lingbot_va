@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 from torch import nn
@@ -5,6 +7,8 @@ from torch import nn
 from src.rl.grpo import (
     compute_group_advantages,
     compute_flow_grpo_logprob,
+    flow_cps_logprob,
+    flow_cps_transition,
     flow_grpo_sde_step,
     gaussian_logprob,
     grpo_clipped_loss,
@@ -139,6 +143,91 @@ def test_flow_grpo_logprob_reduce_mean_scales_over_non_batch_dims():
     assert torch.allclose(lp_mean * x_t[0].numel(), out["logprob"])
 
 
+def test_flow_cps_transition_is_coefficients_preserving():
+    """CPS noise level (RSS of predicted-noise + fresh-noise coefs) == t_next."""
+    torch.manual_seed(0)
+    x_t = torch.randn(2, 3, 4, 5)
+    v = torch.randn_like(x_t)
+    t = torch.tensor([0.8, 0.5])
+    dt = torch.tensor([-0.1, -0.2])
+    eta = 0.7
+
+    out = flow_cps_transition(x_t, t, dt, v, eta=eta)
+
+    t_b = t.view(2, 1, 1, 1)
+    t_next = (t_b + dt.view(2, 1, 1, 1)).clamp_min(0.0)
+    x0 = x_t - t_b * v
+    x1 = x_t + (1.0 - t_b) * v
+    cos_c, sin_c = math.cos(eta * math.pi / 2), math.sin(eta * math.pi / 2)
+
+    # mean = (1 - t_next) x0_hat + t_next cos x1_hat (noise excluded).
+    assert torch.allclose(out["mean"], (1.0 - t_next) * x0 + t_next * cos_c * x1, atol=1e-5)
+    # sample coefficient is exactly (1 - t_next).
+    assert torch.allclose(1.0 - t_next, (1.0 - out["t_next"]), atol=1e-6)
+    # total noise level: RSS of the x1 coef (t_next*cos) and the eps coef (std)
+    # equals t_next, i.e. the scheduler's noise level (coefficients-preserving).
+    x1_coef = t_next * cos_c
+    total_noise = torch.sqrt(x1_coef ** 2 + out["std"] ** 2)
+    assert torch.allclose(total_noise, t_next, atol=1e-5)
+
+
+def test_flow_cps_transition_final_step_is_clean():
+    """At the final step t_next -> 0 so std -> 0 and mean collapses to x0_hat."""
+    x_t = torch.randn(1, 3, 4)
+    v = torch.randn_like(x_t)
+    t = torch.tensor([0.2])
+    dt = torch.tensor([-0.2])  # t_next = 0
+
+    out = flow_cps_transition(x_t, t, dt, v, eta=0.9)
+
+    assert torch.allclose(out["std"], torch.zeros_like(out["std"]), atol=1e-7)
+    assert torch.allclose(out["mean"], x_t - 0.2 * v, atol=1e-5)
+
+
+def test_flow_cps_eta_zero_matches_ode_euler_step():
+    """eta=0 recovers the deterministic Flow-ODE Euler step (== scheduler.step)."""
+    scheduler = FlowMatchScheduler(shift=1.0, sigma_min=0.0, extra_one_step=True)
+    scheduler.set_timesteps(8)
+    sample = torch.randn(1, 3, 2, 4, 1)
+    v = torch.randn_like(sample)
+    ts = scheduler.timesteps[3]
+    next_ts = scheduler.timesteps[4]
+    num = scheduler.num_train_timesteps
+    t = ts / num
+    dt = (next_ts - ts) / num
+
+    out = flow_cps_transition(sample, t, dt, v, eta=0.0)
+
+    assert torch.allclose(out["mean"], scheduler.step(v, ts, sample), atol=1e-5)
+    assert torch.allclose(out["std"], torch.zeros_like(out["std"]), atol=1e-7)
+
+
+def test_flow_cps_logprob_is_negative_squared_error():
+    """Eq.15: log p = -||value - mean||^2, no 1/2sigma^2 / logsigma / log2pi."""
+    torch.manual_seed(1)
+    value = torch.randn(2, 3, 4)
+    mean = torch.randn(2, 3, 4)
+    mask = torch.ones_like(value, dtype=torch.bool)
+
+    lp_sum = flow_cps_logprob(value, mean, mask=mask, logprob_reduce="sum")
+    expected_sum = -((value - mean) ** 2).reshape(2, -1).sum(dim=1)
+    assert torch.allclose(lp_sum, expected_sum, atol=1e-5)
+
+    lp_mean = flow_cps_logprob(value, mean, mask=mask, logprob_reduce="mean")
+    assert torch.allclose(lp_mean * value[0].numel(), lp_sum, atol=1e-5)
+
+
+def test_flow_cps_logprob_respects_mask():
+    value = torch.randn(1, 2, 3)
+    mean = torch.zeros_like(value)
+    mask = torch.ones_like(value, dtype=torch.bool)
+    mask[:, :, 0] = False  # drop one column
+
+    lp = flow_cps_logprob(value, mean, mask=mask, logprob_reduce="sum")
+    expected = -(value[:, :, 1:] ** 2).reshape(1, -1).sum(dim=1)
+    assert torch.allclose(lp, expected, atol=1e-5)
+
+
 def test_replicated_sharded_minibatch_size_keeps_config_batch_global():
     from src.rl.server import _resolve_grpo_minibatch_sizes
 
@@ -201,7 +290,7 @@ def test_episode_summary_stats_aggregates_counts_and_means():
     assert stats["chunk_count_mean"] == 3.0
 
 
-def _make_fake_grpo_server(*, noise_schedule="per_step"):
+def _make_fake_grpo_server(*, noise_schedule="per_step", sampler="flow_sde"):
     # GRPOTrainingServer.__init__ pulls in the full inference stack (T5, VAE,
     # transformer weights, distributed init, ...). For the eval_mode sampling
     # branch we only need the subset of attributes _sample_action_chunk reads;
@@ -217,6 +306,8 @@ def _make_fake_grpo_server(*, noise_schedule="per_step"):
     server.latent_width = 4
     server.action_per_frame = 2
     server.noise_schedule = noise_schedule
+    server.sampler = sampler
+    server.flow_cps_eta = 0.7
     server.normalize_denoising_horizon = True
     server.normalize_action_dim = True
     server.logprob_reduce = "mean"
@@ -303,6 +394,19 @@ def test_sample_action_chunk_training_mode_per_step_records_logprobs():
     assert len(chunk.action_chain) >= 2
     assert chunk.old_logprobs.numel() > 0
     assert chunk.action_timesteps.numel() > 0
+
+
+def test_sample_action_chunk_cps_per_step_produces_finite_logprobs():
+    # CPS routes through _flow_grpo_action_transition (flow_cps_transition) and
+    # _action_logprob (flow_cps_logprob). The final step has t_next=0 -> std=0;
+    # the Eq.15 squared-error logprob must stay finite there (the Gaussian form
+    # would divide by ~0). This guards the sampler wiring end to end.
+    server = _make_fake_grpo_server(noise_schedule="per_step", sampler="flow_cps")
+
+    _, chunk = server._sample_action_chunk({"obs": None}, frame_st_id=0, eval_mode=False)
+
+    assert chunk.old_logprobs.numel() > 0
+    assert torch.isfinite(chunk.old_logprobs).all()
 
 
 class _SyntheticChunkPolicy(nn.Module):
