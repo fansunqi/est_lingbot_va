@@ -53,7 +53,7 @@ fi
 overrides+=("$@")
 
 # WandB credentials — overridden by user shell if pre-exported.
-export WANDB_API_KEY="${WANDB_API_KEY:-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}"
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.wandb.ai}"
 export WANDB_TEAM_NAME="${WANDB_TEAM_NAME:-Robotics-FiT}"
 

@@ -1,7 +1,7 @@
 mode: server
 
 # Model
-model_name_or_path: /home/cxy/ocean/models/lingbot-va-posttrain-robotwin
+model_name_or_path: /apdcephfs_tj5/share_303547874/stevefan/hf_home_new/hub/models--robbyant--lingbot-va-posttrain-robotwin/snapshots/8c9dea8abbc5c91cc9e18bc3264b8915083bbe70
 param_dtype: bfloat16
 patch_size: [1, 2, 2]
 enable_offload: false

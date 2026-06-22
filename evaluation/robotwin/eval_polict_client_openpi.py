@@ -6,7 +6,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/home/cxy/WAM/RoboTwin")
+robowin_root = Path(os.environ.get("ROBOTWIN_ROOT", "/apdcephfs_cq8/share_1611098/stevefan/robotics/RoboTwin"))
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 

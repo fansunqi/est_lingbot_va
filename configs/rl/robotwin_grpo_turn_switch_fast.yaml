@@ -48,8 +48,8 @@ prompt_max_sequence_length: 226
 action_num_inference_steps: 5
 
 wandb:
-  mode: offline
-  project: lingbot-grpo
+  mode: online
+  project: est_rl
   entity: Robotics-FiT
   name: robotwin-grpo-turn-switch-fast
   job_type: grpo-validation
