@@ -180,13 +180,13 @@ rl:
   # Set true for a short diagnostic run. It roughly doubles update compute by
   # recomputing each minibatch after optimizer.step, then logs whether positive
   # advantages increased logprob and negative advantages decreased it.
-  diagnose_update_effect: true
+  diagnose_update_effect: false
   # Per-denoising-step log_ratio breakdown. Logs, per step index i, the
   # flow-time t, sigma, and |log_ratio| distribution. Read it to decide whether
   # the fixed sigma=a*sqrt(t/(1-t)) schedule is ill-conditioned across steps:
   # if |log_ratio| rises as sigma falls (later i), low-sigma steps dominate the
   # chunk ratio; if flat, the schedule is fine and outliers come from elsewhere.
-  diagnose_per_step_logratio: true
+  diagnose_per_step_logratio: false
 
   optimizer:
     # 2026-05-23: baseline 是 2e-5,这一轮 4×↓ 到 5e-6,配合 normalized 信任域。
