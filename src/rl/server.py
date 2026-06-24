@@ -2678,7 +2678,10 @@ class GRPOTrainingServer(VA_Server):
         return str(export_root)
 
     def load_checkpoint(self, path: str) -> None:
-        ckpt = torch.load(path, map_location="cpu")
+        # weights_only=False: torch>=2.6 defaults to True, which rejects the
+        # EasyDict `config` blob we serialize alongside the weights. The
+        # checkpoint is produced by our own training run (trusted source).
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         self.transformer.load_state_dict(ckpt["transformer"], strict=False)
         if self.optimizer is not None and "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
