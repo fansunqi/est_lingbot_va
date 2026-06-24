@@ -130,6 +130,7 @@ for CLIENT_ID in $(seq 0 $((NUM_CLIENTS - 1))); do
   PYTHONWARNINGS=ignore::UserWarning \
   setsid "${PYTHON}" -u -m evaluation.robotwin.grpo_rollout_client \
     --assignment "${ASSIGNMENT}" \
+    $([[ -n "${EVAL_ASSIGNMENT:-}" ]] && printf -- '--eval_assignment %s' "${EVAL_ASSIGNMENT}") \
     --host "${HOST}" \
     --port "${PORT}" \
     --save_root "${SAVE_ROOT}" \

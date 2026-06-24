@@ -147,7 +147,7 @@ rl:
   # 结果不进 training pool,只打到 wandb eval/* 用来 track 真实 success rate。
   # 0 = 关闭。和 checkpoint_interval 对齐,每次出 ckpt 同步做一次 eval。
   eval_enabled: true
-  eval_every: 2
+  eval_every: 4
   # Periodic and eval-only GRPO eval use this deterministic action denoising horizon.
   # Keep it explicit so checkpoint re-eval cannot silently fall back to the base 50-step config.
   eval_action_num_inference_steps: 5

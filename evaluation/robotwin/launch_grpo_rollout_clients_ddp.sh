@@ -144,6 +144,7 @@ for SERVER_RANK in $(seq 0 $((NUM_SERVERS - 1))); do
   # NUM_SERVERS=2, GROUP_SIZE=4, NUM_CLIENTS_PER_SERVER=1 each rank's single
   # client owns members [rank, rank+2] within every group_id.
   ASSIGNMENT="${ASSIGNMENT}" \
+  EVAL_ASSIGNMENT="${EVAL_ASSIGNMENT:-}" \
   PORT="${port}" \
   HOST="${HOST}" \
   SAVE_ROOT="${SAVE_ROOT}" \

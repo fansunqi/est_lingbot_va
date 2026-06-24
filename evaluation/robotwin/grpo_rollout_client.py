@@ -802,6 +802,15 @@ def wait_and_run_eval_pass(
 def main():
     parser = argparse.ArgumentParser(description="RoboTwin GRPO rollout client")
     parser.add_argument("--assignment", type=str, required=True)
+    parser.add_argument(
+        "--eval_assignment",
+        type=str,
+        default=None,
+        help="Separate assignment JSON for deterministic validation passes. "
+        "If unset, validation reuses --assignment. Lets rollout (training) and "
+        "eval (validation) use different seed sets, e.g. 16-seed rollout + "
+        "64-seed eval.",
+    )
     parser.add_argument("--port", type=int, default=29546)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--save_root", type=str, default="./results/grpo")
@@ -928,6 +937,19 @@ def main():
     with open(args.assignment, "r") as f:
         assignment = json.load(f)
 
+    # Validation can use a separate (e.g. larger) seed set than rollout. When
+    # --eval_assignment is unset, fall back to the rollout assignment so old
+    # invocations are unchanged.
+    if args.eval_assignment:
+        with open(args.eval_assignment, "r") as f:
+            eval_assignment = json.load(f)
+        print(
+            f"[eval] using separate eval assignment: {len(eval_assignment)} items "
+            f"from {args.eval_assignment} (rollout uses {len(assignment)} items)"
+        )
+    else:
+        eval_assignment = assignment
+
     run_dir = Path(args.run_dir) if args.run_dir else Path(args.save_root)
     metrics_dir = run_dir / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -979,12 +1001,12 @@ def main():
             print(
                 f"[eval] initial eval armed at global_update_step={gus}; "
                 f"client {args.client_id}/{args.num_clients} joining "
-                f"parallel deterministic pass over {len(assignment)} items "
+                f"parallel deterministic pass over {len(eval_assignment)} items "
                 f"(action_steps={eval_steps})"
             )
             wait_and_run_eval_pass(
                 model,
-                assignment,
+                eval_assignment,
                 args,
                 run_dir=run_dir,
                 global_update_step=gus,
@@ -1004,7 +1026,7 @@ def main():
             )
             wait_and_run_eval_pass(
                 model,
-                assignment,
+                eval_assignment,
                 args,
                 run_dir=run_dir,
                 global_update_step=gus,
@@ -1177,11 +1199,11 @@ def main():
                         print(
                             f"[eval] phase armed at global_update_step={gus}; "
                             f"client {args.client_id}/{args.num_clients} joining "
-                            f"parallel deterministic pass over {len(assignment)} items"
+                            f"parallel deterministic pass over {len(eval_assignment)} items"
                         )
                         wait_and_run_eval_pass(
                             model,
-                            assignment,
+                            eval_assignment,
                             args,
                             run_dir=run_dir,
                             global_update_step=gus,
@@ -1197,11 +1219,11 @@ def main():
                         gus = int(status.get("global_update_step", 0))
                         print(
                             f"[eval] phase armed at global_update_step={gus}; "
-                            f"running deterministic pass over {len(assignment)} items"
+                            f"running deterministic pass over {len(eval_assignment)} items"
                         )
                         wait_and_run_eval_pass(
                             model,
-                            assignment,
+                            eval_assignment,
                             args,
                             run_dir=run_dir,
                             global_update_step=gus,
