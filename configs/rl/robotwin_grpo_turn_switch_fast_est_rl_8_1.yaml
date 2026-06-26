@@ -1,0 +1,205 @@
+base_inference_config: configs/inference/robotwin.yaml
+
+# Fast GRPO sanity-check config for turn_switch — standard GRPO setting.
+#
+# One update step batches `rollout_groups_per_update` groups together:
+#   - advantage is normalized within each group (GRPO's defining property)
+#   - all episodes are concatenated into one training pool
+#   - each of `update_epochs` epochs shuffles the pool and steps the
+#     optimizer once per minibatch of `batch_size` episodes
+#
+# Episode pool per update = group_size × rollout_groups_per_update
+#                         = 4 × 4 = 16 episodes
+# Optimizer steps per update = update_epochs × ceil(16 / batch_size)
+#                            = 1 × 4 = 4
+#
+# Previous run (lr=2e-5, epochs=2, rgpu=2) saw approx_kl repeatedly hit
+# 0.15–0.33 in a single epoch and force early-stop in 14/22 updates while
+# success_rate oscillated between 0.12 and 0.88 without a clear trend.
+# Current values halve the per-step move (lr 2e-5 → 1e-5), double the
+# trained episode count per update for less noisy advantages, and drop to
+# a single epoch since epoch 2 was the one overshooting trust-region.
+# Only ratio/approx_kl from minibatches after the very first one of epoch
+# 1 are interpretable (the first minibatch necessarily has ratio=1
+# because new_logprobs is recomputed at its top).
+#
+# 2026-05-20 follow-up: at lr=1e-5 approx_kl still triggered early-stop in
+# 17/30 updates with mean ratio sitting at 0.83 (never >1). Halving lr
+# again (1e-5 → 5e-6) to bring approx_kl closer to the 0.1 target and let
+# more minibatches run before the trust-region brake kicks in.
+#
+# 2026-05-23 walkback: 22 号关 normalization + 紧 clip/target_kl 是误诊。
+# un-normalized 下 trajectory logprob ≈ 数万元素的高斯和,即使 lr=1e-8 一次
+# AdamW step (~1e-5 量级 Δθ) 在 outlier 轨迹(长 + 失败 + 尾部)上也会累出
+# -100~-2000 nats log_ratio,approx_kl=0.27 对 lr 不敏感。回到 normalized
+# 信任域(clip_range=0.2, target_kl=0.1 是 per-element 量级),原 baseline
+# approx_kl 0.0001–0.04 + early-stop 14/22 其实是健康区间,success_rate
+# 振荡的真正原因是 8 episodes/update 的 Bernoulli 噪声(σ≈0.18)。
+# 本轮:rgpu 2→4 把 episodes/update 升到 32 减半 advantage 噪声;lr 从
+# baseline 的 2e-5 砍到 5e-6 防过冲;若 approx_kl 仍稳定 < target,再抬 lr。
+
+port: 29546
+save_root: experiments/robotwin_grpo_turn_switch_fast
+guidance_scale: 5
+action_guidance_scale: 1
+prompt_max_sequence_length: 226
+# Override base inference config (50) to keep per_step recompute memory bounded.
+# At N=5 each chunk holds ~5x the activation graph of per_chunk during update.
+action_num_inference_steps: 5
+
+wandb:
+  mode: online
+  project: est_rl_8_1
+  entity: Robotics-FiT
+  name: robotwin-grpo-turn-switch-scratch-20260626
+  job_type: grpo-validation
+  tags:
+    - grpo
+    - robotwin
+    - turn_switch
+    - fast
+
+rl:
+  reward:
+    type: sparse_success
+
+  use_fsdp: false
+  group_size: 8
+  # 2026-05-23: 2 → 4,episodes/update 从 16 升到 32,
+  # 减半 advantage 的 Bernoulli 噪声(σ 从 0.18 → 0.12)。
+  rollout_groups_per_update: 16
+  update_epochs: 1
+  batch_size: 16
+
+  # Stochastic sampler: flow_sde (default, Flow-GRPO Euler-Maruyama SDE) or
+  # flow_cps (Coefficients-Preserving Sampling, arXiv:2509.05952). flow_sde keeps
+  # this run bit-for-bit identical to the historical baseline; flow_cps is the
+  # opt-in A/B path. See the "Flow-CPS A/B" block below for the CPS-side knobs.
+  sampler: flow_cps
+  flow_t_eps: 1.0e-5
+
+  # ── Flow-CPS A/B (only active when sampler: flow_cps) ────────────────────────
+  # CPS makes the per-step injected noise level equal the scheduler's t_next
+  # exactly, so the sigma_t = a*sqrt(t/(1-t)) schedule and its sigma_min/max
+  # clamp do NOT apply, and the final step is a clean (deterministic) action.
+  # To run CPS, flip `sampler: flow_cps` and apply the overrides flagged [CPS]:
+  #   sampler: flow_cps
+  #   flow_cps_eta: 0.7        # [CPS] noise strength in [0,1]; paper uses 0.7-0.9.
+  #                            #       eta=0 -> deterministic ODE (no exploration).
+  #   flow_t_eps: 1.0e-5       # [CPS] MUST be small, not 0.1 — a large t_eps would
+  #                            #       keep injecting ~t_eps*sin(.) noise at the
+  #                            #       final step and destroy the clean action.
+  #   # flow_grpo_sigma_min/max: remove or ignore (no-op under CPS).
+  #   # noise_schedule MUST stay per_step (per_chunk -> zero exploration under CPS).
+  #   # Trust region (clip_range / target_kl / beta_kl) is calibrated to the
+  #   # normalized-Gaussian logprob scale; CPS's Eq.15 logprob (-||x-mu||^2, no
+  #   # 1/2sigma^2) changes the log_ratio magnitude, so RE-TUNE by diagnosis:
+  #   # turn on diagnose_per_step_logratio + diagnose_update_effect, read the
+  #   # |log_ratio_i| distribution, and set clip_range/target_kl so clipfrac
+  #   # lands ~5-10%. Expect |log_ratio_i| to be roughly FLAT across steps under
+  #   # CPS (vs rising as sigma shrinks under SDE) — that flatness is the win.
+  flow_cps_eta: 0.5
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  # Flow-GRPO SDE noise scale a in sigma_t = a * sqrt(t / (1 - t)).
+  flow_grpo_noise_level: 0.3
+  # Clamp sigma_t into a narrow band (applied to drift + std consistently, so the
+  # SDE stays marginal-preserving for the clamped coefficient). The raw schedule
+  # spans sigma_t∈[0.15,0.9] at noise_level=0.3 → std∈[0.067,0.40] across the 5
+  # denoising steps, an ~6x spread that lets the low-sigma late steps dominate the
+  # GRPO ratio by ~1/sigma^2 (last step hit |log_ratio|≈0.2, max 4.3 = ratio 75x).
+  # [0.34, 0.9] lifts the floor 2.2x → std∈[0.15,0.40], compressing the cross-step
+  # spread from ~6x to ~2.7x. Remove either key = that side unclamped.
+  flow_grpo_sigma_min: 0.34
+  flow_grpo_sigma_max: 0.9
+  log_ratio_clip: 20.0
+  # 2026-05-23: 回到 PPO 默认 per-element 信任域(配合下方 normalize_* 全开)。
+  clip_range: 0.2
+  # 2026-06-05 Plan A: 不对称信任域(LaST-R1 clip_ratio_high/low 同款)。
+  # 诊断显示 pos_adv_delta_positive_frac 只有 0.34~0.38(正优势样本里只有 ~36%
+  # 概率上升,应 >0.5),而 neg_adv_delta_negative_frac=0.93(负优势学得很好)。
+  # 怀疑对称 clip 把"抬高好动作"(ratio>1+c)那侧裁得比"压低坏动作"更狠。
+  # high 侧放宽到 0.28 给正优势更多上升空间,low 侧保持 0.2。两个 key 留空 = 退回
+  # 对称 clip_range。
+  clip_range_high: 0.28
+  clip_range_low: 0.2
+  target_kl: 0.1
+  # 2026-06-06: 两个 16h run 出现"崩溃→谷底(7h,8组跳7)→自愈"。早期 step5/7/13
+  # clipfrac 飙到 0.16/0.11/0.50、ratio_min 低到 0.48 把策略推出稳定区。本轮:
+  # (1) lr 2e-4 → 1e-4 减小每步移动;(2) 启用 KL-to-old 软惩罚 给越界 ratio 一个
+  # 连续回拉力(硬 clip 越界即梯度=0,缺这个)。
+  #
+  # beta_kl: KL(new‖old) 惩罚系数。用 k3 估计 KL≈ratio-1-log_ratio,梯度 ratio-1
+  # 手动加进 server 的 grad_coef(grpo_clipped_loss 的 loss 不 backward,只用于日志,
+  # 所以必须在 server 端加,见 src/rl/server.py grad_coef 构造处)。0 = 关闭(零回归)。
+  # 注意 update_epochs=1 下它只约束单步内 ratio 越界的 outlier,拦不住跨 step 漂移。
+  # 起步 0.05;压制过强(reward 上不去/ratio 死贴 1)调到 0.01,仍崩溃调到 0.1–0.2。
+  beta_kl: 0.05
+  # NOTE(2026-06-05): entropy_coef 目前是 no-op —— server 从不向 grpo_clipped_loss
+  # 传入 entropy 张量,且 SDE 的 sigma 是固定解析 schedule(非可学),高斯熵对 LoRA
+  # 参数梯度为 0。要真正约束 logprob 塌缩需改用可学 sigma(ReinFlow 式)或加 KL-to-ref
+  # (beta_kl);此处保留 0,Plan A 仅验证不对称 clip 是否能把 pos_frac 抬过 0.5。
+  entropy_coef: 0.0
+  bc_coef: 0.0
+  checkpoint_interval: 4
+  # 每 N 次 GRPO update step 让 rollout clients 用 deterministic inference
+  # (LoRA on,但 sample_action 不注入 per-step 噪声) 把 assignment 跑一遍;
+  # 结果不进 training pool,只打到 wandb eval/* 用来 track 真实 success rate。
+  # 0 = 关闭。和 checkpoint_interval 对齐,每次出 ckpt 同步做一次 eval。
+  eval_enabled: true
+  eval_every: 4
+  # Periodic and eval-only GRPO eval use this deterministic action denoising horizon.
+  # Keep it explicit so checkpoint re-eval cannot silently fall back to the base 50-step config.
+  eval_action_num_inference_steps: 5
+  export_inference_checkpoint: false
+  save_rollout_store: false
+  save_full_transformer: false
+  max_grad_norm: 1.0
+
+  # per_step: inject Gaussian noise at every action denoising step, so the
+  # GRPO ratio is the product of N transition densities (mathematically the
+  # full trajectory likelihood). Each per-chunk recompute now runs the
+  # transformer N times with gradient — keep action_num_inference_steps small.
+  noise_schedule: per_step
+
+  lora:
+    enabled: true
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - action_embedder
+      - action_proj_out
+
+  validate_logprob_consistency: false
+  logprob_consistency_atol: 5.0e-3
+  # Set true for a short diagnostic run. It roughly doubles update compute by
+  # recomputing each minibatch after optimizer.step, then logs whether positive
+  # advantages increased logprob and negative advantages decreased it.
+  diagnose_update_effect: false
+  # Per-denoising-step log_ratio breakdown. Logs, per step index i, the
+  # flow-time t, sigma, and |log_ratio| distribution. Read it to decide whether
+  # the fixed sigma=a*sqrt(t/(1-t)) schedule is ill-conditioned across steps:
+  # if |log_ratio| rises as sigma falls (later i), low-sigma steps dominate the
+  # chunk ratio; if flat, the schedule is fine and outliers come from elsewhere.
+  diagnose_per_step_logratio: false
+
+  optimizer:
+    # 2026-05-23: baseline 是 2e-5,这一轮 4×↓ 到 5e-6,配合 normalized 信任域。
+    # 若 approx_kl 仍稳定 < 0.05 且 clipfrac 长时间 < 5%,再往上抬到 1e-5/2e-5。
+    # 2026-06-06: 因崩溃-自愈不稳定,从 2e-4 砍半到 1e-4,配合上方 beta_kl=0.05。
+    lr: 5e-5
+    weight_decay: 0.0
+    betas: [0.9, 0.95]
+
+  logprob:
+    # 2026-05-23: 回到 per-element 归一化,匹配 clip_range=0.2 / target_kl=0.1。
+    normalize_denoising_horizon: true
+    reduce: mean
+    normalize_episode_length: true
+
+  disable_updates: false

@@ -40,6 +40,14 @@
 
 6. **进程管理铁律**：只停自己起的进程，**按 PID 停**（先 client launcher 后 server torchrun，靠 launcher 的 trap 级联清理子进程）。**绝不 `pkill -f src.rl.server`**——这是共享机，会误杀别人的任务。
 
+7. **绝不中途 kill client（会触发 DDP barrier 死锁，最坑）。** step0 的 initial eval 和每个 update step 的 eval，都会让 8 个 server rank 在 `src/rl/server.py::_gather_replicated_eval_results` 的 **无超时 `dist.barrier()`** 处汇合——必须 8 个 rank 的 client 全部把本地 eval 跑完才能过 barrier。若此时 kill 掉部分 client（哪怕只为修别的问题再重启），已到 barrier 的 rank 会 **100% CPU 空转永久等待**，且主线程被 barrier 占死、**不再响应新的 websocket 握手**（表现为后续重连固定那几个 rank handshake 超时）。
+   **判据**：`ps`/`top` 看到部分 server rank `state=R` + `cpu=100%`、另一部分 `state=S`；用 py-spy 抓栈会看到 `barrier → _gather_replicated_eval_results → infer`。
+   **唯一解**：整体重启 server（死锁 rank 对 SIGTERM 可能不响应，按 PID `kill -TERM` 后等几秒，必要时 `kill -KILL` **自己的** rank）。client 起来后**全程不要中途 kill**；要停就按 §3.4 顺序整套停。
+
+8. **warp/curobo JIT 内核缓存冷启动竞争（首次跑 / 缓存被清后）。** 8 个 client 同时 import curobo 会并发编译 warp 内核到共享缓存（`~/.cache/warp/<ver>/`），部分 rank 会加载到残缺模块，报 `Warp CUDA error 500: named symbol not found` / `Failed to load CUDA module 'curobo.geom.transform'` / `Failed to find forward kernel 'linear_interpolate_trajectory_kernel'`。
+   **判据**：只有部分 rank 报错（缓存竞争是随机的），且 `~/.cache/warp/<ver>/bin/` 里 `.ptx`/`.hash` 文件刚生成。
+   **解决**：缓存一旦建好（含 `wp_curobo.util.warp_interpolation.*.ptx` 等），重启一次 client 即可——这次所有 rank 只**读**已编译好的内核，不再竞争。本机 warp 版本 1.0.2、sm70。
+
 ---
 
 ## 2. 配置要点（`robotwin_grpo_turn_switch_fast.yaml`）
@@ -219,12 +227,38 @@ ls -la $NEW/server/checkpoints/    # grpo_step_0000NN.pt，每 4 step 一个
 |---|---|---|
 | torchrun 启动卡住不动 | `uv run` 在本机 hang | 用 `/root/.venv/bin/torchrun` 手敲 |
 | client 连接 503 | 代理拦截 localhost websocket | unset 全部 `*_proxy/ALL_PROXY` + 设 `no_proxy` |
+| **部分 rank 固定 handshake 超时（"timed out while waiting for handshake response"）** | **多半是 DDP barrier 死锁**：之前中途 k'd 过 client，残留 rank 卡在 `dist.barrier()` 占死主线程不再响应握手（见 §1.7）。**先排除代理**：无代理下 TCP 能连但 ws 握手超时、且固定那几个 rank → 不是代理 | 用 py-spy/`top` 确认是否 `state=R cpu=100%` 卡 barrier；是则**整体重启 server**。纯重启 client 救不了 |
+| 部分 rank 报 warp `named symbol not found` / `Failed to load CUDA module` | warp/curobo JIT 内核缓存冷启动竞争（见 §1.8） | 缓存已建好后**重启一次 client**即可 |
 | `FileNotFoundError` 找 assignment | client chdir 到 RoboTwin 根 | 用绝对路径 |
 | resume 报 UnpicklingError | torch≥2.6 weights_only | 已修（`load_checkpoint` weights_only=False），勿回退 |
 | 某 rank OOM | eval server 叠在 RL rank 上 | 错开 GPU，或先停 RL 再 eval |
 | barrier hang | 多 client 但 group 成员不足 | 单 checkpoint 用 `NUM_CLIENTS_PER_SERVER=1` |
 | **训练变慢但 GPU util 正常** | **共享机邻居抢 CPU/内存带宽**（RoboTwin 仿真是 CPU 密集；判据：`infer_ms` 正常、`elapsed_s` 翻倍且随时间波动） | 非自身问题，等邻居负载下降；不要动别人进程 |
 | wandb 只有 System 栏 | resume 后还没完成第一个 update step | 正常，train 指标在每个 update step 才 log；等首个 `updated:True` |
+
+**调试卡死 rank 的利器（py-spy）**：本机 server venv 无 pip，用 uv 装独立工具即可：
+```bash
+uv tool install py-spy          # 装到 ~/.local/bin/py-spy
+~/.local/bin/py-spy dump --pid <server_rank_pid>   # 抓 Python 栈，定位卡在哪一行
+```
+看到栈顶是 `barrier → _gather_replicated_eval_results → infer` 即 §1.7 的 eval barrier 死锁。
+
+**快速验证 8 个 server rank 是否都能正常握手**（起 client 前自检，无代理下应全部秒回）：
+```bash
+PY=/apdcephfs_tj5/share_303547874/stevefan/miniconda3/envs/RoboTwin/bin/python
+for port in 29546 29547 29548 29549 29550 29551 29552 29553; do
+  printf "port %s: " "$port"
+  env -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy no_proxy=127.0.0.1 timeout 15 $PY - <<PYEOF
+import time,websockets.sync.client
+t=time.time()
+try:
+    c=websockets.sync.client.connect("ws://127.0.0.1:$port",compression=None,max_size=None,ping_interval=None,close_timeout=10)
+    c.recv(); print(f"OK {time.time()-t:.2f}s"); c.close()
+except Exception as e: print(f"FAIL {time.time()-t:.2f}s {type(e).__name__}")
+PYEOF
+done
+```
+某端口固定 FAIL（10s 超时）而 TCP 可连 → 那个 rank 卡 barrier 死锁，需整体重启 server。
 
 ---
 
