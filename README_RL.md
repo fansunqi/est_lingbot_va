@@ -48,6 +48,10 @@
    **判据**：只有部分 rank 报错（缓存竞争是随机的），且 `~/.cache/warp/<ver>/bin/` 里 `.ptx`/`.hash` 文件刚生成。
    **解决**：缓存一旦建好（含 `wp_curobo.util.warp_interpolation.*.ptx` 等），重启一次 client 即可——这次所有 rank 只**读**已编译好的内核，不再竞争。本机 warp 版本 1.0.2、sm70。
 
+9. **NCCL collective 超时 → 整 job SIGABRT（2026-06-29 实际崩过一次）。** 训练跑到 step40 时，rank5 的 NCCL watchdog 报 `collective operation timeout`（`Last enqueued NCCL work: 109174, last completed: 109173`），8 分钟 dump 后 8 个 rank 全部 `Signal 6 (SIGABRT)` 自杀，client 随之 `ConnectionClosedError` 级联退出。**根因不是硬件/OOM**（uptime 68 天没重启、无 Xid/ECC、GPU 没满），而是 **rank 间 rollout 进度差超过 NCCL 默认 10min 超时**：某 rank 摊上长 rollout episode（失败顶满 400 步 + 共享机 CPU 被抢，单条可达 10min+），它迟迟没进入梯度 all-reduce，其他 rank 在 collective 处空等 → watchdog 触发。
+   **判据**：server 日志出现 `ProcessGroupNCCL.cpp ... collective operation timeout` + `Terminating the process after attempting to dump debug info`，8 rank exitcode `-6`。
+   **解决（已固化到 §3.2 启动 env）**：`TORCH_NCCL_TIMEOUT=3600`/`NCCL_TIMEOUT=3600` 把超时 10min→60min（零训练动态影响），`TORCH_NCCL_TRACE_BUFFER_SIZE=1048576` 开 flight recorder 便于下次 dump 出具体卡在哪个 collective。**未动 MAX_EPISODE_STEPS**——数据显示存在 step_count≈400 的真实慢成功，砍上限会误杀成功、污染 success_rate（见对话分析）。
+
 ---
 
 ## 2. 配置要点（`robotwin_grpo_turn_switch_fast.yaml`）
@@ -115,6 +119,13 @@ export no_proxy="localhost,127.0.0.1,0.0.0.0"
 unset HF_ENDPOINT
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# 抗崩溃加固（2026-06-29 曾因 NCCL collective 超时整 job SIGABRT，见 §1.9）：
+#  NCCL 默认 collective 超时仅 10min，扛不住"某 rank 摊上长 rollout episode（失败顶满
+#  400 步 + 共享机 CPU 被抢）→ rank 间进度差 >10min"的场景 → watchdog 触发、8 rank 全 SIGABRT。
+#  下面把超时拉到 60min（零训练动态影响），并开 flight recorder 便于下次定位。
+export TORCH_NCCL_TIMEOUT=3600
+export NCCL_TIMEOUT=3600
+export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 mkdir -p $NEW/server
 
 /root/.venv/bin/torchrun \
@@ -123,8 +134,8 @@ mkdir -p $NEW/server
   --config configs/rl/robotwin_grpo_turn_switch_fast.yaml \
   --port 29546 \
   --save-root $NEW/server \
-  --resume-from $REPO/experiments/robotwin_grpo_turn_switch_ddp/server/checkpoints/grpo_step_000012.pt
-  # ↑ 从头训练时删掉这一行
+  --resume-from $NEW/server/checkpoints/grpo_step_000040.pt
+  # ↑ resume-from 指向最近 checkpoint（新盘已到 step40）；从头训练时删掉这一行
 ```
 
 > server args：`--config`（必填）、`--port`（rank0 端口，rank r 实际绑 port+r）、`--save-root`（checkpoint 输出根）、`--resume-from`（恢复 LoRA 权重 + optimizer 状态 + global_update_step）。
