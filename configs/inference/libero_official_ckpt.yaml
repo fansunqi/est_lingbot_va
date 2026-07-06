@@ -1,0 +1,96 @@
+mode: server
+
+model_name_or_path: /apdcephfs_gy2/share_302735770/stevefan/hf_home/hub/models--robbyant--lingbot-va-posttrain-libero-long/snapshots/0e89d1e753019988aba484e8da2dc0810e264d9f
+param_dtype: bfloat16
+patch_size: [1, 2, 2]
+enable_offload: false
+
+host: 0.0.0.0
+port: 29056
+
+snr_shift: 5.0
+action_snr_shift: 0.05
+
+attn_window: 30
+frame_chunk_size: 4
+env_type: none
+height: 128
+width: 128
+action_dim: 30
+action_per_frame: 4
+guidance_scale: 5
+action_guidance_scale: 1
+num_inference_steps: 20
+video_exec_step: -1
+action_num_inference_steps: 50
+
+obs_cam_keys:
+  - observation.images.agentview_rgb
+  - observation.images.eye_in_hand_rgb
+
+used_action_channel_ids: [0, 1, 2, 3, 4, 5, 6]
+
+action_norm_method: quantiles
+norm_stat:
+  q01:
+    - -0.6589285731315613
+    - -0.84375
+    - -0.9375
+    - -0.12107142806053162
+    - -0.15964286029338837
+    - -0.26571428775787354
+    - -1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+  q99:
+    - 0.8999999761581421
+    - 0.8544642925262451
+    - 0.9375
+    - 0.17142857611179352
+    - 0.1842857152223587
+    - 0.34392857551574707
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
