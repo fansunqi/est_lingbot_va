@@ -33,3 +33,6 @@
 - **节点重启后 IPoIB 的 IP + NFS 挂载都会丢**(不在 fstab、IP 非持久):`sudo ip addr add 172.10.24.N/24 dev ibp194s0 && sudo ip link set ibp194s0 up` + `sudo mount -t nfs 172.10.24.25:/srv/share /mnt/share`。
 - **eval 用 2 卡/任务**:server 峰值~18GB+client~5GB 同卡在 24GB 会 OOM;分卡(server 偶数卡、client 奇数卡)彻底解决。
 - **多节点复制**:节点间默认不能互 SSH;在 ja26 生成 `~/.ssh/id_ed25519_cluster`、分发公钥到各节点 authorized_keys 后,用 IPoIB(172.10.24.N)tar-stream 分发(ja26 1TB 内存,源进 page cache 后并行很快)。
+- **脚本里勿用 `set -u`(nounset)包住 `conda activate`**:conda 的 gcc 激活脚本(cuda-toolkit 带来的)引用未定义变量 `SYS_SYSROOT`,nounset 下报错退出。症状:server 起了但 client 全不启动(脚本在 activate RoboTwin 处死)。对策:不用 set -u,或 `set +u` 后再 activate。
+- **NFS 服务器节点(ja25)的共享盘在 `/srv/share`,不是 `/mnt/share`**:假设 `/mnt/share` 的脚本在 ja25 上找不到文件而失败。对策:在 ja25 上 `sudo mount --bind /srv/share /mnt/share`,让路径全集群统一。
+- **多机批量启动后必须逐机核对 client 真起来了**(client 日志存在 + 奇数卡有显存),别只看 server;不同节点可能因路径/环境差异部分失败。
