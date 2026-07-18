@@ -1,11 +1,13 @@
 mode: server
 
 # Model
-model_name_or_path: /apdcephfs_tj5/share_303547874/stevefan/hf_home_new/hub/models--robbyant--lingbot-va-posttrain-robotwin/snapshots/8c9dea8abbc5c91cc9e18bc3264b8915083bbe70
+# Local path on the 4090 eval nodes (weights replicated to same path per node).
+model_name_or_path: /home/quser/models/lingbot-va-posttrain-robotwin
 param_dtype: bfloat16
 patch_size: [1, 2, 2]
-enable_offload: false
-vae_offload: false
+# 4090 (24GB): offload VAE + text_encoder to CPU to fit (~24GB per README).
+enable_offload: true
+vae_offload: true
 
 # Server
 host: 0.0.0.0
