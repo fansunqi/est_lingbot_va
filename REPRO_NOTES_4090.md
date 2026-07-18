@@ -26,3 +26,10 @@
 - /home/quser/run_clients_sep.sh — 4 client 渲染在 GPU 1/3/5/7
 - server: lingbot环境 python -m src.inference.server --config configs/inference/robotwin.yaml --port <p>
 - client: RoboTwin环境 cd /home/quser/RoboTwin, 设PYTHONPATH=仓库+ROBOTWIN_ROOT+VK_ICD_FILENAMES, python -m evaluation.robotwin.eval_polict_client_openpi --task_name <t> --task_config demo_clean --policy_name ACT --port <p>
+
+## 运维教训(踩过的坑)
+- **eval 跑完必须显式 kill server(按 pid)**:残留 server 占端口 29556-29559 / master 29661,下一轮启动 EADDRINUSE 崩溃、脚本卡在"等 listening"、client 不启动。收尾要清进程。
+- **`pkill -f <pat>` / `pgrep -f` 会自匹配**:在远端 `bash -c "...pat..."` 里执行时,模式匹配到自己的父 shell(命令行含该字符串)→ 杀掉自己的 SSH 会话(exit 255)。对策:按具体 pid 杀;或确认无自匹配再用。
+- **节点重启后 IPoIB 的 IP + NFS 挂载都会丢**(不在 fstab、IP 非持久):`sudo ip addr add 172.10.24.N/24 dev ibp194s0 && sudo ip link set ibp194s0 up` + `sudo mount -t nfs 172.10.24.25:/srv/share /mnt/share`。
+- **eval 用 2 卡/任务**:server 峰值~18GB+client~5GB 同卡在 24GB 会 OOM;分卡(server 偶数卡、client 奇数卡)彻底解决。
+- **多节点复制**:节点间默认不能互 SSH;在 ja26 生成 `~/.ssh/id_ed25519_cluster`、分发公钥到各节点 authorized_keys 后,用 IPoIB(172.10.24.N)tar-stream 分发(ja26 1TB 内存,源进 page cache 后并行很快)。
