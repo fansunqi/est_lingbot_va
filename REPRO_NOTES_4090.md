@@ -44,3 +44,6 @@ turn_switch / demo_randomized / action 5步 / 每台相同 100 seed / denoiser=n
 
 ## eval 偶发挂死:SAPIEN 相机渲染 _get_rgba 卡住(2026-07-18)
 现象:某 client rollout 卡在 "step N/400" 不动(数十分钟),CPU 低、GPU 0%。py-spy dump 该进程 MainThread 栈:_get_rgba (envs/camera/camera.py:335) ← get_rgba ← get_rgb ← get_obs (_base_task.py:450) ← eval_policy。→ **卡在 SAPIEN 相机图像回读(Vulkan 渲染 fence/readback stall)**,不是 websocket/server/NCCL(配对 server 健康但空闲等请求)。属光追渲染在共享 GPU 上的偶发挂死(与 OIDN/OptiX 崩溃同类,这里是 hang 非 crash)。诊断法:`py-spy dump --pid <client>`(需 sudo)。处理:kill 该 client 重启即可(server 无需重载),多为瞬时非确定性。若高频复发,考虑 get_obs 渲染加超时/重试。
+
+### 最终定表(8×100 全完成)
+ja25 52% / ja26 50% / ja36 48% / ja34 45% / ja35 43% / ja27 37% / ja28 36% / ja33 36%。均值 43.4%,极差 16%,跨机 std ~6%(>采样σ 5%)→ 真实机器间差异确认。(ja35 曾因 _get_rgba 渲染挂死卡在81,kill 重启 c1 补齐至100。)
