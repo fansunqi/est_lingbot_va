@@ -829,8 +829,12 @@ def main():
                              "global_client_id = rank * num_clients + client_id.")
     parser.add_argument("--group_barrier", action="store_true",
                         help="Wait for all parallel clients after each assignment item")
-    parser.add_argument("--group_barrier_timeout", type=float, default=0.0,
-                        help="Seconds before failing the group barrier; 0 means wait forever")
+    parser.add_argument("--group_barrier_timeout", type=float, default=900.0,
+                        help="Seconds before failing a group/eval barrier; 0 means wait forever. "
+                             "Default 900s converts a peer's crash/hang into a RuntimeError -> "
+                             "process exit -> supervisor respawn, instead of an unbounded deadlock "
+                             "(a confirmed 'spins forever' failure mode). Barrier waits are short in "
+                             "practice (peers arrive within one episode); raise for very-slow setups.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--num_passes",
