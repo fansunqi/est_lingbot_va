@@ -64,7 +64,7 @@ rl:
     type: sparse_success
 
   use_fsdp: false
-  group_size: 48
+  group_size: 8
   # 2026-05-23: 2 → 4,episodes/update 从 16 升到 32,
   # 减半 advantage 的 Bernoulli 噪声(σ 从 0.18 → 0.12)。
   rollout_groups_per_update: 4
