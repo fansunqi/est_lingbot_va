@@ -903,23 +903,25 @@ class VA_Server:
         """Move current GPU KV cache + VAE feat_cache + metadata to CPU."""
         if session_id is None:
             return
-        stream = self._get_swap_stream()
-        # Collect KV cache tensors from all transformer blocks
+        # Synchronous, correctly-ordered D2H copy on the DEFAULT stream. The KV
+        # pools were written by the last transformer forward on the default
+        # stream, so a blocking .to('cpu') here is FIFO-ordered after those
+        # writes and cannot race them. The previous side-stream + non_blocking +
+        # pin_memory version had NO cross-stream ordering vs those writes and
+        # produced torn snapshots that corrupted concurrent sessions.
         cpu_kv = []
-        with torch.cuda.stream(stream):
-            for block in self.transformer.blocks:
-                cache = block.attn1.attn_caches.get(self.cache_name)
-                if cache is not None:
-                    cpu_cache = {}
-                    for key, val in cache.items():
-                        if isinstance(val, torch.Tensor):
-                            cpu_cache[key] = val.to('cpu', non_blocking=True).pin_memory()
-                        else:
-                            cpu_cache[key] = val
-                    cpu_kv.append(cpu_cache)
-                else:
-                    cpu_kv.append(None)
-        stream.synchronize()
+        for block in self.transformer.blocks:
+            cache = block.attn1.attn_caches.get(self.cache_name)
+            if cache is not None:
+                cpu_cache = {}
+                for key, val in cache.items():
+                    if isinstance(val, torch.Tensor):
+                        cpu_cache[key] = val.to('cpu').pin_memory()
+                    else:
+                        cpu_cache[key] = val
+                cpu_kv.append(cpu_cache)
+            else:
+                cpu_kv.append(None)
 
         # Save VAE streaming feat_cache (list of tensors or Nones)
         def _save_feat_cache(feat_cache):
@@ -960,24 +962,23 @@ class VA_Server:
         if state is None:
             return False
 
-        stream = self._get_swap_stream()
         restored_cache_count = 0
         missing_cache_count = 0
-        with torch.cuda.stream(stream):
-            for block, cpu_cache in zip(self.transformer.blocks, state['kv_cache']):
-                if cpu_cache is not None:
-                    gpu_cache = {}
-                    for key, val in cpu_cache.items():
-                        if isinstance(val, torch.Tensor):
-                            gpu_cache[key] = val.to(self.device, non_blocking=True)
-                        else:
-                            gpu_cache[key] = val
-                    block.attn1.attn_caches[self.cache_name] = gpu_cache
-                    restored_cache_count += 1
-                else:
-                    block.attn1.attn_caches[self.cache_name] = None
-                    missing_cache_count += 1
-        stream.synchronize()
+        # Synchronous, correctly-ordered H2D copy on the DEFAULT stream so the
+        # restored KV is fully present before any subsequent forward reads it.
+        for block, cpu_cache in zip(self.transformer.blocks, state['kv_cache']):
+            if cpu_cache is not None:
+                gpu_cache = {}
+                for key, val in cpu_cache.items():
+                    if isinstance(val, torch.Tensor):
+                        gpu_cache[key] = val.to(self.device)
+                    else:
+                        gpu_cache[key] = val
+                block.attn1.attn_caches[self.cache_name] = gpu_cache
+                restored_cache_count += 1
+            else:
+                block.attn1.attn_caches[self.cache_name] = None
+                missing_cache_count += 1
 
         # Restore VAE streaming feat_cache
         def _restore_feat_cache(saved):

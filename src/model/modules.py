@@ -5,6 +5,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import (
@@ -587,22 +588,53 @@ class WanAttention(torch.nn.Module):
             key = apply_rotary_emb(key, rotary_emb)
         slots = None
         if kv_cache is not None and kv_cache['k'] is not None:
-            slots = self.update_cache(cache_name,
-                                      key,
-                                      value,
-                                      is_pred=(update_cache == 1))
             key_pool = self.attn_caches[cache_name]['k']
             value_pool = self.attn_caches[cache_name]['v']
-            mask = self.attn_caches[cache_name]['mask']
-            valid = mask.nonzero(as_tuple=False).squeeze(-1)
-            key = key_pool[:, valid]
-            value = value_pool[:, valid]
+            qb = query.shape[0]
+            if update_cache == 0:
+                # GRADED / rollout path: do NOT write the current step's k/v into
+                # the persistent pool. A pool write is an index_put that entangles
+                # the whole ~120MB-per-block pool buffer into the autograd graph;
+                # its IndexPutBackward then clones the entire buffer during
+                # backward (30 blocks x {k,v} x ~120MB = ~6.7GB transient -> OOM,
+                # confirmed by a CUDA memory snapshot). Instead attend over
+                # [detached historical cache ++ live current k/v]. custom_sdpa is
+                # maskless, so attention is order-invariant over keys => identical
+                # output (guarded by the logprob-consistency check), while keeping
+                # current k/v differentiable (to_k/to_v LoRA) and history detached
+                # (history is built under no_grad, i.e. a constant either way).
+                # The oldest-first eviction of allocate_slots is replicated so the
+                # attended key SET matches production exactly (incl. sliding window).
+                cache = self.attn_caches[cache_name]
+                mask = cache['mask']
+                ids = cache['id']
+                key_size = key.shape[1]
+                used = mask.nonzero(as_tuple=False).squeeze(-1)
+                free_n = int(mask.numel() - used.numel())
+                need_evict = key_size - free_n
+                if need_evict > 0 and used.numel() > 0:
+                    order = torch.argsort(ids[used])
+                    hist_valid = used[order[need_evict:]]
+                else:
+                    hist_valid = used
+                hist_k = key_pool[:qb, hist_valid]
+                hist_v = value_pool[:qb, hist_valid]
+                key = torch.cat([hist_k, key], dim=1)
+                value = torch.cat([hist_v, value], dim=1)
+            else:
+                # update_cache == 1: persist path (video prefix / deferred
+                # last_step), always under no_grad, so the index_put write carries
+                # no grad_fn and there is no backward clone. Keep original behavior.
+                slots = self.update_cache(cache_name,
+                                          key,
+                                          value,
+                                          is_pred=(update_cache == 1))
+                mask = self.attn_caches[cache_name]['mask']
+                valid = mask.nonzero(as_tuple=False).squeeze(-1)
+                key = key_pool[:qb, valid]
+                value = value_pool[:qb, valid]
 
         hidden_states = self.attn_op(query, key, value)
-
-        if update_cache == 0:
-            if kv_cache is not None and kv_cache['k'] is not None:
-                self.restore_cache(cache_name, slots)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -788,6 +820,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                 eps,
                                 attn_mode=attn_mode) for _ in range(num_layers)
         ])
+
+        # Full-block gradient checkpointing, enabled by the GRPO server for the
+        # grad recompute (_backward_episode_logprob) only. Recomputing the block
+        # (incl. the cache-reading attn1) in backward is safe there because the
+        # server DEFERS the no_grad last_step cache write until AFTER .backward(),
+        # so self.attn_caches is identical during the original forward and the
+        # checkpoint recompute. Gated in forward() on torch.is_grad_enabled() and
+        # update_cache == 0 so no_grad rollout/eval and the update_cache==1 write
+        # are never checkpointed.
+        self.gradient_checkpointing = False
 
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim,
@@ -1014,13 +1056,33 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_time_steps, dtype=latent_hidden_states.dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
+        use_ckpt = (
+            self.gradient_checkpointing
+            and torch.is_grad_enabled()
+            and update_cache == 0
+        )
         for block in self.blocks:
-            latent_hidden_states = block(latent_hidden_states,
-                                         text_hidden_states,
-                                         timestep_proj,
-                                         rotary_emb,
-                                         update_cache=update_cache,
-                                         cache_name=cache_name)
+            if use_ckpt:
+                # _b=block binds the current block (avoid closure late-binding to
+                # the last loop iteration when checkpoint recomputes in backward).
+                def _blk(hs, ths, tp, re, _b=block):
+                    return _b(hs, ths, tp, re,
+                              update_cache=update_cache, cache_name=cache_name)
+                latent_hidden_states = torch.utils.checkpoint.checkpoint(
+                    _blk,
+                    latent_hidden_states,
+                    text_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    use_reentrant=False,
+                )
+            else:
+                latent_hidden_states = block(latent_hidden_states,
+                                             text_hidden_states,
+                                             timestep_proj,
+                                             rotary_emb,
+                                             update_cache=update_cache,
+                                             cache_name=cache_name)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

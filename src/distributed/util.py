@@ -7,6 +7,7 @@ The Lightning training path constructs its process group through
 ``_configure_model`` to materialize the shard.
 """
 from datetime import timedelta
+import os
 
 import torch
 import torch.distributed as dist
@@ -39,12 +40,24 @@ def init_distributed(world_size, local_rank, rank):
         torch.cuda.set_device(local_rank)
     if int(world_size) <= 1:
         return
-    # 60-min timeout gives cute-dsl cold compiles room to finish before the
+    # 60-min default gives cute-dsl cold compiles room to finish before the
     # NCCL watchdog fires monitoredBarrier (default 30 min was already tight
-    # for FA4's first-shape compile on a 24-head 128-dim attention).
+    # for FA4's first-shape compile on a 24-head 128-dim attention) — this
+    # matters on the *sharded* (FSDP/TP) path where the first compile happens
+    # inside a collective (see _configure_model's pre-shard barrier).
+    #
+    # On the *replicated* (DDP) RL path FA4 compiles per-rank during rollout
+    # forwards, which involve NO collective, so the first NCCL op (the GRPO
+    # update barrier) is reached only after every rank has finished compiling
+    # and rolling out. There, a short timeout is desirable: a crashed/hung
+    # rollout client on one rank would otherwise leave its peers hanging in
+    # dist.barrier() for the full hour (the "0 updates all night" failure).
+    # Override with DIST_TIMEOUT_MIN so the RL launcher can fail fast (~8 min)
+    # and let the supervisor restart the client, which resumes from progress.
+    timeout_min = float(os.environ.get("DIST_TIMEOUT_MIN", "60"))
     dist.init_process_group(backend="nccl",
                             init_method="env://",
                             rank=rank,
                             world_size=world_size,
-                            timeout=timedelta(minutes=60),
+                            timeout=timedelta(minutes=timeout_min),
                             device_id=torch.device(f"cuda:{local_rank}"))

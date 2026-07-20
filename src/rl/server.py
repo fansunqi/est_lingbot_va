@@ -208,6 +208,23 @@ class GRPOTrainingServer(VA_Server):
                 stats.trainable_parameters,
                 stats.total_parameters,
             )
+            # Full-block gradient checkpointing on the transformer. The grad
+            # recompute in _backward_episode_logprob spans up to
+            # action_num_inference_steps sequential transformer forwards per
+            # chunk; measured, one chunk's graded forward alone allocates
+            # ~4.8GB of activations (attention + residual stream over the 5
+            # denoising steps), which on top of the 10.2GB model + 6.7GB CFG KV
+            # cache leaves too little for backward on a 24GB 4090 (OOM ~300MB
+            # short). Checkpointing recomputes those activations in backward.
+            # Safe for the cache-reading attn1 ONLY because _backward_episode_
+            # logprob defers the no_grad last_step cache write until AFTER
+            # .backward() (see write_last_step/_flush_deferred_last_step), so
+            # the sliding-window cache is identical across forward and recompute.
+            # Gated inside the transformer on torch.is_grad_enabled() and
+            # update_cache==0, so rollout/eval (no_grad) are unaffected.
+            if bool(self.rl_cfg.get("grad_checkpointing", True)):
+                self.transformer.gradient_checkpointing = True
+                logger.info("GRPO full-block gradient checkpointing enabled: rank=%s", self.rank)
         else:
             self.transformer.train()
             self.transformer.requires_grad_(True)
@@ -239,6 +256,11 @@ class GRPOTrainingServer(VA_Server):
         self.rollout_groups_per_update = int(self.rl_cfg.get("rollout_groups_per_update", 1))
         self._pending_ready_groups = []
         self._rollout_generators: dict[str, torch.Generator] = {}
+        # Holds the deferred no_grad last_step cache write (final_actions,
+        # final_t, frame_st_id) when _recompute_chunk_logprob is called with
+        # write_last_step=False; flushed by _flush_deferred_last_step after
+        # .backward() so gradient-checkpointing recompute sees an unchanged cache.
+        self._deferred_last_step = None
         self.global_update_step = 0
         self.global_rollout_episode = 0
         self.global_eval_episode = 0
@@ -644,6 +666,28 @@ class GRPOTrainingServer(VA_Server):
             logprob_reduce=self.logprob_reduce,
         )
 
+    def _action_input_cond_only(self, action_input: dict) -> dict:
+        """Batch=1 cond-only action input (replaces _repeat_input_for_cfg's batch=2).
+
+        RL forces action_guidance_scale=1, so the action denoising never uses
+        classifier-free guidance: production computes a batch=2 [cond, uncond]
+        action forward and keeps only the cond row ([:1]). Building the input at
+        batch=1 with the cond (prompt) text embedding is numerically identical
+        (the cond action attends to the cond video-cache row either way — see the
+        [:qb] read in WanAttention), but halves the action forward's activations
+        and, crucially, the gradient-checkpointing backward recompute's per-block
+        copy of the 9792-token video KV cache — the dominant OOM source.
+
+        Mirrors _repeat_input_for_cfg's else-branch (grid_id/timesteps get a batch
+        dim) and additionally sets the cond text embedding; noisy_latents stays
+        batch=1 (not repeated). The KV pool remains batch=2 (built by the video
+        prefix); update_cache broadcasts the batch=1 write across both rows.
+        """
+        action_input['text_emb'] = self.prompt_embeds.to(self.dtype).clone()
+        action_input['grid_id'] = action_input['grid_id'][None]
+        action_input['timesteps'] = action_input['timesteps'][None]
+        return action_input
+
     def _action_transformer_step(
         self,
         actions: torch.Tensor,
@@ -672,7 +716,7 @@ class GRPOTrainingServer(VA_Server):
             frame_st_id=frame_st_id,
         )
         action_noise_pred = self.transformer(
-            self._repeat_input_for_cfg(input_dict["action_res_lst"]),
+            self._action_input_cond_only(input_dict["action_res_lst"]),
             update_cache=1 if last_step else 0,
             cache_name=self.cache_name,
             action_mode=True,
@@ -950,7 +994,15 @@ class GRPOTrainingServer(VA_Server):
             }
         )
 
-    def _recompute_chunk_logprob(self, chunk: RolloutChunk) -> torch.Tensor:
+    def _recompute_chunk_logprob(self, chunk: RolloutChunk, write_last_step: bool = True) -> torch.Tensor:
+        # write_last_step=False DEFERS the no_grad last_step cache write to the
+        # caller (_backward_episode_logprob), which issues it AFTER .backward().
+        # This keeps self.attn_caches unchanged across the grad forward and the
+        # gradient-checkpointing recompute in backward, so recomputing the
+        # cache-reading attn1 is correct. The deferred write tensors are stashed
+        # on self._deferred_last_step; the caller flushes via
+        # _flush_deferred_last_step. get_action_logprobs (no_grad, uncheckpointed)
+        # keeps the default (write inline) so its cross-chunk cache is unchanged.
         self._run_video_prefix(chunk.obs, chunk.frame_st_id, latent_noise=chunk.latent_noise)
         action_timesteps = chunk.action_timesteps.to(self.device)
         action_dts = (
@@ -989,12 +1041,17 @@ class GRPOTrainingServer(VA_Server):
                 self._record_per_step_diag(chunk, 0, t, transition["std"], lp)
             # Mirror rollout's last_step cache write (see per_step branch below
             # for the full rationale): without it the per_chunk recompute would
-            # have the same KV-cache drift as per_step.
-            with torch.no_grad():
-                final_t = torch.zeros_like(t)
-                self._action_transformer_step(
-                    next_actions, final_t, chunk.frame_st_id, last_step=True,
-                )
+            # have the same KV-cache drift as per_step. Deferred when
+            # write_last_step=False so the checkpoint recompute sees an unchanged
+            # cache (see method docstring).
+            if write_last_step:
+                with torch.no_grad():
+                    final_t = torch.zeros_like(t)
+                    self._action_transformer_step(
+                        next_actions, final_t, chunk.frame_st_id, last_step=True,
+                    )
+            else:
+                self._deferred_last_step = (next_actions, torch.zeros_like(t), chunk.frame_st_id)
             return lp
 
         transition_logprobs = []
@@ -1030,15 +1087,21 @@ class GRPOTrainingServer(VA_Server):
         # recompute's cache state diverges from rollout by ~1 bf16 ulp per chunk
         # and accumulates over the chain — surfacing as the 0.0625 max_abs_diff
         # in validate_logprob_consistency and the occasional -15 to -33 outlier
-        # log_ratio on long, heterogeneous trajectories.
-        with torch.no_grad():
-            final_actions = action_chain[-1]
-            final_t = torch.zeros_like(action_timesteps[0])
-            self._action_transformer_step(
-                final_actions,
-                final_t,
-                chunk.frame_st_id,
-                last_step=True,
+        # log_ratio on long, heterogeneous trajectories. Deferred when
+        # write_last_step=False (see method docstring).
+        if write_last_step:
+            with torch.no_grad():
+                final_actions = action_chain[-1]
+                final_t = torch.zeros_like(action_timesteps[0])
+                self._action_transformer_step(
+                    final_actions,
+                    final_t,
+                    chunk.frame_st_id,
+                    last_step=True,
+                )
+        else:
+            self._deferred_last_step = (
+                action_chain[-1], torch.zeros_like(action_timesteps[0]), chunk.frame_st_id,
             )
 
         logprob = torch.stack(transition_logprobs).sum(dim=0)
@@ -1131,9 +1194,20 @@ class GRPOTrainingServer(VA_Server):
                 global_members_sorted = sorted(global_bucket.keys())
                 g_rewards = [global_bucket[m] for m in global_members_sorted]
                 if len(g_rewards) >= 2 and float(torch.tensor(g_rewards).std(unbiased=False)) <= 0.0:
-                    skipped_groups += 1
-                    continue
-                global_adv = compute_group_advantages(g_rewards)
+                    if os.environ.get("GRPO_MEM_FORCE_BACKWARD"):
+                        # DEBUG (memory / grad-all-reduce diagnostic only): force a
+                        # synthetic non-degenerate advantage so the backward + NCCL
+                        # grad all-reduce run even on all-fail groups. Mirrors the
+                        # non-sharded hook below. Never set this in a real run.
+                        global_adv = torch.zeros(len(g_rewards))
+                        if global_adv.numel() >= 2:
+                            global_adv[0] = 1.0
+                            global_adv[1] = -1.0
+                    else:
+                        skipped_groups += 1
+                        continue
+                else:
+                    global_adv = compute_group_advantages(g_rewards)
                 # Map global member → its position in global_members_sorted so
                 # we can fetch the right advantage for each local episode.
                 member_to_pos = {m: i for i, m in enumerate(global_members_sorted)}
@@ -1151,6 +1225,18 @@ class GRPOTrainingServer(VA_Server):
                 # capacity. Filtering keeps the training pool concentrated on groups
                 # that actually carry an advantage signal.
                 if len(g_rewards) >= 2 and float(torch.tensor(g_rewards).std(unbiased=False)) <= 0.0:
+                    if os.environ.get("GRPO_MEM_FORCE_BACKWARD"):
+                        # DEBUG (memory diagnostic only): force a synthetic
+                        # non-degenerate advantage so the backward runs even on
+                        # all-fail groups. Never set this in a real run.
+                        episodes.extend(group)
+                        adv = torch.zeros(len(group))
+                        if adv.numel() >= 2:
+                            adv[0] = 1.0
+                            adv[1] = -1.0
+                        advantage_chunks.append(adv)
+                        group_rewards_summary.append(sum(g_rewards) / max(len(g_rewards), 1))
+                        continue
                     skipped_groups += 1
                     continue
                 episodes.extend(group)
@@ -1215,6 +1301,11 @@ class GRPOTrainingServer(VA_Server):
         )
 
         # Optimizer steps per epoch may vary if n_eps % minibatch_size != 0.
+        # Clear the rollout phase's cached allocator blocks before entering the
+        # grad-backward loop: the server just served many no_grad sample_action
+        # forwards whose reserved blocks linger and fragment the ~120MB of free
+        # headroom on a 24GB 4090 (see the per-minibatch empty_cache below).
+        torch.cuda.empty_cache()
         stats: dict[str, float] = {}
         stop_outer = False
         for epoch_idx in range(self.update_epochs):
@@ -1340,6 +1431,19 @@ class GRPOTrainingServer(VA_Server):
                 # logprob the gradient actually saw (per-chunk grad-forward
                 # path), used below for ``new_logprob_mean`` logging and for
                 # the optional two-forward drift diagnostic.
+                #
+                # Reclaim the detached forward's cached-but-freed blocks before
+                # the memory-hungry backward. On a 24GB 4090 the transformer
+                # (~9.5GB) + the resident batch=2 (CFG) KV cache pool (~6.7GB) +
+                # one chunk's 5-step grad activations sit within ~120MB of
+                # capacity; the detached forward above leaves a few hundred MB
+                # reserved-but-unallocated that fragments the free space and
+                # triggers a spurious OOM in backward (observed: alloc of
+                # 116MB failed with 121MB free). empty_cache returns it to the
+                # allocator. Backward is per-chunk memory-bounded (see
+                # _backward_episode_logprob), so this makes the peak fit. It is
+                # called identically on every rank (no collective, no desync).
+                torch.cuda.empty_cache()
                 mb_new_logprobs_gradfwd_list: list[torch.Tensor] = []
                 for episode, coef in zip(mb_episodes, grad_coef):
                     ep_lp = self._backward_episode_logprob(episode, coef.to(self.device))
@@ -1997,19 +2101,82 @@ class GRPOTrainingServer(VA_Server):
         skip_backward = bool(chunk_scale.detach().abs().item() == 0.0)
         total_lp = torch.zeros((), device=self.device, dtype=torch.float32)
         norm_f = float(normalizer)
-        for chunk in episode.chunks:
+        _memdbg = bool(os.environ.get("GRPO_MEM_DEBUG"))
+        _memsnap = os.environ.get("GRPO_MEM_SNAPSHOT")  # dir; dumps CUDA alloc snapshot around first backward
+        _snap_armed = False
+
+        def _mem(tag: str, idx: int) -> None:
+            if not _memdbg:
+                return
+            a = torch.cuda.memory_allocated(self.device) / 1e9
+            r = torch.cuda.memory_reserved(self.device) / 1e9
+            m = torch.cuda.max_memory_allocated(self.device) / 1e9
+            logger.info("MEMDBG rank=%s chunk=%s %s: alloc=%.3fG reserved=%.3fG max_alloc=%.3fG",
+                        self.rank, idx, tag, a, r, m)
+
+        for ci, chunk in enumerate(episode.chunks):
+            _mem("loop_top", ci)
             if skip_backward:
                 with torch.no_grad():
                     chunk_logprob = self._recompute_chunk_logprob(chunk).reshape(())
             else:
-                chunk_logprob = self._recompute_chunk_logprob(chunk).reshape(())
-                (chunk_logprob * chunk_scale).backward()
+                # write_last_step=False: defer the no_grad last_step cache write
+                # until AFTER backward, so gradient-checkpointing recompute of
+                # the cache-reading attn1 sees the same cache as the forward.
+                chunk_logprob = self._recompute_chunk_logprob(
+                    chunk, write_last_step=False).reshape(())
+                _mem("after_gradfwd(pre_backward)", ci)
+                if _memdbg:
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                if _memsnap and not _snap_armed:
+                    torch.cuda.memory._record_memory_history(max_entries=300000)
+                    _snap_armed = True
+                try:
+                    (chunk_logprob * chunk_scale).backward()
+                except torch.cuda.OutOfMemoryError:
+                    if _memsnap:
+                        try:
+                            _sp = "%s/oom_rank%s_chunk%s.pickle" % (_memsnap, self.rank, ci)
+                            torch.cuda.memory._dump_snapshot(_sp)
+                            logger.error("MEMDBG snapshot dumped: %s", _sp)
+                        except Exception as _e:
+                            logger.error("MEMDBG snapshot dump failed: %s", _e)
+                    logger.error("MEMDBG OOM in backward rank=%s chunk=%s/%s n_chunks=%s\n%s",
+                                 self.rank, ci, len(episode.chunks), n_chunks,
+                                 torch.cuda.memory_summary(self.device, abbreviated=True))
+                    raise
+                _mem("after_backward", ci)
+                if _memsnap and _snap_armed:
+                    try:
+                        torch.cuda.memory._dump_snapshot("%s/postbwd_rank%s_chunk%s.pickle" % (_memsnap, self.rank, ci))
+                    except Exception:
+                        pass
+                    torch.cuda.memory._record_memory_history(enabled=None)
+                    _snap_armed = False
+                # Now that backward is done, apply the deferred last_step cache
+                # write so the next chunk (and validate_logprob_consistency) sees
+                # the same accumulated cache as before the reorder.
+                self._flush_deferred_last_step()
             total_lp = total_lp + chunk_logprob.detach().float() * norm_f
             self._detach_kv_cache_pools()
             if chunk.keyframes is not None and chunk.state is not None:
                 with torch.no_grad():
                     self._compute_kv_cache({"obs": chunk.keyframes, "state": chunk.state})
         return total_lp
+
+    def _flush_deferred_last_step(self) -> None:
+        """Apply the last_step cache write deferred by _recompute_chunk_logprob.
+
+        No-op if nothing was deferred. Runs under no_grad (update_cache=1 write)."""
+        deferred = self._deferred_last_step
+        self._deferred_last_step = None
+        if deferred is None:
+            return
+        final_actions, final_t, frame_st_id = deferred
+        with torch.no_grad():
+            self._action_transformer_step(
+                final_actions, final_t, frame_st_id, last_step=True,
+            )
 
     def _episode_old_logprobs(self, episodes) -> torch.Tensor:
         result = []
