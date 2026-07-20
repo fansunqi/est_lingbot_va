@@ -71,3 +71,12 @@ member-sharded 下各 rank 的 ready-group 数天然不同、慢 rank 的 client
 2. **8 台各跑一个独立单-rank run**(超参 sweep) → 榨满集群且无 DDP。
 3. **真重构**:把 update 触发与 client 解耦,让全 8 rank lockstep 做 `all_reduce(MIN)` of ready-count 一致决定 update/skip(有风险,别挂机过夜盲改)。
 ⇒ 单纯"加大 group_size/batch_size"不解决问题、会原样重演死锁。
+
+## RL server 推理路径 ≠ 生产 VA_Server：A/B 坐实的 code-path bug (2026-07-20)
+**现象**：GRPO 的 val-before-train SR 仅 ~10-14%(5步),远低于独立 5 步 eval 的 ~44%。
+**受控 A/B**(ja25 GPU5 server/GPU6 client,与 RL run 的 GPU0-4 互不干扰):独立 `src.inference.server` VA_Server(robotwin_rl5) vs RL-server eval 路径,**同 10 seed(10000-10011)、同机/环境/任务(demo_clean)/步数(25 video,5 action)/guidance(video5,action1)**。
+**结果**:standalone **5/10=50%** vs RL 路径 **1/10=10%**,standalone 严格压制(RL 成功的 seed standalone 都成功,standalone 另胜 4 个,RL 无一处反超)。
+**排除**(两边完全一致):去噪步数、guidance、LoRA(step0 零初始化=identity)、eval 确定性(eval_mode 路径确为 deterministic)、seed、task_config;两 config(robotwin.yaml vs robotwin_rl5.yaml)仅 action_num_inference_steps 50→5 之差,而 grpo config 已 override 成 5。
+**根因**:唯一差异是代码路径——RL server 在 `_sample_action_chunk`/`_run_video_prefix`(src/rl/server.py)**重写了去噪**,而非调用 `VA_Server.infer`。`scheduler_transition_mean` 只是转调 `FlowMatchScheduler.step`(同数学),故分歧在**循环结构**。头号嫌疑:RL 用 `F.pad(scheduler.timesteps,(0,1),value=0)` 补 0 并对最后一个真实时刻也 step → `scheduler.step` 命中 `timestep_id+1>=len→sigma_=0` → **多去噪一步到 sigma=0**;而 VA_Server 用 `if not last_step:` 提前一格停(动作停在 sigma(t_last))。video prefix 同样补 0。多这一步很可能把动作推离 action head 预期分布。
+**严重性**:rollout 也走同一 `_sample_action_chunk` → **RL 在优化一个被错误积分、且和生产不一致的策略**,修复是 RL 结果有意义的前提。
+**修法**:把 RL eval/rollout 去噪循环对齐 `VA_Server.infer`(或直接复用),再跑同一 A/B,预期 RL SR 回到 ~50%。A/B 产物在 /mnt/share/rl_exp/ab_test/。
