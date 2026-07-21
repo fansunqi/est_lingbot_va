@@ -42,7 +42,7 @@ port: 29546
 save_root: experiments/robotwin_grpo_turn_switch_fast
 guidance_scale: 5
 action_guidance_scale: 1
-prompt_max_sequence_length: 226
+prompt_max_sequence_length: 512  # ROOT-CAUSE FIX 2026-07-21: was 226 vs inference default 512 (SR 0.17 vs 0.50)
 # Override base inference config (50) to keep per_step recompute memory bounded.
 # At N=5 each chunk holds ~5x the activation graph of per_chunk during update.
 action_num_inference_steps: 5

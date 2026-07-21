@@ -51,7 +51,7 @@ wandb:
   mode: online
   project: est_rl
   entity: Robotics-FiT
-  name: robotwin-grpo-turn-switch-fast
+  name: robotwin-grpo-turn-switch-1machine
   job_type: grpo-validation
   tags:
     - grpo
@@ -64,7 +64,7 @@ rl:
     type: sparse_success
 
   use_fsdp: false
-  group_size: 8
+  group_size: 4
   # 2026-05-23: 2 → 4,episodes/update 从 16 升到 32,
   # 减半 advantage 的 Bernoulli 噪声(σ 从 0.18 → 0.12)。
   rollout_groups_per_update: 4
@@ -141,17 +141,17 @@ rl:
   # (beta_kl);此处保留 0,Plan A 仅验证不对称 clip 是否能把 pos_frac 抬过 0.5。
   entropy_coef: 0.0
   bc_coef: 0.0
-  checkpoint_interval: 4
+  checkpoint_interval: 5
   # 每 N 次 GRPO update step 让 rollout clients 用 deterministic inference
   # (LoRA on,但 sample_action 不注入 per-step 噪声) 把 assignment 跑一遍;
   # 结果不进 training pool,只打到 wandb eval/* 用来 track 真实 success rate。
   # 0 = 关闭。和 checkpoint_interval 对齐,每次出 ckpt 同步做一次 eval。
-  eval_enabled: true
+  eval_enabled: false  # external standalone eval instead of in-training val
   eval_every: 4
   # Periodic and eval-only GRPO eval use this deterministic action denoising horizon.
   # Keep it explicit so checkpoint re-eval cannot silently fall back to the base 50-step config.
   eval_action_num_inference_steps: 5
-  export_inference_checkpoint: false
+  export_inference_checkpoint: true  # emit loadable LoRA export per ckpt
   save_rollout_store: false
   save_full_transformer: false
   max_grad_norm: 1.0
