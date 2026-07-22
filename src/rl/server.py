@@ -1190,6 +1190,13 @@ class GRPOTrainingServer(VA_Server):
                 # filter and advantage normalization. We then slice out the
                 # advantages corresponding to *this* rank's local members.
                 gid = group[0].group_id
+                if gid not in global_rewards:
+                    # Group was dropped in the cross-rank merge because a client
+                    # restarted/desynced and not all ranks submitted this item.
+                    # global_rewards is identical on every rank, so all ranks skip
+                    # the same gids here and stay aligned for the grad all-reduce.
+                    skipped_groups += 1
+                    continue
                 global_bucket = global_rewards[gid]
                 global_members_sorted = sorted(global_bucket.keys())
                 g_rewards = [global_bucket[m] for m in global_members_sorted]
@@ -2479,14 +2486,29 @@ class GRPOTrainingServer(VA_Server):
                         )
                     bucket[member] = float(reward)
 
-        for gid, bucket in merged.items():
-            if len(bucket) != self.group_size:
-                raise RuntimeError(
-                    f"Sharded GRPO: incomplete group {gid!r} after cross-rank merge: "
-                    f"got {len(bucket)} members, expected {self.group_size}. "
-                    "Check client --world_size/--rank/--num_clients flags and that "
-                    "every assignment item completes on every rank."
-                )
+        # Robustness: a client restart / crash / desync (watchdog kill, hang) can
+        # leave a group with fewer than group_size members after the merge. Rather
+        # than raise and take the whole DDP-lockstep run down, DROP the incomplete
+        # group and continue with the complete ones. `merged` is identical on every
+        # rank (all_gather_object), so all ranks drop the SAME gids and stay aligned
+        # for the subsequent grad all-reduce. The caller skips any local group whose
+        # gid is absent here (see _run_grpo_update).
+        incomplete = {
+            gid: len(bucket)
+            for gid, bucket in merged.items()
+            if len(bucket) != self.group_size
+        }
+        if incomplete:
+            self._info0(
+                "GRPO sharded merge: dropping %s incomplete group(s) after cross-rank "
+                "merge (client restart/desync); kept=%s expected_members=%s detail=%s",
+                len(incomplete),
+                len(merged) - len(incomplete),
+                self.group_size,
+                incomplete,
+            )
+            for gid in incomplete:
+                del merged[gid]
         return merged
 
     def _gather_replicated_eval_results(self) -> list[dict[str, Any]]:
